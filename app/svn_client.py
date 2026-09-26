@@ -350,19 +350,18 @@ def preflight_target(target: RepoTarget) -> list[dict]:
         return steps
     steps.append(_step("仓库地址", True, f"{target.label()}（来源：{target.source}）"))
 
-    info_res = run(["info", target.repo_url], check=False)
-    if info_res.code != 0:
-        text = info_res.output.strip()[:300]
-        steps.append(_step("仓库可达", False, text or "未知错误"))
+    # Probe the trunk path, not the repository root: servers with path-level authz deny
+    # the root while still allowing the product line, and the root is never operated on.
+    trunk = run(["info", target.trunk_url()], check=False)
+    if trunk.code != 0:
+        text = trunk.output.strip()[:300]
+        steps.append(_step("仓库可达", False, f"{target.trunk_url()}：{text or '未知错误'}"))
         return steps
     settings = get_settings()
-    steps.append(_step("仓库可达", True, "svn info 成功"
+    steps.append(_step("仓库可达", True, f"svn info {target.trunk_url()} 成功"
                        + ("（用上 SVN_USERNAME/SVN_PASSWORD）" if settings.svn_username
                           else "（用本机缓存的凭证）")))
-
-    trunk = run(["info", target.trunk_url()], check=False)
-    steps.append(_step("trunk 目录", trunk.code == 0, target.trunk_url()
-                       + ("" if trunk.code == 0 else " 不存在：AI 建分支需要它（或改 trunk_path）")))
+    steps.append(_step("trunk 目录", True, target.trunk_url()))
 
     root = run(["info", target.branch_root_url()], check=False)
     steps.append(_step("branches 根目录", None,
@@ -381,7 +380,12 @@ def preflight_target(target: RepoTarget) -> list[dict]:
             steps.append(_step("工作副本格式", False,
                                f"本机 svn {version} 读不了 1.7+ 格式（.svn/wc.db），请升级客户端并设 SVN_BIN"))
     else:
-        steps.append(_step("工作副本", None, f"{wc} 未检出，首次建分支时自动 checkout"))
+        if (wc / ".git").exists():
+            steps.append(_step("工作副本", None,
+                               f"{wc} 是 git 镜像（不是 SVN 工作副本）：默认方式只在其中 git commit，"
+                               f"进正式库由主人 dcommit"))
+        else:
+            steps.append(_step("工作副本", None, f"{wc} 未检出，首次建分支时自动 checkout"))
     return steps
 
 
