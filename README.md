@@ -5,7 +5,7 @@
 - 服务地址：<http://127.0.0.1:5000>
 - 数据库：`bug_system.db`（已建好全部表）
 - AI 执行器规则：`AGENTS.md`（Trae 读它干活）
-- 自动连跑下达手册：`AUTO_LOOP.md`（一条跑完自动下一条 + 提交闸门 G1–G10 + 可复制指令）
+- 自动连跑下达手册：`AUTO_LOOP.md`（一条跑完自动下一条 + 提交闸门 G1–G11 + 可复制指令）
 - 能力清单 / 接口协议：`CAPABILITIES.md`
 - 账号密码配置：`.env`（已被 `.gitignore` 忽略）
 
@@ -153,9 +153,9 @@ python -m app.cli branch 51452 --dry-run
 
 **职责边界**：本系统只做**任务管理**（拉禅道、抓截图备注、排队、状态、登记修订号、审查、回写评论）。
 「什么情况下允许提交、提交怎么走（SSH / 是否需同意）/ 真实修订号从哪来」这些**提交细则由目标代码库自己的知识体系决定**，
-本系统只下达一份「提交闸门 G1–G10」清单，不复制也不解释那些细则。默认本系统**不执行 svn**。
+本系统只下达一份「提交闸门 G1–G11」清单，不复制也不解释那些细则。默认本系统**不执行 svn**。
 
-> 「一条跑完自动下一条」的完整下达方式（两种执行方式、G1–G10 提交闸门、可复制的主循环与子任务指令、
+> 「一条跑完自动下一条」的完整下达方式（三种执行方式、G1–G11 提交闸门、可复制的主循环与子任务指令、
 > 并行约束）见 **`AUTO_LOOP.md`**。下面只是最小骨架。
 
 ```
@@ -172,9 +172,9 @@ python -m app.cli branch 51452 --dry-run
    python -m app.cli status <禅道ID>     # 全文 + 截图本地路径 + 备注 + 历史提交 + 主人答复 + 所属产品
    python -m app.cli claim  <禅道ID>     # 占住任务，避免被别的子任务重复领
    ... 在该库自己的知识体系下定位并改代码、跑该库的编译/测试 ...
-   ... 逐条核对 AUTO_LOOP.md 的提交闸门 G1–G10 ...
-   闸门全过 → 按该代码库自己的提交细则提交到 bugfix/zentao-<ID>，拿真实修订号后回本系统登记：
-   python -m app.cli commit <禅道ID> --message "..." --files a.c,b.c --summary "..." --verify "..." --no-svn --revision <真实修订号> --analysis-file a.json
+   ... 逐条核对 AUTO_LOOP.md 的提交闸门 G1–G11 ...
+   闸门全过 → 只在落码位置（git 镜像/独立工作副本）本地提交，回本系统登记：
+   python -m app.cli commit <禅道ID> --message "..." --files a.c,b.c --summary "..." --verify "..." --no-svn --revision git:<短哈希> --analysis-file a.json
         # = 存 analyses（分析结论） + 写 svn_revisions + 状态置 await_review + 回写禅道评论（不跑 svn）
    **分析结论是必交付物**：REQUIRE_ANALYSIS=true（默认）时没写分析的 commit 会被直接拒绝，
    字段规范见 `AUTO_LOOP.md` §2.1；也可先 `analyze <禅道ID> --kind commit --analysis-file a.json` 再 commit
@@ -269,7 +269,7 @@ product_repos(product_id PK, product_name, repo_url, trunk_path, branch_root,
 need_solution(id, bug_id, question, ai_options, ai_advice, owner_reply,
               status[awaiting|replied|done], created_at, replied_at, done_at)
 analyses(id, bug_id, kind[commit|block|manual], symptom, root_cause, evidence,
-         call_chain, change_desc, impact, verify, gates(JSON G1–G10), unverified,
+         call_chain, change_desc, impact, verify, gates(JSON G1–G11), unverified,
          rollback, conclusion, author, created_at)
                    # 执行器每条 bug 收尾必写的分析结论；commit 会校验其存在
 svn_revisions(id, bug_id, revision, branch, message, author, files, created_at)
@@ -327,7 +327,7 @@ app/cli.py           AI 执行器命令行（全部输出单条 JSON）
 app/templates/       看板/同步/需方案/审查/SVN/产品仓库/配置 页面
 app/static/          style.css + app.js（展开卡片、确认框）
 AGENTS.md            AI 批量执行规则（Trae 读它干活）
-AUTO_LOOP.md         自动连跑下达手册（提交闸门 G1–G10 + 可复制的主循环/子任务指令）
+AUTO_LOOP.md         自动连跑下达手册（提交闸门 G1–G11 + 可复制的主循环/子任务指令）
 README.md            本文档（使用与运维）
 CAPABILITIES.md      能力清单与接口协议（CLI/Web/DB 三张表）
 ```

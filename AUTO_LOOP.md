@@ -6,9 +6,11 @@
 | --- | --- | --- |
 | 任务管理 | **本系统（AI-BUG）** | 拉禅道、抓截图/备注/附件、排队与优先级、占任务、状态流转、登记改动与修订号、审查流、回写禅道评论 |
 | 提交资格与提交动作 | **代码库自己的知识体系**（目标仓库工作区的 `CLAUDE.md` 及其 `registry/playbooks/skills`） | 什么情况下允许提交、怎么走 SSH、要不要征求同意、`svn ci` 怎么执行、真实修订号从哪来 |
+| 远端写入（进正式库） | **只有主人** | `git svn dcommit` / `git push` / `svn ci` / merge 到 trunk —— 执行器一律不碰，见 §1.5 与闸门 G11 |
 
 本系统**不做提交决策、默认也不执行 svn**。它只把一份「提交闸门」清单交给执行器；
-执行器在代码库侧按自己的细则完成提交，回到本系统只做一件事：`commit --no-svn --revision <真实修订号>` 登记。
+执行器在代码库侧按自己的细则完成**本地**提交（`git commit`），回到本系统只做一件事：
+`commit --no-svn --revision git:<哈希>` 登记。改动要进正式库那一步只由主人做（见 §1.5、G11）。
 
 本文档只管「怎么下达任务」；执行协议本体在 `AGENTS.md`，接口细节在 `CAPABILITIES.md`。
 
@@ -17,29 +19,67 @@
 ## 0. 最短下达语（直接粘）
 
 ```
-读 AGENTS.md 与 AUTO_LOOP.md，无人值守处理禅道 bug，按 AUTO_LOOP.md 的【提交闸门】判定可否提交：
+读 AGENTS.md 与 AUTO_LOOP.md，无人值守处理禅道 bug，按 AUTO_LOOP.md 的【提交闸门 G1–G11】判定可否提交：
 1) python -m app.cli sync --details -1     （同步 + 全量抓截图/备注/附件）
 2) python -m app.cli tasks --limit 5       （按 product_id 分组，组内严格串行、组间可并行）
 3) 每条 bug 起一个独立子任务，用 AUTO_LOOP.md §3.2 模板，只替换禅道ID
-4) 子任务只做：status(看图看备注) → claim → 定位改码 → 编译/测试 → 逐条核对提交闸门
-5) 闸门全过 → 按目标代码库自己的提交细则完成提交，拿到真实修订号后回本系统登记，
-   并把分析结论一起写入（--analysis-file a.json，字段见 §2.1）：
-   commit --no-svn --revision <真实修订号> --analysis-file a.json；
+4) 落码位置是 git-svn 镜像（AUTO_LOOP.md §1.5）；镜像未就绪就不许改码，也不许动正式 SVN 工作副本
+5) 子任务只做：验镜像就绪 → status(看图看备注) → claim → 镜像里开 bugfix/zentao-<ID> 定位改码
+   → SSH 编译/测试 → 逐条核对提交闸门
+6) 闸门全过 → 只在镜像里 git commit（本地），把短哈希当修订号登记，并一起写入分析结论
+   （--analysis-file a.json，字段见 §2.1）：
+   commit --no-svn --revision git:<哈希> --analysis-file a.json；
    闸门任一条不过 → block 回填（也带上分析），继续下一条
-6) 一批跑完立刻取下一批，禁止问我是否继续；tasks --limit 1 返回 0 条才停并输出 report
-本系统不执行 svn、不判定提交细则；没写分析结论不许 commit；不许提交或合并 trunk；
+7) 一批跑完立刻取下一批，禁止问我是否继续；tasks --limit 1 返回 0 条才停并输出 report
+本系统不执行 svn、不判定提交细则；没写分析结论不许 commit；
+禁止 git svn dcommit / git push / svn ci / 提交或合并 trunk（进正式库只由我做）；
 不许 resolve/close 禅道 bug；不许改与当前 bug 无关的文件
 ```
 
-## 1. 两种执行方式（默认用第一种）
+## 1. 三种执行方式（本工程默认第三种）
 
 | 方式 | 提交动作由谁做 | 本系统命令 | 适用 |
 | --- | --- | --- | --- |
-| **默认：只管任务**（推荐） | 执行器按**代码库知识体系**的提交细则做（含 SSH 门禁、同意流程、真实修订号） | `claim` → 提交 → `commit --no-svn --revision <真实号> --analysis-file a.json` | 有自己规则体系的仓库（如带 `CLAUDE.md` 的工作区） |
-| 可选：托管 svn | 本系统代跑 `svn copy/switch/commit` | `branch <ID>` → `commit <ID> --files ...` | 无门禁的独立工作副本（`svn_workspace/p<产品ID>-<hash>`），想彻底无人值守时 |
+| 只管任务 | 执行器按**代码库知识体系**的提交细则做（含 SSH 门禁、同意流程、真实修订号） | `claim` → 提交 → `commit --no-svn --revision <真实号> --analysis-file a.json` | 有自己规则体系的仓库（如带 `CLAUDE.md` 的工作区） |
+| 托管 svn | 本系统代跑 `svn copy/switch/commit` | `branch <ID>` → `commit <ID> --files ...` | 无门禁的独立工作副本（`svn_workspace/p<产品ID>-<hash>`），想彻底无人值守时 |
+| **本地 git 草稿**（本工程采用） | 执行器只在 git-svn 镜像里 `git commit`，**不推任何远端**；进正式库由主人事后做 | `claim` → 镜像里 `git commit` → `commit <ID> --no-svn --revision git:<哈希> --analysis-file a.json` | 仓库带 git-svn 镜像、要求「改动先落地可见、正式库在你点头之前不动」（见 §1.5） |
 
-两种方式的**任务管理部分完全一样**（排队、详情、状态、审查、禅道回填），差别只在 `svn` 由谁执行。
+三种方式的**任务管理部分完全一样**（排队、详情、状态、审查、禅道回填），差别只在「改动落在哪、由谁落」。
 换方式不需要换文档，只换子任务里第 5 步那一条命令。
+
+## 1.5 本地 git 草稿仓（当前代码库的落码位置）
+
+**这是执行器唯一允许改代码的地方，不是正式工作副本。**
+
+| 项 | 值 |
+| --- | --- |
+| 镜像仓库 | `<镜像目录>`（真实路径写在该产品的 `product_repos.working_copy`，`/repos` 页可见；**不写进本文档**） |
+| 上游 | 该产品的 `repo_url`（一个 git-svn 镜像；路径级授权时 stdlayout 不可用，clone 要带 `--trunk=.`） |
+| 正式 SVN 工作副本 | 你日常开发那一份 —— **执行器只读对待，禁止在其中改码** |
+| 本地分支名 | `bugfix/zentao-<禅道ID>`（与 `BRANCH_PREFIX` 一致） |
+
+三条硬规矩：
+
+1. **只 commit，不推远端**：允许 `git checkout -b` / `git add` / `git commit` / `git diff` / `git log`；
+   禁止 `git svn dcommit`、`git push`、`svn ci`、`svn copy`。镜像的 `fetch`（拉 SVN→git）由主人跑，执行器不代跑。
+2. **登记时用 git 哈希，不带 `r` 前缀**：`--revision git:<7位短哈希>`，与本系统的 SVN 修订号用两种形态区分，
+   审查页一眼能看出这条是「本地草稿」还是「已进正式库」。
+3. **镜像未就绪时不许开工**：`git -C <镜像> rev-parse --verify refs/remotes/origin/trunk` 失败、
+   或 `refs/remotes/origin/trunk` 为空（clone/fetch 还在跑）→ 不改码、不转去动正式工作副本，
+   直接 `block` 写明「镜像未就绪」并继续下一条。
+
+为什么这么分：SVN 没有本地提交，`svn ci` 一跑就进正式库；git 有。用镜像当草稿区，就把「AI 已改完」
+和「已进正式库」这两件事拆成了两个独立动作 —— 前者随时可 `git reset` 回退，后者只在人点头后发生。
+
+代价（必须知道，别当透明）：
+
+- 镜像与正式工作副本是**两份独立副本**，改一份不会同步到另一份；最终回灌靠主人 `git svn dcommit`
+  或 `git diff` 出 patch 打到正式副本，本系统不代做。
+- 两边共用同一个 `.git` 目录（跨 Samba）时**只能有一个操作方**，git 的文件锁在 SMB 上不可靠；
+  所以同产品串行处理是硬约束（见 §5），且 Windows 侧与编译服务器侧不得同时动镜像。
+- 编译与实测仍只能在 SSH 编译服务器上做（闸门 G4 不变），镜像目录在 Windows 本地编译不了。
+- 绑定关系仍要落进本系统，G3 才有判据（真实地址与镜像路径存 `product_repos`，不写进文档）：
+  `python -m app.cli bind-repo <产品ID> "<SVN仓库地址>" --name "<产品名>" --working-copy <镜像目录>`
 
 ## 2. 提交闸门（下达给执行器的「什么情况下可以提交」）
 
@@ -49,14 +89,15 @@
 | --- | --- | --- |
 | G1 | 已看过禅道的完整描述、**截图**、备注/操作记录 | `status` 的 `steps` / `attachments[].local_path` / `comments`；缺则先 `detail <ID>` |
 | G2 | 根因明确、修改点唯一（或已按主人 `owner_reply` 执行） | `status` 的 `owner_reply` 与历史提交 |
-| G3 | 只改与本 bug 直接相关的文件，且都在**该 bug 所属产品的仓库**内 | `status` 的 `product_id` + `repos` 的产品→仓库映射 |
+| G3 | 只改与本 bug 直接相关的文件，且都在**该 bug 所属产品的工作副本**内（git 方式下 = `repos` 给出的镜像目录，不是正式工作副本） | `status` 的 `product_id` + `repos` 的产品→仓库映射（含 `working_copy`） |
 | G4 | 该产品的编译/测试实际通过（连续 2 次不过即视为不过） | `repos` 的 `build_command` / `test_command`（未绑定则按代码库自身构建规则） |
 | G5 | 状态矩阵自审完成：主路径 / fallback 与异常路径 / 资源释放收尾 / 日志计数 / 同构镜像分支 | 无（由代码库知识体系的 precheck 规程负责，本系统只要求你显式声明已核对） |
 | G6 | 触及页面文案就同步 `i18n.po/.mo`；页面源码不直接写中文、注释全英文；不引入超出语言基线的语法 | 无（同上，属代码库规则） |
-| G7 | 提交目标是 `bugfix/zentao-<禅道ID>` 分支，**不是 trunk** | `status` 的 `branch`；本系统侧还有 `SVN_ALLOW_TRUNK_WRITE=false` 兜底 |
+| G7 | 提交目标是 `bugfix/zentao-<禅道ID>` 分支，**不是 trunk**（git 方式下=本地分支，且只是一次 `git commit`） | `status` 的 `branch`；本系统侧还有 `SVN_ALLOW_TRUNK_WRITE=false` 兜底 |
 | G8 | commit message = `fix #<禅道ID> <一句话根因>`，不含账号密码等敏感串 | `commit --message` 拼接规则 |
 | G9 | 未验证的路径必须标「未验证」，不得按「已完成 / 可直接合入」收口 | 登记内容进 `fix_summary` / `verify_steps` 供你审查 |
 | G10 | 提交所需的授权已按代码库规程取得（如 SSH 写操作需显式同意） | 无（属代码库规则；本系统只要求拿到真实修订号再登记） |
+| G11 | **远端写入留给主人**：执行器只做本地动作（`git commit` / 改工作副本不 `ci`），绝不 `git svn dcommit`、`git push`、`svn ci`、merge 到 trunk | 无（本系统不检测，靠禁止事项 + 登记形态 `git:<哈希>` 让审查页一眼可辨） |
 
 > G5 / G6 / G10 这三类是**代码库自己的细则**，本系统不复制也不解释它们，只在闸门清单里点名要求 ——
 > 细则原文以目标仓库工作区的 `CLAUDE.md` 与其下层 `registry/playbooks` 为唯一权威。
@@ -68,11 +109,11 @@
 
 ```
 # 写法一：随 commit 一起提交（推荐，一条命令搞定）
-python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.c --no-svn --revision <真实修订号> --analysis-file a.json
+python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.c --no-svn --revision git:<短哈希> --analysis-file a.json
 
 # 写法二：先单独写分析，再 commit
 python -m app.cli analyze <禅道ID> --kind commit --analysis-file a.json
-python -m app.cli commit <禅道ID> --message "..." --files a.c,b.c --no-svn --revision <真实修订号>
+python -m app.cli commit <禅道ID> --message "..." --files a.c,b.c --no-svn --revision git:<短哈希>
 ```
 
 `a.json` 的字段（除 gates 外都建议写满，写不出来的就是没分析到位）：
@@ -89,7 +130,7 @@ python -m app.cli commit <禅道ID> --message "..." --files a.c,b.c --no-svn --r
   "unverified":  "仍未验证的点；没有就留空，禁止用「无」搪塞",
   "rollback":    "回退方式",
   "conclusion":  "一句话结论",
-  "gates":       {"G1": "pass", "G5": "未验证:OEM 同名页未核对", "G7": "pass"}
+  "gates":       {"G1": "pass", "G5": "未验证:OEM 同名页未核对", "G7": "pass", "G11": "pass:只本地 commit，未 dcommit"}
 }
 ```
 
@@ -119,7 +160,7 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
   - 已提交待审查（我要去 /review）
   - 需我给方案（我要去 /need 答复）
   - 闸门未过/未提交及原因
-期间不要复述规则、不要问我是否继续、不要碰 trunk、不要替代码库判定提交细则。
+期间不要复述规则、不要问我是否继续、不要碰 trunk、不要推远端（dcommit/push/svn ci）、不要替代码库判定提交细则。
 ```
 
 ### 3.2 子任务指令（每条 bug 一份，无上下文也能独立执行）
@@ -127,44 +168,58 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
 ```
 你只处理禅道 bug #<禅道ID>，做完立即结束，禁止顺带处理其他 bug。
 任务管理命令的工作目录：<项目目录>
+落码位置：镜像仓库 <镜像路径>（见 §1.5）；正式 SVN 工作副本只读，禁止在里面改码
 
+0) 先验镜像就绪（不就绪就别开工）：
+   git -C <镜像路径> rev-parse --verify refs/remotes/origin/trunk
+   失败或该 ref 为空 = clone/fetch 还没跑完 → 直接跳到第 6 步 block，原因写「镜像未就绪」
 1) python -m app.cli status <禅道ID>
    读 product_id / product_name / steps / comments(备注) / attachments[].local_path / 历史提交 / owner_reply
    → 有截图必须用 Read 打开 local_path 真正看图，只看文字就动手是最常见的误判来源
    → 若 attachments 为空且没抓过详情：python -m app.cli detail <禅道ID>
 2) python -m app.cli claim <禅道ID>        # 占住任务，置 fixing，避免被别的子任务重复领
-3) 在目标代码库里按该库自己的知识体系定位修改点（先读它的 CLAUDE.md / 首跳规程，再动代码）
-   只改与这条 bug 直接相关的文件，且路径必须属于这条 bug 的产品仓库
+3) 在镜像里为这条 bug 开本地分支，然后按该代码库自己的知识体系定位修改点（先读它的 CLAUDE.md / 首跳规程）
+   git -C <镜像路径> checkout -b bugfix/zentao-<禅道ID> refs/remotes/origin/trunk
+   只改与这条 bug 直接相关的文件，且路径必须属于这条 bug 的产品仓库（闸门 G3）
 4) 编译 / 测试：用该库规定的构建方式（本系统 `repos` 里的 build_command / test_command 可作参考）
-   连续 2 次不过 → 直接走第 6 步 block，写清失败现象，不要硬试
-5) 提交判定（AUTO_LOOP.md §2 的 G1–G10）
-   - 全过：按**该代码库自己的提交细则**提交到分支 bugfix/zentao-<禅道ID>，取得真实修订号
+   本工程只能在 SSH 编译服务器上实测；连续 2 次不过 → 直接走第 6 步 block，写清失败现象，不要硬试
+5) 提交判定（§2 的 G1–G11）
+   - 全过：只在镜像里做一次本地提交，并记下短哈希
+     git -C <镜像路径> add <改的文件> ; git -C <镜像路径> commit -m "fix #<禅道ID> <一句话根因>"
+     git -C <镜像路径> rev-parse --short HEAD
+   - 禁止：git svn dcommit / git push / svn ci（G11，进正式库只由主人做）
    - 任一条不过或需要业务决策：不提交，仍要写分析，跳到第 6 步的 block 分支
-6) 把分析结论写成 JSON 文件（字段规范见 §2.1，gates 必须逐条给结论），然后回本系统登记
-   已提交并拿到真实修订号：
-     python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.c --summary "<改了什么>" --verify "<人工怎么验>" --no-svn --revision <真实修订号> --analysis-file a.json
-   已改好但提交还需你授权/排队等批次：
+6) 把分析结论写成 JSON 文件（字段规范见 §2.1，gates 必须逐条给结论，含 G11），然后回本系统登记
+   已本地提交（把 git 短哈希当修订号登记，前缀 git:）：
+     python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.c --summary "<改了什么>" --verify "<人工怎么验>" --no-svn --revision git:<短哈希> --analysis-file a.json
+   改好了但不便开分支/哈希还没定（占位待你处理）：
      python -m app.cli commit <禅道ID> ... --no-svn --revision PENDING --analysis-file a.json --extra "待主人按仓库提交细则提交"
    卡住需要方案（question/options/advice 之外照样给分析）：
      python -m app.cli block <禅道ID> --question "<卡在哪一步>" --options "方案A：…；方案B：…" --advice "<建议及理由>" --analysis-file a.json
-7) 回报字段：zentao_id / product / 改了哪些文件 / 闸门逐条结论 / analysis_id / action(commit|pending-commit|block) / revision 或 need_id
-禁止：没写分析就 commit（REQUIRE_ANALYSIS 会直接拒绝）；提交或合并 trunk；resolve/close 禅道 bug；
-改无关文件；把 .env 内容写进任何输出；问我是否继续
+7) 回报字段：zentao_id / product / 分支名 / 改了哪些文件 / git 短哈希 / 闸门逐条结论 / analysis_id / action(commit|pending-commit|block) / revision 或 need_id
+禁止：没写分析就 commit（REQUIRE_ANALYSIS 会直接拒绝）；git svn dcommit / git push / svn ci / 提交或合并 trunk；
+在正式工作副本里改码；resolve/close 禅道 bug；改无关文件；把 .env 内容写进任何输出；问我是否继续
 ```
 
-### 3.3 收工后你的三步（审 + 授权提交 + 回填）
+### 3.3 收工后你的三步（审 + 回灌正式库 + 回填）
 
 ```
 # 1) 看这轮结果与待办
 python -m app.cli report
 
-# 2) 对登记成 PENDING 的条目，逐条读它的分析结论 + files + summary + verify：
+# 2) 逐条读 AI 的分析结论 + files + summary + verify，并审它本地的提交：
 python -m app.cli status <禅道ID>       # 输出里的 analysis 就是 AI 写的分析（gates_parsed 是闸门逐条）
-#    按代码库自己的提交细则决定要不要提交、怎么提交（本系统不替你判）
+git -C <镜像目录> show <短哈希>          # 真实改动长什么样，这里看
+git -C <镜像目录> diff refs/remotes/origin/trunk..<分支名>   # 整条分支相对 trunk 的全部改动
 
-# 3) 真实提交后回填修订号（分析已在库里，不会再被闸门拦；会顺带再发一条禅道评论，文案用 --extra 控制）
-python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.c --no-svn --revision <真实修订号>
+# 3) 你判定可以进正式库，就自己做回灌（这一步执行器绝不代做），拿到真实 r 号后回填：
+git svn dcommit          # 在镜像目录里执行；或出 patch 打到正式工作副本再 svn ci
+python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.c --no-svn --revision r<真实号>
 ```
+
+回填是**追加**：`git:<哈希>`（本地草稿）与 `r<号>`（正式库）会同时挂在这条 bug 名下，
+`status` 与审查页能看到它从草稿到落库的完整轨迹。
+登记成 `PENDING` 的条目同理，只是还没有可信的本地哈希可审，得先看 `files` 与工作副本状态。
 
 ## 4. 为什么它能「自动下一个」而不会走偏
 
@@ -180,9 +235,13 @@ python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.
 ## 5. 并行的唯一硬约束
 
 ```
-同产品：并发度 = 1（同一份工作副本，一条提交完才能下一条动分支）
+同产品：并发度 = 1（同一份工作副本/同一个 git 镜像，一条提交完才能下一条动分支）
 跨产品：可以并行（各产品独立仓库与工作副本，互不影响）
 ```
+
+用 §1.5 的 git 镜像时这条约束更硬，原因有两个：一份工作树同一时刻只能 checkout 一个分支；
+镜像的 `.git` 跨 Samba 共享时 git 的文件锁不可靠，**Windows 侧与编译服务器侧绝不能同时操作同一个镜像**。
+所以：动镜像前先确认没有另一侧在跑 `git` / `git svn fetch`。
 
 想加速：按产品开多个主对话，都用 §3.1 但加一句「只处理 product_id=<X> 的 bug」，取队列后自行过滤：
 
@@ -210,7 +269,8 @@ Web /sync     同步与详情抓取留痕（含禅道评论是否写入成功）
 Web /         看板：pending 变少、fixing/await_review/need_solution 变多就是在正常推进
 Web /need     要你给方案（答复后自动回到 AI 队列最前）
 Web /review   待你审查：AI 分析结论 + 闸门逐条 + files_changed / fix_summary / verify_steps / 修订号
-              （PENDING 表示尚未真实提交；缺分析会标红提示）
+              （修订号形态：git:<哈希>=已本地提交未进正式库；r<号>=已进正式库；PENDING=还没提交；
+                缺分析会标红提示）
 Web /repos    各产品用哪个仓库、工作副本在哪、build/test 命令
 命令 python -m app.cli report            进度：counts + 三份清单 + remaining_work
 命令 python -m app.cli tasks --limit 5   下一条会被处理的是谁
@@ -221,28 +281,39 @@ Web /repos    各产品用哪个仓库、工作副本在哪、build/test 命令
 | 现象 | 处理 |
 | --- | --- |
 | `commit` 报「提交前必须把分析结果写入系统」 | 子任务没交分析结论。补 `analyze <ID> --kind commit --analysis-file a.json`（字段见 §2.1）再 commit；确实写不出来就该转 `block` |
+| 镜像 `refs/remotes/origin/trunk` 不存在或为空（clone/fetch 未完成） | 执行器**不许改码**，也不许转去动正式工作副本；`block` 写明「镜像未就绪」，等主人把 `git svn clone/fetch` 跑完 |
+| 本地 git 分支攒了一堆 commit 没进正式库 | 正常状态（G11 设计如此）。由主人 `git -C <镜像> diff origin/trunk..<分支>` 审，通过后自行 `git svn dcommit` 或出 patch 打到正式副本，再回填真实修订号 |
 | 某条被 AI 反复处理不满意 | `/review` 填原因「打回」→ `rejected`，自动回队列且优先级提升 |
 | 某条想先搁置 | 让它 `need_solution`，或直接在库里改状态，它就不在队列里 |
 | PENDING 一直没人提交 | 它已在 `await_review`，`report` 与 `/review` 都能看到；不提交就不会变 `merged` |
-| 误改了别的文件 | 只有当轮改动的那份工作副本受影响，按代码库规程 `svn revert`（本系统不自动 revert） |
+| 误改了别的文件 | 镜像里 `git reset --hard <分支基线>` 或 `git checkout -- <文件>` 即可回退（不影响正式库）；正式工作副本里则由主人按代码库规程 `svn revert`（本系统不自动 revert） |
 | 禅道评论写不进去 | 不影响主流程，原文留在 `sync_log`（`/sync` 页可见）；之后用 `comment <ID> --text ...` 单独补发 |
 | 中途关窗/IDE 重启 | 重贴 §3.1，状态从库里恢复，不会重复领任务 |
 | 全队列跑完 | `report` 的 `remaining_work=0`，只剩你的审查与合入 trunk（手动） |
 
-## 9. 一次完整实操（默认方式）
+## 9. 一次完整实操（§1.5 本地 git 草稿方式）
 
 ```
-# 你（一次性）
-python -m app.cli bind-repo 25 "<DPDK/NGFW 仓库根地址>" --name "DPDKUAC&NGFW" --build "<编译命令>" --test "<测试命令>"
-python -m app.cli repos                       # 确认产品 25 已 bound
-# 若代码库工作副本另有其人（在你日常那份代码里），把 repo_url 填对即可，本系统不会去动它的 svn
+# 你（一次性，且必须在有 git-svn 的那一侧跑 —— 编译服务器上通常没有 git-svn）
+git svn clone --trunk=. --no-metadata <SVN仓库地址> <镜像目录>
+git -C <镜像目录> rev-parse --verify refs/remotes/origin/trunk     # 有输出才算就绪
+python -m app.cli bind-repo <产品ID> "<SVN仓库地址>" --name "<产品名>" --working-copy <镜像目录> --build "<编译命令>" --test "<测试命令>"
+python -m app.cli repos                       # 确认该产品已 bound、working_copy 指向镜像
 
 # 你（下达任务）：粘 §0 或 §3.1
 
 # AI（自动）
-sync --details -1 → tasks → 每条一个子任务（status→claim→改→编译测试→闸门）
-   → 按代码库细则提交并拿真实修订号 → commit --no-svn --revision <号> → 下一条 → report
+sync --details -1 → tasks → 每条一个子任务
+   （验镜像就绪 → status → claim → 在镜像开 bugfix/zentao-<ID> → 改 → SSH 编译测试 → 闸门 G1–G11
+     → git commit（只本地）→ commit --no-svn --revision git:<哈希> --analysis-file a.json）
+   → 下一条 → report
 
 # 你（收尾）
-/need 答复 → /review 逐条审查 → 手动 svn merge 到 trunk → merged 卡片点「标记已结案」
+/need 答复 → /review 逐条看分析与闸门 → git -C <镜像目录> log/diff 审改动
+   → 通过后自己执行 git svn dcommit（或出 patch 打到正式副本再 svn ci）→ 拿到真实 r 号后回填：
+python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.c --no-svn --revision r<真实号>
+   → 是否 merge 到 trunk 由你决定 → merged 卡片点「标记已结案」
 ```
+
+回填那一步为什么可以重复 `commit`：`svn_revisions` 对同一个 bug 是**追加**而不是覆盖，
+`git:<哈希>`（本地草稿）与 `r<号>`（正式库）会并存在这条 bug 名下，审查记录是完整的。
