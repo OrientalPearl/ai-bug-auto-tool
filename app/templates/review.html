@@ -32,11 +32,11 @@
     <ul class="tight mono">{% for f in bug.files_changed %}<li>{{ f }}</li>{% endfor %}</ul>
     {% else %}<p class="muted">（未登记文件列表）</p>{% endif %}
 
-    <h4 class="hint" style="color:#23272f;font-weight:600">关联 SVN 提交</h4>
+    <h4 class="hint" style="color:#23272f;font-weight:600">关联提交（git:=本地草稿未进正式库 / 纯数字=SVN 已进库 / PENDING=未提交）</h4>
     {% if bug.revisions %}
     <ul class="tight">
       {% for r in bug.revisions %}
-      <li><b>r{{ r.revision }}</b> · {{ r.created_at }} · <code>{{ r.branch or bug.branch }}</code><br>{{ r.message }}</li>
+      <li><b>{{ r.revision | rev_label }}</b> · {{ r.created_at }} · <code>{{ r.branch or bug.branch }}</code><br>{{ r.message }}</li>
       {% endfor %}
     </ul>
     {% else %}<p class="muted">（无提交记录）</p>{% endif %}

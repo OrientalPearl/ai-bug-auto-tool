@@ -50,9 +50,15 @@
       <table class="grid">${rows}${gates}</table>`;
   }
 
+  // SVN numbers are shown with the r prefix; git:/PENDING/DRYRUN- stay verbatim.
+  function revLabel(value) {
+    const text = String(value == null ? "" : value);
+    return /^\d+$/.test(text) ? "r" + text : text;
+  }
+
   function renderBug(b) {
     const revs = (b.revisions || []).map(r =>
-      `<li><b>r${esc(r.revision)}</b> · ${esc(r.created_at)} · ${esc(r.branch || b.branch || "")}<br>${esc(r.message)}</li>`
+      `<li><b>${esc(revLabel(r.revision))}</b> · ${esc(r.created_at)} · ${esc(r.branch || b.branch || "")}<br>${esc(r.message)}</li>`
     ).join("");
     const needs = (b.needs || []).map(n => `
       <li><b>[${esc(LABELS[n.status] || n.status)}]</b> ${esc(n.question)}

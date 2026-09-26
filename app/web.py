@@ -33,6 +33,13 @@ def create_app() -> Flask:
     # ------------------------------------------------------------------
     # template helpers
     # ------------------------------------------------------------------
+    def _rev_label(value: Any) -> str:
+        """SVN numbers get the r prefix; git:/PENDING/DRYRUN- stay verbatim."""
+        text = str(value or "")
+        return "r" + text if text.isdigit() else text
+
+    app.jinja_env.filters["rev_label"] = _rev_label
+
     @app.context_processor
     def inject_helpers() -> dict[str, Any]:
         settings = get_settings()

@@ -13,7 +13,7 @@ from .config import get_settings
 from .zentao_client import ZentaoError
 from .zentao_session import make_client
 
-COMMIT_TEMPLATE = "AI 已提交分支 {branch}，SVN r{revision}，待人工审查。{extra}"
+COMMIT_TEMPLATE = "AI 已处理分支 {branch}：{revision_note} 待人工审查。{extra}"
 BLOCK_TEMPLATE = "AI 阻塞，需要主人决策。\n问题：{question}\n可选方案：{options}\nAI 建议：{advice}"
 REVIEW_PASS_TEMPLATE = "人工审查通过，已合入 trunk r{revision}，请主人/测试在禅道确认结案。"
 
@@ -182,8 +182,22 @@ def push_comment(zentao_id: int, text: str, *, client: ZentaoClient | None = Non
         return {"ok": False, "detail": str(exc)}
 
 
+def revision_note(revision: str) -> str:
+    """Describe a stored revision honestly: SVN number, local git draft, or nothing committed.
+
+    Zentao readers must never infer from a draft hash that the fix is already in the SVN repo.
+    """
+    text = str(revision or "").strip()
+    if text.isdigit():
+        return f"SVN r{text}，"
+    if text.startswith("git:"):
+        return f"本地 git 提交 {text[4:]}（尚未进 SVN），"
+    return "尚未提交（占位待人工提交），"
+
+
 def comment_commit(zentao_id: int, branch: str, revision: str, extra: str = "") -> dict:
-    text = COMMIT_TEMPLATE.format(branch=branch, revision=revision, extra=extra).strip()
+    text = COMMIT_TEMPLATE.format(branch=branch, revision_note=revision_note(revision),
+                                  extra=extra).strip()
     return push_comment(zentao_id, text)
 
 

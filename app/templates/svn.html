@@ -57,7 +57,7 @@
       <tbody>
         {% for r in g.revisions %}
         <tr>
-          <td><b>r{{ r.revision }}</b></td>
+          <td><b>{{ r.revision | rev_label }}</b></td>
           <td>{{ r.created_at }}</td>
           <td>{{ r.author or '-' }}</td>
           <td>
