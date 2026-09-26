@@ -108,7 +108,7 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
 ### 3.1 主循环指令（给主对话）
 
 ```
-角色：你是调度器，不亲自改代码。工作目录 C:\Users\82691\Desktop\AI-BUG。
+角色：你是调度器，不亲自改代码。工作目录 <项目目录>。
 循环直到退出条件满足：
   a. python -m app.cli tasks --limit 5；返回 0 条则跳到「收工」
   b. 按 product_id 分组；同一产品严格串行，不同产品可以并行开子任务
@@ -126,7 +126,7 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
 
 ```
 你只处理禅道 bug #<禅道ID>，做完立即结束，禁止顺带处理其他 bug。
-任务管理命令的工作目录：C:\Users\82691\Desktop\AI-BUG
+任务管理命令的工作目录：<项目目录>
 
 1) python -m app.cli status <禅道ID>
    读 product_id / product_name / steps / comments(备注) / attachments[].local_path / 历史提交 / owner_reply

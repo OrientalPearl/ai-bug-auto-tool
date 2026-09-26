@@ -30,7 +30,7 @@
 
 ## 2. 配置禅道（必做，否则同步会报错）
 
-编辑 `C:\Users\82691\Desktop\AI-BUG\.env`：
+编辑 `<项目目录>\.env`：
 
 ```
 ZENTAO_BASE_URL=http://你的禅道地址        # 例 http://zentao.example.com
@@ -49,7 +49,7 @@ SVN。**默认方式下本系统不执行 svn**（提交动作由目标代码库
 
 ```
 SVN_REPO_URL=https://svn.example.com/svn/project   # 全局回落：没绑定的产品用它
-SVN_WORKING_COPY=C:/Users/82691/Desktop/AI-BUG/svn_workspace
+SVN_WORKING_COPY=<项目目录>\svn_workspace
 SVN_TRUNK_PATH=/trunk
 SVN_BRANCH_ROOT=/branches
 SVN_USERNAME= SVN_PASSWORD=
