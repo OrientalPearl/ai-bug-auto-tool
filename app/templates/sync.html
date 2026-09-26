@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <h2>禅道同步</h2>
+  <form class="inline right" method="post" action="{{ url_for('sync_run') }}" data-confirm="将调用禅道 API 拉取指派给我的 active bug，确认执行？">
+    <button class="btn-primary" type="submit">立即同步</button>
+    <a class="btn" href="{{ url_for('sync_doctor') }}">一键诊断禅道</a>
+    <a class="btn" href="{{ url_for('sync_page') }}">刷新</a>
+  </form>
+</div>
+
+{% if doctor %}
+<div class="panel">
+  <h3>禅道诊断结果
+    <span class="badge badge-{{ 'green' if doctor.ok else 'red' }}">{{ '通过' if doctor.ok else '未通过' }}</span>
+  </h3>
+  <table class="grid">
+    <thead><tr><th style="width:140px">步骤</th><th style="width:80px">结果</th><th>详情</th></tr></thead>
+    <tbody>
+      {% for s in doctor.steps %}
+      <tr>
+        <td>{{ s.name }}</td>
+        <td>{% if s.ok %}<span style="color:#188038">OK</span>{% elif s.ok is none %}<span class="muted">INFO</span>{% else %}<span style="color:#d93025">FAIL</span>{% endif %}</td>
+        <td class="mono" style="font-size:12px; word-break:break-all; white-space:pre-wrap">{{ s.detail }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">结论：{{ doctor.hint }}</p>
+  {% if not doctor.ok %}
+  <p class="hint">
+    如果是「登录取 token」这步失败，多半有三种情况：<br>
+    1. <b>没开 RESTful 接口</b>：禅道「后台 → 系统 → 二次开发/接口设置」打开 RESTful API；<br>
+    2. <b>地址/端口不对</b>：<code>ZENTAO_BASE_URL</code> 只填根地址（例 <code>http://192.168.1.10:8888</code>），
+       若禅道装在子目录则填 <code>http://ip/zentao</code>；也可用 <code>ZENTAO_TOKENS_PATH</code> 改登录路径；<br>
+    3. <b>账号被锁 / 要求验证码</b>：先在浏览器登录一次确认账号可用，
+       然后改用手工令牌：浏览器 F12 → Network → 任意 <code>api.php/v1</code> 请求的 <code>Token</code> 请求头值，
+       填进 <code>.env</code> 的 <code>ZENTAO_TOKEN=xxx</code>（填了它就跳过账号密码登录）。
+  </p>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="stat">
+  <div><b>{{ summary.created_today }}</b><span class="muted">今日新增</span></div>
+  <div><b>{{ summary.updated_today }}</b><span class="muted">今日更新</span></div>
+  <div><b>{{ summary.total_bugs }}</b><span class="muted">库内 bug 总数</span></div>
+  <div><b>{{ summary.pending }}</b><span class="muted">待处理 pending</span></div>
+  <div><b>{{ summary.details_missing }} / {{ summary.details_total }}</b><span class="muted">详情（图片/备注）待抓</span></div>
+  <div><b>{{ summary.last_sync.created_at if summary.last_sync else '尚未同步' }}</b><span class="muted">最近同步时间</span></div>
+</div>
+
+<div class="panel">
+  <h3>批量抓取详情（图片 / 备注 / 附件）</h3>
+  <p class="hint">
+    列表同步只带回标题和简要字段，<b>截图、备注、附件</b>要逐条抓详情才能看到（AI 修复前必须先看到这些）。
+    抓取按 <code>pri 升序 + severity 降序</code> 排队，条数填 <code>0</code> 表示<b>全量</b>（未关闭的 bug 全部抓一遍）。
+  </p>
+  <form class="inline" method="post" action="{{ url_for('sync_details') }}"
+        data-confirm="将逐条访问禅道详情页并下载截图，全量可能需要几分钟，确认执行？">
+    <label for="limit">抓取条数</label>
+    <input type="number" id="limit" name="limit" value="0" min="0" step="1" style="width:110px">
+    <button class="btn-primary" type="submit">开始抓取（0 = 全量）</button>
+    <span class="muted">当前还有 {{ summary.details_missing }} 条未抓详情（共 {{ summary.details_total }} 条未关闭 bug）</span>
+  </form>
+</div>
+
+<div class="panel">
+  <h3>同步规则</h3>
+  <p class="hint">
+    1. 先取产品列表（<code>GET /api.php/v1/products</code>），若设置了 <code>ZENTAO_PRODUCT_IDS</code> 则只取指定产品；<br>
+    2. 逐产品取 <code>GET /api.php/v1/products/{id}/bugs?status=active</code>，本地过滤 <code>assignedTo == 我</code>（等价 browseType=assigntome）；<br>
+    3. 每条 bug 落库字段：zentao_id / title / steps / severity / pri / module / assignedTo / openedBuild；<br>
+    4. 已存在的 bug 只更新禅道侧字段，<b>不会覆盖本地工作流状态</b>（pending / fixing / await_review …）。
+  </p>
+  <p class="hint">
+    当前配置：产品ID <b>{{ settings_view.zentao_product_ids }}</b>，账号 <b>{{ settings_view.zentao_account }}</b>，
+    地址 <b>{{ settings_view.zentao_base_url }}</b>。
+    {% if not zentao_ready %}<span style="color:#d93025">禅道账号未配置，请先编辑 .env</span>{% endif %}
+  </p>
+</div>
+
+<div class="panel">
+  <h3>最近同步日志</h3>
+  {% if logs %}
+  <table class="grid">
+    <thead><tr><th style="width:70px">ID</th><th style="width:90px">动作</th><th style="width:90px">禅道ID</th><th>详情</th><th style="width:150px">时间</th></tr></thead>
+    <tbody>
+      {% for row in logs %}
+      <tr>
+        <td>{{ row.id }}</td>
+        <td><span class="badge badge-{{ 'green' if row.action=='sync' else ('yellow' if row.action=='error' else 'blue') }}">{{ row.action }}</span></td>
+        <td>{{ row.zentao_id or '-' }}</td>
+        <td class="mono" style="font-size:12px; word-break:break-all">{{ row.payload }}</td>
+        <td>{{ row.created_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">还没有同步记录，点击上方「立即同步」。</p>
+  {% endif %}
+</div>
+{% endblock %}

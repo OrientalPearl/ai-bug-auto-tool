@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <h2>需方案清单</h2>
+  <div class="inline">
+    {% for s in ['awaiting', 'replied', 'done', 'all'] %}
+      <a class="btn {{ 'btn-primary' if current == s }}" href="{{ url_for('need_page', status=s) }}">
+        {{ {'awaiting':'待我答复','replied':'已答复待AI处理','done':'已处理','all':'全部'}[s] }}
+      </a>
+    {% endfor %}
+  </div>
+</div>
+
+{% if needs %}
+<div class="grid-cards">
+  {% for n in needs %}
+  <div class="panel">
+    <h3>
+      禅道 #{{ n.zentao_id }} · {{ n.title }}
+      <span class="badge badge-{{ {'awaiting':'yellow','replied':'blue','done':'green'}[n.status] }}">
+        {{ {'awaiting':'待答复','replied':'已答复','done':'已处理'}[n.status] }}
+      </span>
+    </h3>
+    <p class="hint">
+      bug 状态：<b>{{ status_labels[n.bug_status] }}</b> ·
+      pri {{ n.pri }} / S{{ n.severity }} ·
+      分支 <code>{{ n.branch or '未建' }}</code> ·
+      提问时间 {{ n.created_at }}{% if n.replied_at %} · 答复时间 {{ n.replied_at }}{% endif %}
+    </p>
+
+    <h4 class="hint" style="color:#23272f;font-weight:600">AI 卡在哪一步（question）</h4>
+    <pre class="detail-block" style="white-space:pre-wrap">{{ n.question }}</pre>
+
+    {% if n.ai_options %}
+    <h4 class="hint" style="color:#23272f;font-weight:600">AI 可选方案（ai_options）</h4>
+    <div style="white-space:pre-wrap">{{ n.ai_options }}</div>
+    {% endif %}
+
+    {% if n.ai_advice %}
+    <h4 class="hint" style="color:#23272f;font-weight:600">AI 建议（ai_advice）</h4>
+    <div style="white-space:pre-wrap">{{ n.ai_advice }}</div>
+    {% endif %}
+
+    {% if n.owner_reply %}
+    <h4 class="hint" style="color:#188038;font-weight:600">我的答复</h4>
+    <div style="white-space:pre-wrap">{{ n.owner_reply }}</div>
+    {% endif %}
+
+    <form method="post" action="{{ url_for('need_reply', need_id=n.id) }}" style="margin-top:10px">
+      <textarea name="owner_reply" placeholder="填写方案 / 决策，例如：按方案A改，只影响 XX 模块，注意兼容旧数据"
+                data-required>{{ n.owner_reply or '' }}</textarea>
+      <div class="row-actions">
+        <button class="btn btn-primary" type="submit">提交方案</button>
+        <span class="hint">提交后状态变 replied，AI 下次运行按 pri/优先级最先处理该 bug。</span>
+      </div>
+    </form>
+
+    {% if n.status == 'replied' %}
+    <form method="post" action="{{ url_for('need_done', need_id=n.id) }}"
+          data-confirm="确认该阻塞项已由 AI 处理完成并关闭？">
+      <div class="row-actions"><button class="btn" type="submit">标记已处理完成</button></div>
+    </form>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="panel"><p class="muted">当前状态下没有阻塞项。AI 处理不动的 bug 会出现在这里。</p></div>
+{% endif %}
+{% endblock %}

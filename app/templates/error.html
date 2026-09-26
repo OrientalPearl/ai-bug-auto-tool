@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="panel">
+  <h2 style="margin:0">{{ code }}</h2>
+  <p class="muted">{{ message }}</p>
+  <a class="btn btn-primary" href="{{ url_for('kanban') }}">回到看板</a>
+</div>
+{% endblock %}

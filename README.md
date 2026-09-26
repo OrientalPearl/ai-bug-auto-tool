@@ -1,0 +1,333 @@
+# 禅道 Bug 自动修复闭环系统
+
+本机跑的「禅道拉取 → SQLite 排队 → AI 自动修复提交分支 → 人工审查 → 合入 trunk → 结案」闭环。
+
+- 服务地址：<http://127.0.0.1:5000>
+- 数据库：`bug_system.db`（已建好全部表）
+- AI 执行器规则：`AGENTS.md`（Trae 读它干活）
+- 自动连跑下达手册：`AUTO_LOOP.md`（一条跑完自动下一条 + 提交闸门 G1–G10 + 可复制指令）
+- 能力清单 / 接口协议：`CAPABILITIES.md`
+- 账号密码配置：`.env`（已被 `.gitignore` 忽略）
+
+---
+
+## 1. 一键启动 / 停止
+
+**最省事：双击项目根目录的 `start_web.bat`** —— 它会自检 Python、自动装依赖（缺才装）、
+建库、启动服务并自动打开浏览器 <http://127.0.0.1:5000>。窗口关掉即停止服务。
+
+| 方式 | 操作 |
+| --- | --- |
+| 一键启动 | 双击 `start_web.bat` |
+| 启动并顺带同步禅道 | 双击 `start_web_sync.bat`（或命令行 `start_web.bat sync`） |
+| 命令行启动 | `python run_web.py`（带浏览器）/ `python run_web.py --no-browser` |
+| 换端口 | `python run_web.py --port 8080`，或改 `.env` 里的 `WEB_PORT` |
+| 停止 | 关闭那个命令行窗口，或在该窗口按 `Ctrl+C` |
+| 看是否在跑 | 浏览器开 <http://127.0.0.1:5000/healthz>，返回 `"ok": true` 即在运行 |
+
+重复双击不会报错：检测到端口被占用时只提示「系统已在运行」并直接打开页面。
+改完 `.env` 后需重启一次服务（关窗口再双击）才会生效。
+
+## 2. 配置禅道（必做，否则同步会报错）
+
+编辑 `C:\Users\82691\Desktop\AI-BUG\.env`：
+
+```
+ZENTAO_BASE_URL=http://你的禅道地址        # 例 http://zentao.example.com
+ZENTAO_ACCOUNT=你的账号
+ZENTAO_PASSWORD=你的密码
+ZENTAO_PRODUCT_IDS=                        # 留空=全部产品；也可写 1,3,7
+
+# 执行器行为（放在同一个 .env 里）
+REQUIRE_ANALYSIS=true                      # 没写分析结论不许 commit（默认 true）
+AI_BATCH_SIZE=5                            # 每批处理条数
+```
+
+SVN。**默认方式下本系统不执行 svn**（提交动作由目标代码库自己的提交细则负责），这里填的仓库地址只用于：
+闸门 G3 判断「改的文件属不属于这个产品」、审查页展示归属、以及你想让本系统代跑 svn 时的可选方式。
+各产品自己的仓库在「产品仓库」页或 `bind-repo` 里绑定（见第 3 节）：
+
+```
+SVN_REPO_URL=https://svn.example.com/svn/project   # 全局回落：没绑定的产品用它
+SVN_WORKING_COPY=C:/Users/82691/Desktop/AI-BUG/svn_workspace
+SVN_TRUNK_PATH=/trunk
+SVN_BRANCH_ROOT=/branches
+SVN_USERNAME= SVN_PASSWORD=
+SVN_ALLOW_TRUNK_WRITE=false                # 保持 false，AI 禁止碰主干
+BRANCH_PREFIX=bugfix/zentao-               # 分支名 = 前缀 + 禅道ID（产品可各自覆盖）
+```
+
+改完在「配置」页点 **重新读取 .env**。「禅道同步」页点 **立即同步** 验证是否通：
+拉的是 `status=active` 且 `assignedTo=我` 的 bug（等价 browseType=assigntome），
+每条落库 id/标题/steps/severity/pri/module/assignedTo/openedBuild。
+
+### 认证通道 `ZENTAO_AUTH_MODE`
+
+禅道有两种可通的通道，按你的环境选：
+
+| 值 | 走法 | 适用 |
+| --- | --- | --- |
+| `rest` | `POST /api.php/v1/tokens` 换 token，请求头 `Token:` | 标准禅道，api.php 未被拦截 |
+| `session` | 模拟浏览器登录 `/user-login.html`（`md5(md5(密码)+verifyRand)` + `verifyRand`/`passwordStrength`/`keepLogin`），再读 `/xxx.json` 内部接口 | api.php 被统一登录网关拦截时（**本机实测采用**） |
+| `cookie` | 直接复用浏览器复制来的 `zentaosid`，**完全不发密码** | 走 LDAP/扫码/免密 SSO，或不想让脚本碰密码 |
+| `auto` | 有 `ZENTAO_COOKIE` 用 cookie，否则用 rest（**不会**自动发密码，避免误试锁号） | 默认 |
+
+会话模式读的是 `/product-index.json`（`data.products` 是 `{id:名称}`）和
+`/my-bug-assignedTo-pri_asc-0-100-{页}.json`（`data.bugs` 已内含 `steps`，无需逐条取详情）。
+
+> **截图与备注要单独拉**：禅道列表接口只带回文字描述，描述里的截图
+> （`<img src="/file-read-xxx.png">`）和「备注/操作记录」（在 `actions` 里）必须按条抓详情。
+> 看板卡片展开后有「**拉取截图 / 备注 / 附件**」按钮，「禅道同步」页有 **批量抓取详情**（条数填 `0` = 全量）；
+> 命令行对应：
+>
+> ```
+> python -m app.cli detail <禅道ID>     # 单条
+> python -m app.cli detail --limit 20   # 优先级最高的 20 条
+> python -m app.cli detail --all        # 全量（所有未关闭 bug 逐条抓）
+> python -m app.cli sync --details 5    # 同步 + 抓队首 5 条
+> python -m app.cli sync --details -1   # 同步 + 全量抓
+> ```
+>
+> 图片落到 `attachments/zentao-<ID>/`（已 gitignore），`steps` 里的
+> `[图片N: /files/<ID>/xxx.png]` 直接指向本地文件，页面上会显示成缩略图画廊。
+> 全量抓取是逐条访问禅道详情页，100 条约 1~2 分钟，中途失败只影响单条（结果里 `failed`/`errors` 会列出）。
+>
+> 说明：会话模式下 `module` 存的是**模块 ID**（禅道只在各产品浏览页单独下发模块名，
+> 同步时不值得为 60+ 产品各发一次请求）。
+>
+> 评论接口：REST 模式默认依次尝试 `POST /api.php/v1/bugs/{id}/comments`、`/comment`、
+> `/api.php/v1/products/0/bugs/{id}/comments`；会话模式尝试
+> `POST /bug-comment-{id}.json`、`.html`。可用 `ZENTAO_COMMENT_PATH` 覆盖。
+> 失败不阻塞流程，评论原文会写进 `sync_log` 表留痕。
+> 本系统**不提供** resolve/close 接口，AI 无法自动结案。
+>
+> 排查顺序：「禅道同步」页 → **一键诊断禅道**（分步回显配置/会话/端点/产品解析/Bug 解析），
+> 或命令行 `python -m app.cli doctor`；要抓原始响应校准解析用
+> `python -m app.cli session-probe`（样本写到 `session_dump/`）。
+
+## 3. 按产品区分代码库（多仓库）
+
+禅道里你的 bug 分布在多个产品上（本机实测：`DPDKUAC&NGFW`、`AC-10G`、`网络审计（DPDK）`… 6 个产品 100 条），
+而**每个产品的代码在不同 SVN 仓库**。系统的处理方式是：
+
+1. 同步时把每条 bug 的 `product_id / product_name` 一起落库（禅道列表接口的 `product` 字段）；
+2. 「产品仓库」页（`/repos`）或 `bind-repo` 命令把 **产品 ID → 仓库根地址** 绑定，存 `product_repos` 表；
+3. `branch` / `commit` 只要给禅道 ID，就自动解析出该 bug 产品的仓库；
+4. 每个绑定产品有**独立工作副本**（默认 `svn_workspace/p<产品ID>-<仓库哈希>`），多产品切换不会互相污染；
+5. 产品没绑定 → 回落 `.env` 的 `SVN_REPO_URL`；连它也为空 → 命令直接报错并打印该执行的 `bind-repo` 命令，
+   **绝不猜仓库**。
+
+### 绑定操作
+
+网页：打开 <http://127.0.0.1:5000/repos> → 选产品 → 填仓库根地址（不含 `/trunk`）→ 保存绑定。
+
+命令行（Trae / 脚本用这个）：
+
+```
+python -m app.cli repos                       # 看每个产品的 bug 数与生效仓库、工作副本
+python -m app.cli bind-repo 25 svn://10.0.0.1/repo/dpdkuac --name "DPDKUAC&NGFW" --build "make all" --test "make test"
+                                              # 编译/测试命令会一并下发给 AI；还可加 --trunk-path/--branch-root/--working-copy/--branch-prefix/--note/--disabled
+python -m app.cli svn-check --all             # 逐仓库只读自检（客户端/可达/trunk/工作副本归属）
+python -m app.cli svn-check --product 25      # 只检查某个产品解析出来的仓库
+python -m app.cli bind-repo 25 --unbind       # 解绑，回落到全局 SVN_REPO_URL
+```
+
+绑定时怎么拿到产品 ID：`repos` 命令 / 「产品仓库」页 / 看板卡片上的产品标签都直接显示；
+禅道网址 `product-browse-0--byProject-0-...` 里也行，最准的是 `/product-view-{ID}.html` 里的 ID。
+
+一条 bug 会落到哪个仓库，可以先干跑确认（不会真的动 SVN）：
+
+```
+python -m app.cli branch 51452 --dry-run
+{"branch":"bugfix/zentao-51452","product_id":25,"product_name":"DPDKUAC&NGFW",
+ "repo":"svn://.../dpdkuac","repo_source":"product",
+ "trunk":"svn://.../dpdkuac/trunk","working_copy":"...\\svn_workspace\\p25-fb94b59e"}
+```
+
+`repo_source` 为 `product` 表示用了产品绑定，`global` 表示回落到 `.env`。
+
+## 4. 给 Trae 的完整操作剧本（自动修复 + 回填）
+
+系统跑通后，你在 Trae 里只需要说一句「按 AGENTS.md 处理禅道 bug」，Trae 会按下面的顺序做；
+你本人只在两处介入：**需方案清单里答复** 和 **审查清单里通过/打回**。
+
+**职责边界**：本系统只做**任务管理**（拉禅道、抓截图备注、排队、状态、登记修订号、审查、回写评论）。
+「什么情况下允许提交、提交怎么走（SSH / 是否需同意）/ 真实修订号从哪来」这些**提交细则由目标代码库自己的知识体系决定**，
+本系统只下达一份「提交闸门 G1–G10」清单，不复制也不解释那些细则。默认本系统**不执行 svn**。
+
+> 「一条跑完自动下一条」的完整下达方式（两种执行方式、G1–G10 提交闸门、可复制的主循环与子任务指令、
+> 并行约束）见 **`AUTO_LOOP.md`**。下面只是最小骨架。
+
+```
+① 准备（一次性）
+   python -m app.cli doctor            # 禅道通道是否通
+   python -m app.cli repos             # 各产品是否已绑定仓库（闸门 G3 要用）
+   python -m app.cli bind-repo <pid> <仓库地址> --build "..." --test "..."
+
+② 取任务（每轮开始）
+   python -m app.cli sync --details -1   # 全量拉 bug + 全部截图/备注/附件
+   python -m app.cli tasks --limit 5     # 取本轮队列（已答复 > 已打回 > 待处理，pri 升序 / severity 降序）
+
+③ 逐条处理（每批 5 条，处理完自动取下一批，不问「是否继续」）
+   python -m app.cli status <禅道ID>     # 全文 + 截图本地路径 + 备注 + 历史提交 + 主人答复 + 所属产品
+   python -m app.cli claim  <禅道ID>     # 占住任务，避免被别的子任务重复领
+   ... 在该库自己的知识体系下定位并改代码、跑该库的编译/测试 ...
+   ... 逐条核对 AUTO_LOOP.md 的提交闸门 G1–G10 ...
+   闸门全过 → 按该代码库自己的提交细则提交到 bugfix/zentao-<ID>，拿真实修订号后回本系统登记：
+   python -m app.cli commit <禅道ID> --message "..." --files a.c,b.c --summary "..." --verify "..." --no-svn --revision <真实修订号> --analysis-file a.json
+        # = 存 analyses（分析结论） + 写 svn_revisions + 状态置 await_review + 回写禅道评论（不跑 svn）
+   **分析结论是必交付物**：REQUIRE_ANALYSIS=true（默认）时没写分析的 commit 会被直接拒绝，
+   字段规范见 `AUTO_LOOP.md` §2.1；也可先 `analyze <禅道ID> --kind commit --analysis-file a.json` 再 commit
+   还需你授权才提交：把 --revision 换成 PENDING 并用 --extra 说明「待主人按仓库细则提交」
+   拿不定主意时：
+   python -m app.cli block <禅道ID> --question "..." --options "方案A…；方案B…" --advice "建议A"
+        # = 写 need_solution + 状态 need_solution + 回写禅道「AI 阻塞」，然后立刻做下一条
+
+④ 人工环节（你）
+   「需方案清单」/need  → 写答复提交 → 状态 replied，Trae 下轮优先处理
+   PENDING 的条目 → 你自己按仓库细则提交后回填真实修订号（`AUTO_LOOP.md` §3.3）
+   「审查清单」/review  → 看 diff/说明 → 通过填 trunk 修订号 → merged；打回填原因 → rejected 重回队列
+   merged 的卡片 → 「标记已结案」→ closed（禅道侧 resolve/close 由你手动做，AI 无权限）
+
+⑤ 收尾
+   python -m app.cli report            # 已提交待审 / 需方案 / 续修 / PENDING 待提交
+```
+
+安全边界（系统强制，Trae 绕不过去）：AI 不能提交或合并 trunk、不能 resolve/close 禅道 bug、
+不能改与当前 bug 无关的文件、闸门未过不许提交、不许绕过仓库自己的提交门禁；
+所有改动都挂在 `bugfix/zentao-<ID>` 名下等你审查。
+
+## 5. 页面怎么用
+
+| 页面 | 用途 |
+| --- | --- |
+| **看板** `/` | 按 7 种状态分列展示（灰/蓝/黄/橙/绿/深绿/红），卡片上有产品标签；点开展开描述、截图画廊、备注、分支、SVN 记录、需方案记录、审查记录，并有「拉取截图/备注/附件」按钮 |
+| **禅道同步** `/sync` | 「立即同步」+「批量抓取详情（0=全量）」+ 待抓详情条数 + 今日新增/更新 + 同步日志 + 一键诊断 |
+| **需方案清单** `/need` | AI 卡住的问题、可选方案、AI 建议；你在输入框写答复提交 → 状态 `replied`，AI 下次优先处理 |
+| **审查清单** `/review` | AI 的分析结论（根因/定位依据/链路/影响面/验证结果/未验证项/闸门逐条）+ 修改文件列表 + SVN 提交号 + 修复说明与验证步骤 + 截图；填 trunk 号点「通过」→ `merged`；填原因点「打回」→ `rejected` 并重回 AI 队列 |
+| **SVN 记录** `/svn` | 按 bug 分组，同一 bug 多次提交连续排列；「当前/全部仓库自检」按钮 |
+| **产品仓库** `/repos` | 产品 ↔ 代码库绑定：每个产品的 bug 数、生效仓库来源、实际 trunk 与工作副本；绑定/编辑/解绑 |
+| **配置** `/config` | 当前生效配置（密码脱敏）+ 重新读取 `.env` |
+
+`merged` 的卡片展开后有「标记已结案」按钮 → 本地变 `closed`（禅道状态仍由你手动改）。
+
+## 6. AI 执行器命令一览
+
+`AGENTS.md` 是给 AI 的协议，所有动作都通过带 JSON 输出的 CLI 完成，AI 不需要手写 SQL：
+
+```
+python -m app.cli init                    # 建库建表（幂等，启动时也会自动补列/补表）
+python -m app.cli sync                    # 拉禅道 bug 入库（文字）
+python -m app.cli sync --details 5        # 并抓队首 5 条的截图/备注/附件
+python -m app.cli sync --details -1       # 并全量抓截图/备注/附件
+python -m app.cli detail 1024             # 抓单条截图/备注/附件到 attachments/
+python -m app.cli detail --limit 20       # 抓优先级最高的 20 条
+python -m app.cli detail --all            # 全量抓
+python -m app.cli tasks --limit 5         # 取队列：已答复 > 已打回 > 待处理，再按 pri 升序 / severity 降序
+python -m app.cli status 1024             # 读全文 + 历史提交 + 主人答复 + 所属产品
+python -m app.cli repos                   # 每个产品的 bug 数与生效仓库
+python -m app.cli bind-repo 25 <仓库地址> --name "产品名" --build "..." --test "..."
+python -m app.cli branch 1024 [--dry-run] # 在 bug 所属产品的仓库 svn copy trunk -> branches/bugfix/zentao-1024 并 switch
+python -m app.cli note 1024 --summary "..." --verify "..." --files a.py,b.py
+python -m app.cli analyze 1024 --kind commit --analysis-file a.json
+                                     # 写入分析结论（现象/根因/证据/链路/改动/影响面/验证/未验证/回退/结论 + gates）
+                                     # 也支持 --analysis-stdin 与单字段 --root-cause/--evidence/--impact/--gates "G1=pass,..."
+python -m app.cli commit 1024 --message "..." --files a.py --summary "..." --verify "..." --no-svn --revision r123 --analysis-file a.json
+                                     # = 存 analyses + 写 svn_revisions + await_review + 回写禅道评论（默认不跑 svn）
+                                     # REQUIRE_ANALYSIS=true 时：没有分析结论的 commit 会被直接拒绝
+python -m app.cli block 1024 --question "..." --options "A..;B.." --advice "建议A"
+                                     # = 写 need_solution + need_solution 状态 + 回写禅道「AI 阻塞」
+python -m app.cli need-done <need_id>     # 关闭已答复的阻塞项
+python -m app.cli comment 1024 --text "..."  # 仅回写一条禅道评论
+python -m app.cli doctor                  # 禅道通道分步诊断（只读）
+python -m app.cli session-probe           # 抓禅道原始响应到 session_dump/ 便于对齐字段
+python -m app.cli svn-check [--all|--product 25]   # SVN 只读自检：客户端/可达/认证/trunk/工作副本/主干保护
+python -m app.cli report                  # 停止时输出汇总
+python -m app.cli config                  # 查看当前配置（密码脱敏）
+python -m app.cli demo --clear            # 清除演示数据
+```
+
+`commit` 会拒绝指向 trunk 的工作副本；SVN 没配好时可用 `--no-svn --revision PENDING`
+先登记为待审查，不阻塞后续 bug。
+
+## 7. 数据库表
+
+```
+bugs(id, zentao_id UNIQUE, title, severity, pri, status, branch,
+     steps, steps_html, comments, attachments, module,
+     product_id, product_name, assigned_to, assigned_to_name,
+     opened_by, opened_build, zentao_status, zentao_resolution, opened_date,
+     fix_summary, verify_steps, files_changed, raw_json, detail_synced_at,
+     synced_at, created_at, updated_at)
+                   # comments = 禅道备注/操作记录 JSON；attachments = 截图与附件
+                   # (file_id/ext/url/name/local_path/web_path/size)
+                   # product_id = 禅道产品，决定这条 bug 用哪个代码库
+product_repos(product_id PK, product_name, repo_url, trunk_path, branch_root,
+              working_copy, branch_prefix, build_command, test_command, note,
+              enabled, created_at, updated_at)
+                   # 一个产品 = 一个仓库；enabled=0 或删行则回落全局 SVN_*
+need_solution(id, bug_id, question, ai_options, ai_advice, owner_reply,
+              status[awaiting|replied|done], created_at, replied_at, done_at)
+analyses(id, bug_id, kind[commit|block|manual], symptom, root_cause, evidence,
+         call_chain, change_desc, impact, verify, gates(JSON G1–G10), unverified,
+         rollback, conclusion, author, created_at)
+                   # 执行器每条 bug 收尾必写的分析结论；commit 会校验其存在
+svn_revisions(id, bug_id, revision, branch, message, author, files, created_at)
+reviews(id, bug_id, result[pass|reject], reject_reason, merged_revision, reviewer, created_at)
+sync_log(id, action[sync|update|comment|error], zentao_id, payload, created_at)
+meta(key, value)          # 最近同步时间等杂项
+```
+
+表和列由 `db.init_db()` / `db.migrate()` 自动补齐（每次 `python -m app.cli` 与启动 Web 都会检查，
+全部语句是 `IF NOT EXISTS`，不会动已有数据），不用你手动 ALTER。
+
+`status` 枚举：`pending / fixing / need_solution / await_review / rejected / merged / closed`。
+
+## 8. 常见问题
+
+1. **点同步报「禅道未配置」** → `.env` 三项必填没填。
+2. **登录取不到 token** → 先在「禅道同步」页点 **一键诊断禅道**，它会分步回显真实响应
+   （配置 / 站点可达 / 登录 / 产品列表 / Bug 列表），再按提示处理：
+   - 返回 HTML 页面 → `ZENTAO_BASE_URL` 路径不对，或后台没开 RESTful API；
+   - 返回 `{"errcode":401,"errmsg":"缺少code参数"}` 这类**不是禅道原生格式**的 JSON
+     → `api.php` 被前置网关/统一登录接管了，账号密码换 token 这条路走不通，
+     需要管理员对 `api.php` 放行，或改用下面的手工令牌；
+   - 提示需要验证码 / 账号被锁 → 用 `ZENTAO_TOKEN` 手工令牌（填了就跳过账号密码登录）。
+3. **自签 HTTPS 证书报错** → 保持 `ZENTAO_VERIFY_SSL=false`。
+4. **`branch`/`commit` 报「产品 X 未绑定代码库」** → 该产品还没绑定、`.env` 的 `SVN_REPO_URL` 也为空。
+   去 `/repos` 页绑定，或 `python -m app.cli bind-repo <产品ID> <仓库根地址>`；
+   绑完用 `python -m app.cli branch <禅道ID> --dry-run` 确认输出里 `repo_source` 是 `product`。
+5. **`working_copy` 显示「该副本属于 …，与本产品仓库不一致」** → 那个目录是别的产品检出的。
+   删掉该目录让它重新 checkout，或在绑定里给它单独指定一个 `working_copy`。
+6. **老 bug 没有产品名/产品 ID** → 产品字段是新增的，重新点一次「立即同步」即可回填。
+7. **SVN 相关任何不通** → 先跑 `python -m app.cli svn-check --all`（或页面「SVN 记录 → 全部仓库自检」），
+   它只跑 `svn --version` / `svn info`，逐仓库告诉你：客户端版本、仓库地址是否可达、
+   认证是否通过、`/trunk` 是否存在、`/branches` 是否要自动建、工作副本状态、
+   以及 `SVN_ALLOW_TRUNK_WRITE` 是否仍为 false。
+   注意本机 svn 是 **1.6.16-SlikSvn**：若仓库工作副本是 1.7+ 格式（`.svn/wc.db`），
+   1.6 客户端读不了，自检会直接 FAIL 提示，需要升级客户端并把 `SVN_BIN` 指向新的 `svn.exe`。
+8. **页面数据为空** → 数据库里目前只有 `[DEMO]` 演示数据时会被真实同步混着显示，
+   用 `python -m app.cli demo --clear` 清掉。
+
+## 9. 目录结构
+
+```
+run_web.py           一键启动入口（建库 + 起服务 + 开浏览器，支持 --sync/--port）
+start_web.bat        双击启动（自检 Python、缺依赖时自动 pip install）
+start_web_sync.bat   双击启动并先同步禅道
+app/config.py        读取 .env，集中配置
+app/db.py            SQLite 建表/迁移 + 全部数据访问（含 product_repos）
+app/zentao_client.py 禅道 REST v1 客户端（token 认证，只读 + 评论）
+app/zentao_session.py禅道会话客户端（登录 + /xxx.json 内部接口 + 附件下载）
+app/zentao_parse.py  禅道响应解析（描述/图片/备注/附件 共用一层）
+app/svn_client.py    svn 命令封装（按产品解析仓库、分支、提交、log、trunk 保护）
+app/sync.py          同步、批量抓详情、回写编排
+app/web.py           Flask 页面与接口
+app/cli.py           AI 执行器命令行（全部输出单条 JSON）
+app/templates/       看板/同步/需方案/审查/SVN/产品仓库/配置 页面
+app/static/          style.css + app.js（展开卡片、确认框）
+AGENTS.md            AI 批量执行规则（Trae 读它干活）
+AUTO_LOOP.md         自动连跑下达手册（提交闸门 G1–G10 + 可复制的主循环/子任务指令）
+README.md            本文档（使用与运维）
+CAPABILITIES.md      能力清单与接口协议（CLI/Web/DB 三张表）
+```

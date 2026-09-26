@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <h2>产品与代码库</h2>
+  <span class="muted">不同禅道产品对应不同代码库，AI 建分支 / 提交时按 bug 的产品自动选库</span>
+  <span class="right">
+    <a class="btn" href="{{ url_for('svn_check', all=1) }}">全部仓库自检</a>
+    <a class="btn" href="{{ url_for('repos_page') }}">刷新</a>
+  </span>
+</div>
+
+<div class="panel">
+  <h3>选库规则</h3>
+  <p class="hint">
+    <b>默认方式下本系统不执行 svn</b>：提交动作与提交资格由目标代码库自己的提交细则负责，
+    这里的绑定用于「这条 bug 属于哪份代码」的判定（提交闸门 G3）与审查页展示。
+    只有在该仓库允许本系统代跑 svn 时才会真正用到下面的建分支逻辑。<br>
+    1. 先查 <code>product_repos</code> 表：该 bug 的 <b>产品</b> 有绑定且 enabled=1 → 用产品仓库；<br>
+    2. 没有绑定 → 回落到 <code>.env</code> 的全局 <code>SVN_REPO_URL / SVN_TRUNK_PATH / SVN_BRANCH_ROOT</code>；<br>
+    3. 全局也没配 → <code>branch</code> / <code>commit</code> 直接报错并给出 <code>bind-repo</code> 命令；<br>
+    4. 每个已绑定产品使用<b>独立工作副本</b>（留空时自动分配
+    <code>{{ global_repo.working_copy }}\p&lt;产品ID&gt;-&lt;仓库哈希&gt;</code>），避免多产品互相切库；<br>
+    5. 主干始终只读：AI 只能提交到 <code>&lt;仓库&gt;/&lt;分支根&gt;/{{ edit.branch_prefix }}&lt;禅道ID&gt;</code>。
+  </p>
+</div>
+
+<div class="panel">
+  <h3>全局回落仓库（未绑定产品使用）</h3>
+  <p class="hint">
+    仓库：<code>{{ global_repo.repo_url or '(未配置)' }}</code><br>
+    主干：<code>{{ global_repo.trunk_url() if global_repo.repo_url else '-' }}</code>
+    　分支根：<code>{{ global_repo.branch_root_url() if global_repo.repo_url else '-' }}</code><br>
+    工作副本：<code>{{ global_repo.working_copy }}</code>
+    　分支前缀：<code>{{ global_repo.branch_prefix }}&lt;禅道ID&gt;</code>
+  </p>
+  {% if not global_repo.repo_url %}
+  <p class="hint" style="color:#d93025">
+    全局仓库为空：请在 <code>.env</code> 填写 <code>SVN_REPO_URL</code>，或干脆只给每个产品绑定仓库（推荐后者）。
+  </p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h3>产品清单（共 {{ rows|length }} 个产品有 bug）</h3>
+  {% if rows %}
+  <table class="grid">
+    <thead>
+      <tr>
+        <th style="width:60px">产品ID</th>
+        <th style="width:150px">产品名</th>
+        <th style="width:60px">Bug</th>
+        <th style="width:60px">待处理</th>
+        <th style="width:90px">仓库来源</th>
+        <th>实际生效的 trunk / 工作副本</th>
+        <th style="width:120px">操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td>{{ r.product_id or '-' }}</td>
+        <td>{{ r.product_name or '(无名)' }}</td>
+        <td>{{ r.bugs }}</td>
+        <td>{{ r.pending }}</td>
+        <td>
+          {% if r.error %}<span class="badge badge-red">配置异常</span>
+          {% elif r.source == 'product' %}<span class="badge badge-green">产品绑定</span>
+          {% elif r.source == 'global' %}<span class="badge badge-grey">全局回落</span>
+          {% else %}<span class="badge badge-grey">不可用</span>{% endif %}
+        </td>
+        <td>
+          {% if r.effective_trunk %}
+          <div class="wc">{{ r.effective_trunk }}</div>
+          <div class="wc muted">{{ r.effective_wc }}</div>
+          {% else %}<span class="muted">-</span>{% endif %}
+          {% if r.error %}<div class="wc" style="color:#d93025">{{ r.error }}</div>{% endif %}
+          {% if r.bound and not r.enabled %}<div class="hint" style="color:#d93025">该绑定已禁用</div>{% endif %}
+        </td>
+        <td>
+          <div class="row-actions">
+            <a class="btn" href="{{ url_for('repos_page', edit=r.product_id) }}">编辑</a>
+            {% if r.bound %}
+            <form class="inline" method="post" action="{{ url_for('repos_unbind', product_id=r.product_id) }}"
+                  data-confirm="解绑后该产品会回落到全局仓库，确认？">
+              <button type="submit">解绑</button>
+            </form>
+            {% endif %}
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">库里还没有任何产品，请先去「禅道同步」拉一次 bug。</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h3>{{ '修改绑定' if edit.product_id else '新增 / 修改绑定' }}</h3>
+  <form method="post" action="{{ url_for('repos_bind') }}">
+    <div class="form-grid">
+      <div class="field">
+        <label>禅道产品 ID（必填，可从列表选，也可手填）</label>
+        <input type="text" name="product_id" list="product-ids" value="{{ edit.product_id }}" required>
+        <datalist id="product-ids">
+          {% for p in products %}<option value="{{ p.product_id }}">{{ p.product_name or ('产品 ' ~ p.product_id) }}</option>{% endfor %}
+        </datalist>
+      </div>
+      <div class="field">
+        <label>产品名称（仅展示用）</label>
+        <input type="text" name="product_name" value="{{ edit.product_name }}">
+      </div>
+      <div class="field field-wide">
+        <label>SVN 仓库根地址（必填，例 svn://192.168.1.10/repo/xxx 或 http://svn/svn/xxx）</label>
+        <input type="text" name="repo_url" value="{{ edit.repo_url }}" required>
+      </div>
+      <div class="field">
+        <label>主干路径</label>
+        <input type="text" name="trunk_path" value="{{ edit.trunk_path }}">
+      </div>
+      <div class="field">
+        <label>分支根路径</label>
+        <input type="text" name="branch_root" value="{{ edit.branch_root }}">
+      </div>
+      <div class="field">
+        <label>本地工作副本（留空自动按产品分配独立目录）</label>
+        <input type="text" name="working_copy" value="{{ edit.working_copy }}" placeholder="留空 = {{ global_repo.working_copy }}\p&lt;pid&gt;-&lt;hash&gt;">
+      </div>
+      <div class="field">
+        <label>分支前缀（AI 分支名 = 前缀 + 禅道ID）</label>
+        <input type="text" name="branch_prefix" value="{{ edit.branch_prefix }}">
+      </div>
+      <div class="field">
+        <label>编译命令（AI 修完在该产品库执行，可空）</label>
+        <input type="text" name="build_command" value="{{ edit.build_command }}">
+      </div>
+      <div class="field">
+        <label>测试命令（可空）</label>
+        <input type="text" name="test_command" value="{{ edit.test_command }}">
+      </div>
+      <div class="field field-wide">
+        <label>备注</label>
+        <input type="text" name="note" value="{{ edit.note }}">
+      </div>
+      <div class="field field-check">
+        <input type="checkbox" id="enabled" name="enabled" value="1" {% if edit.enabled %}checked{% endif %}>
+        <label for="enabled">启用该绑定（取消勾选 = 暂不启用，会回落到全局仓库）</label>
+      </div>
+    </div>
+    <div class="row-actions">
+      <button class="btn-primary" type="submit">保存绑定</button>
+      <a class="btn" href="{{ url_for('repos_page') }}">清空</a>
+    </div>
+  </form>
+  <p class="hint">
+    等价的命令行写法（Trae / 脚本用这个）：<br>
+    <code>python -m app.cli bind-repo &lt;产品ID&gt; &lt;仓库地址&gt; --name "产品名" --trunk-path /trunk --branch-root /branches --build "..." --test "..."</code><br>
+    <code>python -m app.cli repos</code> 查看每个产品实际生效的仓库；<code>python -m app.cli svn-check --all</code> 逐仓库自检。
+  </p>
+</div>
+{% endblock %}

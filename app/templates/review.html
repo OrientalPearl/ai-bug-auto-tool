@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <h2>审查清单（待审查 await_review）</h2>
+  <span class="muted">AI 只提交到分支，合入 trunk 与禅道结案由你手动完成</span>
+</div>
+
+{% if queue %}
+<div class="grid-cards">
+  {% for bug in queue %}
+  <div class="panel">
+    <h3>禅道 #{{ bug.zentao_id }} · {{ bug.title }}
+      <span class="badge badge-orange">待审查</span></h3>
+    <p class="hint">
+      pri {{ bug.pri }} / S{{ bug.severity }} · 分支 <code>{{ bug.branch or '未记录' }}</code> ·
+      更新时间 {{ bug.updated_at }}
+    </p>
+
+    <h4 class="hint" style="color:#23272f;font-weight:600">修复说明</h4>
+    <div style="white-space:pre-wrap">{{ bug.fix_summary or '（AI 未填写，可用 svn log 查看提交说明）' }}</div>
+
+    {% set analysis = bug.analysis %}
+    {% set show_missing = true %}
+    {% set zentao_id = bug.zentao_id %}
+    {% include "_analysis.html" %}
+
+    <h4 class="hint" style="color:#23272f;font-weight:600">验证步骤</h4>
+    <div style="white-space:pre-wrap">{{ bug.verify_steps or '（AI 未填写）' }}</div>
+
+    <h4 class="hint" style="color:#23272f;font-weight:600">修改文件列表</h4>
+    {% if bug.files_changed %}
+    <ul class="tight mono">{% for f in bug.files_changed %}<li>{{ f }}</li>{% endfor %}</ul>
+    {% else %}<p class="muted">（未登记文件列表）</p>{% endif %}
+
+    <h4 class="hint" style="color:#23272f;font-weight:600">关联 SVN 提交</h4>
+    {% if bug.revisions %}
+    <ul class="tight">
+      {% for r in bug.revisions %}
+      <li><b>r{{ r.revision }}</b> · {{ r.created_at }} · <code>{{ r.branch or bug.branch }}</code><br>{{ r.message }}</li>
+      {% endfor %}
+    </ul>
+    {% else %}<p class="muted">（无提交记录）</p>{% endif %}
+
+    <h4 class="hint" style="color:#23272f;font-weight:600">复现步骤（禅道原文）</h4>
+    <pre style="white-space:pre-wrap; max-height:160px; overflow:auto; background:#f7f8fa; padding:8px; border:1px solid #e3e6ec; border-radius:4px; font-size:12px">{{ bug.steps or '（无）' }}</pre>
+
+    {% if bug.images %}
+    <h4 class="hint" style="color:#23272f;font-weight:600">禅道截图（{{ bug.images | length }} 张）</h4>
+    <div class="gallery">
+      {% for a in bug.images %}
+      <a href="{{ a.web_path }}" target="_blank"><img class="thumb" src="{{ a.web_path }}" alt="{{ a.name or a.filename }}"></a>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if bug.comments %}
+    <h4 class="hint" style="color:#23272f;font-weight:600">禅道备注 / 操作记录</h4>
+    <ul class="tight" style="font-size:12px">
+      {% for c in bug.comments %}
+      <li><b>{{ c.actor or '-' }}</b> · {{ c.action }} · {{ c.date }}
+        {% if c.comment %}<br>{{ c.comment }}{% endif %}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+
+    <form method="post" action="{{ url_for('review_pass', bug_id=bug.id) }}"
+          data-confirm="确认审查通过？合入 trunk 后请把 trunk 修订号填入下方。">
+      <div class="row-actions">
+        <input type="text" name="merged_revision" placeholder="合入 trunk 的 SVN 号（可稍后补填）" style="width:260px">
+        <button class="btn btn-pass" type="submit">通过</button>
+      </div>
+    </form>
+
+    <form method="post" action="{{ url_for('review_reject', bug_id=bug.id) }}"
+          data-confirm="确认打回？该 bug 会重新进入 AI 处理队列。">
+      <div class="row-actions">
+        <input type="text" name="reject_reason" placeholder="打回原因（必填）" style="flex:1">
+        <button class="btn btn-reject" type="submit">打回</button>
+      </div>
+    </form>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="panel"><p class="muted">没有待审查的 bug。</p></div>
+{% endif %}
+
+<div class="panel">
+  <h3>已合入 / 已结案</h3>
+  <p class="hint">
+    审查通过后状态变为 <b>merged</b>（已合入），你手动在禅道结案后可在看板卡片里点「标记已结案」变成 <b>closed</b>。
+  </p>
+</div>
+{% endblock %}

@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}禅道 Bug 自动修复闭环系统{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">禅道 Bug 自动修复闭环系统</div>
+  <nav>
+    <a href="{{ url_for('kanban') }}" class="{{ 'active' if request.endpoint == 'kanban' }}">看板</a>
+    <a href="{{ url_for('sync_page') }}" class="{{ 'active' if request.endpoint == 'sync_page' }}">禅道同步</a>
+    <a href="{{ url_for('need_page') }}" class="{{ 'active' if request.endpoint == 'need_page' }}">需方案清单
+      {% if counts.need_solution %}<span class="badge badge-yellow">{{ counts.need_solution }}</span>{% endif %}</a>
+    <a href="{{ url_for('review_page') }}" class="{{ 'active' if request.endpoint == 'review_page' }}">审查清单
+      {% if counts.await_review %}<span class="badge badge-orange">{{ counts.await_review }}</span>{% endif %}</a>
+    <a href="{{ url_for('svn_page') }}" class="{{ 'active' if request.endpoint == 'svn_page' }}">SVN 记录</a>
+    <a href="{{ url_for('repos_page') }}" class="{{ 'active' if request.endpoint == 'repos_page' }}">产品仓库</a>
+    <a href="{{ url_for('config_page') }}" class="{{ 'active' if request.endpoint == 'config_page' }}">配置</a>
+  </nav>
+  <div class="topmeta">Bug 总数 {{ total_bugs }} · 待处理 {{ counts.pending }}</div>
+</header>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+    <div class="flashes">
+      {% for category, message in messages %}
+        <div class="flash flash-{{ category }}">{{ message }}</div>
+      {% endfor %}
+    </div>
+  {% endif %}
+{% endwith %}
+
+{% if not zentao_ready %}
+  <div class="flash flash-warn">
+    禅道账号尚未配置：请在 <code>{{ project_root }}\.env</code> 填写
+    <code>ZENTAO_BASE_URL / ZENTAO_ACCOUNT / ZENTAO_PASSWORD</code>，然后到「配置」页重新加载。
+  </div>
+{% endif %}
+
+<main>
+  {% block content %}{% endblock %}
+</main>
+
+<footer class="footer">
+  DB: <code>{{ settings_view.db_path }}</code>
+  {% if last_sync %} · 最近同步 {{ last_sync.created_at }} ({{ last_sync.action }}){% endif %}
+</footer>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

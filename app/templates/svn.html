@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <h2>SVN 提交记录</h2>
+  <span class="muted">按 bug 分组，同一 bug 的多次提交连续排列，便于回溯</span>
+  <span class="right">
+    <a class="btn" href="{{ url_for('svn_check') }}">当前仓库自检</a>
+    <a class="btn" href="{{ url_for('svn_check', all=1) }}">全部仓库自检</a>
+    <a class="btn" href="{{ url_for('repos_page') }}">产品仓库</a>
+  </span>
+</div>
+
+{% if check %}
+<div class="panel">
+  <h3>SVN 自检结果
+    <span class="badge badge-{{ 'green' if check.ok else 'red' }}">{{ '通过' if check.ok else '未通过' }}</span>
+  </h3>
+  <table class="grid">
+    <thead><tr><th style="width:150px">检查项</th><th style="width:80px">结果</th><th>详情</th></tr></thead>
+    <tbody>
+      {% for s in check.steps %}
+      <tr>
+        <td>{{ s.name }}</td>
+        <td>{% if s.ok %}<span style="color:#188038">OK</span>{% elif s.ok is none %}<span class="muted">INFO</span>{% else %}<span style="color:#d93025">FAIL</span>{% endif %}</td>
+        <td class="mono" style="font-size:12px; word-break:break-all; white-space:pre-wrap">{{ s.detail }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">结论：{{ check.hint }}</p>
+  <p class="hint">本自检只跑 <code>svn info / --version</code>，不会创建、切换或提交任何东西。</p>
+</div>
+{% endif %}
+
+<div class="panel">
+  <h3>SVN 配置</h3>
+  <p class="hint">
+    仓库：<code>{{ settings_view.svn_repo_url }}</code><br>
+    工作副本：<code>{{ settings_view.svn_working_copy }}</code><br>
+    分支前缀：<code>{{ settings_view.branch_prefix }}&lt;禅道ID&gt;</code>
+    {% if not svn_ready %} · <span class="muted">SVN_REPO_URL 未配置：默认方式下不影响使用（提交由代码库自己的细则负责），
+      只有让本系统代跑 svn 时才需要在 .env 填写或按产品 bind-repo</span>{% endif %}
+  </p>
+</div>
+
+{% if groups %}
+  {% for g in groups %}
+  <div class="panel">
+    <h3>禅道 #{{ g.zentao_id }} · {{ g.title }}
+      <span class="badge badge-{{ {'pending':'grey','fixing':'blue','need_solution':'yellow','await_review':'orange','rejected':'red','merged':'green','closed':'dark-green'}[g.bug_status] }}">
+        {{ status_labels[g.bug_status] }}
+      </span>
+      <span class="muted" style="font-weight:400;font-size:12px">分支 <code>{{ g.branch or '-' }}</code></span>
+    </h3>
+    <table class="grid">
+      <thead><tr><th style="width:110px">提交号</th><th style="width:150px">时间</th><th style="width:110px">作者</th><th>提交说明 / 修改文件</th></tr></thead>
+      <tbody>
+        {% for r in g.revisions %}
+        <tr>
+          <td><b>r{{ r.revision }}</b></td>
+          <td>{{ r.created_at }}</td>
+          <td>{{ r.author or '-' }}</td>
+          <td>
+            <div style="white-space:pre-wrap">{{ r.message }}</div>
+            {% if r.files %}
+            <ul class="tight mono" style="font-size:12px">
+              {% for f in r.files %}<li>{{ f }}</li>{% endfor %}
+            </ul>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endfor %}
+{% else %}
+<div class="panel"><p class="muted">还没有 SVN 提交记录。AI 每次提交分支后会写到这里。</p></div>
+{% endif %}
+{% endblock %}

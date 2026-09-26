@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <h2>配置</h2>
+  <a class="btn btn-primary right" href="{{ url_for('config_reload') }}">重新读取 .env</a>
+</div>
+
+<div class="panel">
+  <h3>当前生效配置（密码已脱敏）</h3>
+  <table class="grid">
+    <tbody>
+      {% for key, value in info.items() %}
+      <tr><th style="width:220px">{{ key }}</th><td class="mono">{{ value }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">配置文件：<code>{{ project_root }}\.env</code>（已在 .gitignore / svn:ignore 中忽略，不会进入版本库）</p>
+</div>
+
+<div class="panel">
+  <h3>可写的 .env 变量清单</h3>
+  <pre>
+# ---- 禅道 ----
+ZENTAO_BASE_URL=http://禅道地址        # 例 http://zentao.example.com 或 http://192.168.1.10:8888
+ZENTAO_ACCOUNT=你的禅道账号
+ZENTAO_PASSWORD=你的禅道密码
+ZENTAO_PRODUCT_IDS=                   # 留空=自动取全部产品；可填 1,3,7 缩小范围
+ZENTAO_BUG_STATUS=active              # 只拉这个状态的 bug
+ZENTAO_BROWSE_TYPE=assigntome         # 本地按 assignedTo==我 过滤
+ZENTAO_VERIFY_SSL=false               # 自签证书时保持 false
+ZENTAO_TIMEOUT=20
+# 认证通道：rest=api.php token | session=网页登录(账号密码) | cookie=复用 zentaosid | auto
+ZENTAO_AUTH_MODE=auto
+ZENTAO_COOKIE=                         # 从浏览器 F12 复制 zentaosid，填了就完全不发密码
+ZENTAO_TOKENS_PATH=/api.php/v1/tokens  # 登录接口路径特殊时改
+ZENTAO_COMMENT_PATH=                   # 评论接口路径特殊时填写，如 /api.php/v1/bugs/{bug_id}/comments
+
+# ---- SVN ----
+SVN_REPO_URL=https://svn.example.com/svn/project
+SVN_WORKING_COPY=C:/Users/82691/Desktop/AI-BUG/svn_workspace
+SVN_TRUNK_PATH=/trunk
+SVN_BRANCH_ROOT=/branches
+SVN_USERNAME=
+SVN_PASSWORD=
+SVN_BIN=svn
+SVN_ALLOW_TRUNK_WRITE=false           # 保持 false：AI 永远不许提交主干
+
+# ---- 分析结论 ----
+REQUIRE_ANALYSIS=true                 # 没写分析结论（analyses）时 commit 直接失败
+
+# ---- 服务 / 执行器 ----
+WEB_HOST=127.0.0.1
+WEB_PORT=5000
+DB_PATH=C:/Users/82691/Desktop/AI-BUG/bug_system.db
+AI_BATCH_SIZE=5
+BRANCH_PREFIX=bugfix/zentao-
+
+# ---- 禅道截图 / 附件 ----
+ATTACHMENT_DIR=                        # 留空=项目下 attachments/，抓下来的截图按 zentao-<ID>/ 分目录
+DOWNLOAD_ATTACHMENTS=true              # false=只抓文字描述，不下载图片
+  </pre>
+</div>
+
+<div class="panel">
+  <h3>AI 执行器可用命令（全部输出 JSON）</h3>
+  <pre>
+python -m app.cli sync            # 拉禅道 bug 入库
+python -m app.cli tasks --limit 5 # 取队列（pri 升序 / severity 降序，已答复的优先）
+python -m app.cli branch 1024     # 建/切 bugfix/zentao-1024 分支
+python -m app.cli note 1024 --summary "..." --verify "..." --files a.py,b.py
+python -m app.cli commit 1024 --message "空指针判空" --files a.py
+python -m app.cli block 1024 --question "..." --options "A:..;B:.." --advice "建议A"
+python -m app.cli report          # 汇总报告
+  </pre>
+</div>
+{% endblock %}

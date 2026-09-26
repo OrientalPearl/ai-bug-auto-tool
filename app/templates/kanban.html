@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <h2>Bug 看板</h2>
+  <span class="muted">按状态分组 · pri 升序 / severity 降序 · 点击卡片展开详情</span>
+  <form class="inline right" method="post" action="{{ url_for('sync_run') }}">
+    <button class="btn-primary" type="submit">立即同步禅道</button>
+  </form>
+</div>
+
+<div class="board">
+  {% for col in columns %}
+  <section class="column col-{{ col.status }}">
+    <h3>{{ status_labels[col.status] }}<span class="count">{{ col.count }}</span></h3>
+    {% for bug in col.bugs %}
+    <article class="card st-{{ bug.status }}" data-bug-id="{{ bug.id }}">
+      <div class="zt">禅道 #{{ bug.zentao_id }}
+        {% if bug.need_open %}<span class="badge badge-yellow">需方案</span>{% endif %}
+      </div>
+      <div class="title">{{ bug.title or '(无标题)' }}</div>
+      <div class="meta">
+        {% if bug.product_name or bug.product_id %}
+        <span class="badge badge-blue">{{ bug.product_name or ('产品 ' ~ bug.product_id) }}</span>
+        {% endif %}
+        <span>PRI {{ bug.pri }}</span>
+        <span>S{{ bug.severity }}</span>
+        <span>{{ bug.updated_at }}</span>
+      </div>
+      <div class="detail" data-detail></div>
+    </article>
+    {% endfor %}
+    {% if not col.bugs %}<p class="muted" style="padding:6px 4px">暂无</p>{% endif %}
+  </section>
+  {% endfor %}
+</div>
+{% endblock %}

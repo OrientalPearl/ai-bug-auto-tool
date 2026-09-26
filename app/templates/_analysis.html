@@ -1,0 +1,60 @@
+{# Render one AI analysis record. Expects `analysis` (dict or None) in the context. #}
+{% if analysis %}
+<h4 class="hint" style="color:#23272f;font-weight:600">
+  分析结论
+  <span class="badge badge-blue">{{ {'commit': '修复完成时', 'block': '卡点时', 'manual': '人工补记'}[analysis.kind] }}</span>
+  <span class="muted" style="font-weight:400;font-size:12px">{{ analysis.author }} · {{ analysis.created_at }}</span>
+</h4>
+<table class="grid analysis">
+  <tbody>
+    {% if analysis.conclusion %}
+    <tr><th>一句话结论</th><td>{{ analysis.conclusion }}</td></tr>
+    {% endif %}
+    {% if analysis.symptom %}
+    <tr><th>现象</th><td>{{ analysis.symptom }}</td></tr>
+    {% endif %}
+    {% if analysis.root_cause %}
+    <tr><th>根因</th><td>{{ analysis.root_cause }}</td></tr>
+    {% endif %}
+    {% if analysis.evidence %}
+    <tr><th>定位依据</th><td class="mono-wrap">{{ analysis.evidence }}</td></tr>
+    {% endif %}
+    {% if analysis.call_chain %}
+    <tr><th>涉及链路</th><td class="mono-wrap">{{ analysis.call_chain }}</td></tr>
+    {% endif %}
+    {% if analysis.change_desc %}
+    <tr><th>改动内容</th><td>{{ analysis.change_desc }}</td></tr>
+    {% endif %}
+    {% if analysis.impact %}
+    <tr><th>影响面</th><td>{{ analysis.impact }}</td></tr>
+    {% endif %}
+    {% if analysis.verify %}
+    <tr><th>验证方式与结果</th><td>{{ analysis.verify }}</td></tr>
+    {% endif %}
+    {% if analysis.unverified %}
+    <tr><th>未验证项</th><td style="color:#b3261e">{{ analysis.unverified }}</td></tr>
+    {% endif %}
+    {% if analysis.rollback %}
+    <tr><th>回退方式</th><td class="mono-wrap">{{ analysis.rollback }}</td></tr>
+    {% endif %}
+    {% if analysis.gates_parsed %}
+    <tr>
+      <th>提交闸门</th>
+      <td>
+        <div class="gates">
+          {% for key, verdict in analysis.gates_parsed | dictsort %}
+          {% set text = verdict | string %}
+          <span class="badge badge-{{ 'green' if text.startswith('pass') or text.startswith('通过')
+                                        else ('yellow' if text.startswith('未验证') or text.startswith('warn')
+                                        else 'red') }}">{{ key }}: {{ text }}</span>
+          {% endfor %}
+        </div>
+      </td>
+    </tr>
+    {% endif %}
+  </tbody>
+</table>
+{% elif show_missing %}
+<p class="hint" style="color:#b3261e">（AI 未写入分析结论：该轮 `REQUIRE_ANALYSIS` 可能被关掉了，
+  要求执行器补 <code>python -m app.cli analyze {{ zentao_id }} --analysis-file a.json</code>）</p>
+{% endif %}
