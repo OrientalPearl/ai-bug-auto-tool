@@ -4,6 +4,7 @@
   <h2>产品与代码库</h2>
   <span class="muted">不同禅道产品对应不同代码库，AI 建分支 / 提交时按 bug 的产品自动选库</span>
   <span class="right">
+    <a class="btn btn-primary" href="#/repo/new">新增绑定</a>
     <a class="btn" href="{{ url_for('svn_check', all=1) }}">全部仓库自检</a>
     <a class="btn" href="{{ url_for('repos_page') }}">刷新</a>
   </span>
@@ -20,7 +21,7 @@
     3. 全局也没配 → <code>branch</code> / <code>commit</code> 直接报错并给出 <code>bind-repo</code> 命令；<br>
     4. 每个已绑定产品使用<b>独立工作副本</b>（留空时自动分配
     <code>{{ global_repo.working_copy }}\p&lt;产品ID&gt;-&lt;仓库哈希&gt;</code>），避免多产品互相切库；<br>
-    5. 主干始终只读：AI 只能提交到 <code>&lt;仓库&gt;/&lt;分支根&gt;/{{ edit.branch_prefix }}&lt;禅道ID&gt;</code>。
+    5. 主干始终只读：AI 只能提交到 <code>&lt;仓库&gt;/&lt;分支根&gt;/{{ forms.new.branch_prefix }}&lt;禅道ID&gt;</code>。
   </p>
 </div>
 
@@ -78,7 +79,7 @@
         </td>
         <td>
           <div class="row-actions">
-            <a class="btn" href="{{ url_for('repos_page', edit=r.product_id) }}">编辑</a>
+            <a class="btn" href="#/repo/{{ r.product_id }}">编辑</a>
             {% if r.bound %}
             <form class="inline" method="post" action="{{ url_for('repos_unbind', product_id=r.product_id) }}"
                   data-confirm="解绑后该产品会回落到全局仓库，确认？">
@@ -97,66 +98,74 @@
 </div>
 
 <div class="panel">
-  <h3>{{ '修改绑定' if edit.product_id else '新增 / 修改绑定' }}</h3>
-  <form method="post" action="{{ url_for('repos_bind') }}">
+  <h3>新增 / 修改绑定</h3>
+  <p class="hint">点右上「新增绑定」或某行的「编辑」，在弹窗里填写；保存后弹窗会自动关闭并刷新列表。</p>
+  <p class="hint">
+    等价的命令行写法（Trae / 脚本用这个）：<br>
+    <code>python -m app.cli bind-repo &lt;产品ID&gt; &lt;仓库地址&gt; --name "产品名" --trunk-path /trunk/3.0 --working-copy &lt;镜像目录&gt;</code><br>
+    省略的选项沿用库里已有值，不会把没填的列清空；<code>python -m app.cli repos</code> 查看每个产品实际生效的仓库。
+  </p>
+</div>
+
+{# Prefill payloads for the dialog: "new" holds the defaults, every other key is a product id. #}
+<script type="application/json" id="repo-forms">{{ forms | tojson }}</script>
+
+{# The bind form lives in a template: app.js clones it into the dialog and fills it in. #}
+<template id="repo-form-tpl">
+  <form method="post" action="{{ url_for('repos_bind') }}" data-reload="1">
     <div class="form-grid">
       <div class="field">
         <label>禅道产品 ID（必填，可从列表选，也可手填）</label>
-        <input type="text" name="product_id" list="product-ids" value="{{ edit.product_id }}" required>
+        <input type="text" name="product_id" list="product-ids" required>
         <datalist id="product-ids">
           {% for p in products %}<option value="{{ p.product_id }}">{{ p.product_name or ('产品 ' ~ p.product_id) }}</option>{% endfor %}
         </datalist>
       </div>
       <div class="field">
         <label>产品名称（仅展示用）</label>
-        <input type="text" name="product_name" value="{{ edit.product_name }}">
+        <input type="text" name="product_name">
       </div>
       <div class="field field-wide">
         <label>SVN 仓库根地址（必填，例 svn://192.168.1.10/repo/xxx 或 http://svn/svn/xxx）</label>
-        <input type="text" name="repo_url" value="{{ edit.repo_url }}" required>
+        <input type="text" name="repo_url" required>
       </div>
       <div class="field">
         <label>主干路径</label>
-        <input type="text" name="trunk_path" value="{{ edit.trunk_path }}">
+        <input type="text" name="trunk_path">
       </div>
       <div class="field">
         <label>分支根路径</label>
-        <input type="text" name="branch_root" value="{{ edit.branch_root }}">
+        <input type="text" name="branch_root">
       </div>
-      <div class="field">
-        <label>本地工作副本（留空自动按产品分配独立目录）</label>
-        <input type="text" name="working_copy" value="{{ edit.working_copy }}" placeholder="留空 = {{ global_repo.working_copy }}\p&lt;pid&gt;-&lt;hash&gt;">
+      <div class="field field-wide">
+        <label>本地工作副本 / git 镜像目录（留空自动按产品分配独立目录）</label>
+        <input type="text" name="working_copy" placeholder="留空 = {{ global_repo.working_copy }}\p&lt;pid&gt;-&lt;hash&gt;">
       </div>
       <div class="field">
         <label>分支前缀（AI 分支名 = 前缀 + 禅道ID）</label>
-        <input type="text" name="branch_prefix" value="{{ edit.branch_prefix }}">
+        <input type="text" name="branch_prefix">
       </div>
       <div class="field">
         <label>编译命令（AI 修完在该产品库执行，可空）</label>
-        <input type="text" name="build_command" value="{{ edit.build_command }}">
+        <input type="text" name="build_command">
       </div>
       <div class="field">
         <label>测试命令（可空）</label>
-        <input type="text" name="test_command" value="{{ edit.test_command }}">
+        <input type="text" name="test_command">
       </div>
       <div class="field field-wide">
         <label>备注</label>
-        <input type="text" name="note" value="{{ edit.note }}">
+        <input type="text" name="note">
       </div>
       <div class="field field-check">
-        <input type="checkbox" id="enabled" name="enabled" value="1" {% if edit.enabled %}checked{% endif %}>
-        <label for="enabled">启用该绑定（取消勾选 = 暂不启用，会回落到全局仓库）</label>
+        <input type="checkbox" id="repo-enabled" name="enabled" value="1">
+        <label for="repo-enabled">启用该绑定（取消勾选 = 暂不启用，会回落到全局仓库）</label>
       </div>
     </div>
     <div class="row-actions">
       <button class="btn-primary" type="submit">保存绑定</button>
-      <a class="btn" href="{{ url_for('repos_page') }}">清空</a>
+      <button class="btn" type="button" data-dialog-close>返回</button>
     </div>
   </form>
-  <p class="hint">
-    等价的命令行写法（Trae / 脚本用这个）：<br>
-    <code>python -m app.cli bind-repo &lt;产品ID&gt; &lt;仓库地址&gt; --name "产品名" --trunk-path /trunk --branch-root /branches --build "..." --test "..."</code><br>
-    <code>python -m app.cli repos</code> 查看每个产品实际生效的仓库；<code>python -m app.cli svn-check --all</code> 逐仓库自检。
-  </p>
-</div>
+</template>
 {% endblock %}

@@ -48,6 +48,20 @@
   DB: <code>{{ settings_view.db_path }}</code>
   {% if last_sync %} · 最近同步 {{ last_sync.created_at }} ({{ last_sync.action }}){% endif %}
 </footer>
+
+{# One shared dialog for bug details and forms: opened through the URL hash so the
+   browser back button (and the 返回 button) always gets you back to the list. #}
+<div class="dialog" id="dialog" hidden>
+  <div class="dialog-mask" data-dialog-close></div>
+  <div class="dialog-panel" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+    <div class="dialog-head">
+      <h3 id="dialog-title"></h3>
+      <button class="btn" type="button" data-dialog-close>返回</button>
+    </div>
+    <div class="dialog-body"></div>
+  </div>
+</div>
+
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 {% block scripts %}{% endblock %}
 </body>

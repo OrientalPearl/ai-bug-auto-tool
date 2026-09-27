@@ -51,6 +51,7 @@
         {{ status_labels[g.bug_status] }}
       </span>
       <span class="muted" style="font-weight:400;font-size:12px">分支 <code>{{ g.branch or '-' }}</code></span>
+      <a class="btn" style="float:right" href="#/bug/{{ g.bug_id }}">弹窗看完整详情</a>
     </h3>
     <table class="grid">
       <thead><tr><th style="width:110px">提交号</th><th style="width:150px">时间</th><th style="width:110px">作者</th><th>提交说明 / 修改文件</th></tr></thead>

@@ -1,4 +1,5 @@
-// Expandable bug cards on the kanban board.
+// Shared UI: bug / form dialogs driven by the URL hash (so "back" always works),
+// plus collapsible kanban bands.
 (function () {
   const LABELS = {
     pending: "待处理", fixing: "修复中", need_solution: "需方案",
@@ -69,7 +70,7 @@
     const reviews = (b.reviews || []).map(r => `
       <li><b>[${r.result === "pass" ? "通过" : "打回"}]</b> ${esc(r.created_at)}
         ${r.reject_reason ? `<br>打回原因：${esc(r.reject_reason)}` : ""}
-        ${r.merged_revision ? `<br>合入 trunk：r${esc(r.merged_revision)}` : ""}
+        ${r.merged_revision ? `<br>合入 trunk：${esc(revLabel(r.merged_revision))}` : ""}
       </li>`).join("");
     const files = (b.files_changed || []).map(f => `<li class="mono">${esc(f)}</li>`).join("");
 
@@ -138,28 +139,191 @@
     return html;
   }
 
-  document.addEventListener("click", async function (event) {
+  // ------------------------------------------------------------------
+  // dialog: mounted through the URL hash so the browser back button returns
+  // to the list, and so a dialog can be shared / reloaded by URL.
+  // ------------------------------------------------------------------
+  const dialog = document.getElementById("dialog");
+  const dialogTitle = dialog.querySelector("#dialog-title");
+  const dialogBody = dialog.querySelector(".dialog-body");
+  const initialHash = location.hash;
+  let currentBug = null;
+
+  function mount(title) {
+    dialogTitle.textContent = title;
+    dialogBody.innerHTML = "";
+    dialog.hidden = false;
+    document.body.classList.add("dialog-open");
+    return dialogBody;
+  }
+
+  function hideDialog() {
+    dialog.hidden = true;
+    dialogBody.innerHTML = "";
+    currentBug = null;
+    document.body.classList.remove("dialog-open");
+  }
+
+  function closeDialog() {
+    // If the hash came from this page, going back lands on the list again;
+    // if the page was opened straight on a hash, rewriting it avoids leaving the site.
+    if (location.hash && location.hash !== initialHash) {
+      history.back();
+      return;
+    }
+    if (location.hash) {
+      history.replaceState(null, "", location.pathname + location.search);
+    }
+    hideDialog();
+  }
+
+  function openAt(hash) {
+    if (location.hash === hash) {
+      route();
+      return;
+    }
+    location.hash = hash;
+  }
+
+  function loadBug(bugId, note) {
+    currentBug = bugId;
+    mount("Bug 详情");
+    dialogBody.innerHTML = '<p class="muted">加载中…</p>';
+    return fetch(`/api/bug/${bugId}`)
+      .then(resp => resp.json())
+      .then(function (data) {
+        if (currentBug !== bugId) return;
+        const title = `禅道 #${data.zentao_id || "-"} · ${data.title || "(无标题)"}`;
+        const tip = note ? `<p class="hint" style="color:#188038">${esc(note)}</p>` : "";
+        mount(title);
+        dialogBody.innerHTML = `<div class="bugdoc">${tip}${renderBug(data)}</div>`;
+      })
+      .catch(function (err) {
+        mount("加载失败");
+        dialogBody.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
+      });
+  }
+
+  // Bind-form data is rendered as JSON on the repos page; parsed once on demand.
+  let repoForms = null;
+
+  function formsData() {
+    if (repoForms) return repoForms;
+    const tag = document.getElementById("repo-forms");
+    if (!tag) return null;
+    try {
+      repoForms = JSON.parse(tag.textContent);
+    } catch (err) {
+      return null;
+    }
+    return repoForms;
+  }
+
+  function showRepo(key) {
+    const forms = formsData();
+    if (!forms) return;
+    const data = forms[key] || forms.new;
+    const tpl = document.getElementById("repo-form-tpl");
+    const label = String(data.product_id || "");
+    const body = mount(label ? `修改绑定 · 产品 ${label}` : "新增绑定");
+    body.appendChild(tpl.content.cloneNode(true));
+    const form = body.querySelector("form");
+    Object.keys(data).forEach(function (name) {
+      const input = form.elements[name];
+      if (!input) return;
+      if (input.type === "checkbox") input.checked = Number(data[name]) === 1;
+      else input.value = data[name] === null || data[name] === undefined ? "" : String(data[name]);
+    });
+    // The product id is the primary key of the binding: it must not drift while editing.
+    const idField = form.elements.product_id;
+    if (idField && label) idField.readOnly = true;
+  }
+
+  function route() {
+    const bug = /^#\/bug\/(\d+)$/.exec(location.hash || "");
+    if (bug) {
+      loadBug(Number(bug[1]));
+      return;
+    }
+    const repo = /^#\/repo\/(.+)$/.exec(location.hash || "");
+    if (repo && formsData()) {
+      showRepo(decodeURIComponent(repo[1]));
+      return;
+    }
+    hideDialog();
+  }
+
+  window.addEventListener("hashchange", route);
+
+  document.addEventListener("click", function (event) {
+    if (!event.target || !event.target.closest) return;
+    if (event.target.closest("[data-dialog-close]")) {
+      event.preventDefault();
+      closeDialog();
+      return;
+    }
     const card = event.target.closest(".card[data-bug-id]");
     if (!card) return;
-    if (event.target.closest("button") || event.target.closest("form")) return;
-    const box = card.querySelector(".detail");
-    box.classList.toggle("open");
-    if (!box.classList.contains("open") || box.dataset.loaded === "1") return;
-    box.innerHTML = '<p class="muted">加载中…</p>';
-    try {
-      const resp = await fetch(`/api/bug/${card.dataset.bugId}`);
-      const data = await resp.json();
-      box.innerHTML = renderBug(data);
-      box.dataset.loaded = "1";
-    } catch (err) {
-      box.innerHTML = `<p class="muted">加载失败：${esc(err.message)}</p>`;
+    if (event.target.closest("a") || event.target.closest("button") || event.target.closest("form")) return;
+    event.preventDefault();
+    openAt(`#/bug/${card.dataset.bugId}`);
+  });
+
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && !dialog.hidden) {
+      event.preventDefault();
+      closeDialog();
     }
   });
-})();
 
-// Destructive / comment-writing actions ask for confirmation.
-document.addEventListener("submit", function (event) {
-  const form = event.target;
-  const tip = form.dataset.confirm;
-  if (tip && !window.confirm(tip)) event.preventDefault();
-});
+  // ------------------------------------------------------------------
+  // forms: destructive / comment-writing actions ask first; forms inside the
+  // dialog are posted without a page reload so the dialog stays open.
+  // ------------------------------------------------------------------
+  document.addEventListener("submit", function (event) {
+    const form = event.target;
+    const tip = form.dataset.confirm;
+    if (tip && !window.confirm(tip)) {
+      event.preventDefault();
+      return;
+    }
+    if (!form.closest(".dialog-body")) return;
+    event.preventDefault();
+    const bugId = currentBug;
+    mount("处理中…");
+    dialogBody.innerHTML = '<p class="muted">正在执行，请稍候…</p>';
+    fetch(form.action, { method: "post", body: new FormData(form) })
+      .then(function (resp) {
+        if (form.dataset.reload) {
+          // Follow the server's own target: the bind route points back at the
+          // dialog only when the save was rejected.
+          location.href = resp.url || location.pathname;
+          return;
+        }
+        if (bugId) {
+          loadBug(bugId, "操作已提交，上方内容已刷新。");
+          return;
+        }
+        location.reload();
+      })
+      .catch(function (err) {
+        if (bugId) loadBug(bugId, "");
+        else location.reload();
+        window.alert(`提交失败：${err.message}`);
+      });
+  });
+
+  // ------------------------------------------------------------------
+  // kanban bands: collapsed state is remembered per browser.
+  // ------------------------------------------------------------------
+  document.querySelectorAll("details.band[data-band]").forEach(function (band) {
+    const key = `band:${band.dataset.band}`;
+    const saved = window.localStorage ? window.localStorage.getItem(key) : null;
+    if (saved !== null) band.open = saved === "1";
+    band.addEventListener("toggle", function () {
+      if (window.localStorage) window.localStorage.setItem(key, band.open ? "1" : "0");
+    });
+  });
+
+  route();
+})();

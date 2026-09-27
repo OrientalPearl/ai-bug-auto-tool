@@ -24,6 +24,14 @@ STATUS_LABELS = {
     "closed": "已结案",
 }
 
+# Kanban shows three stacked bands instead of one column per status:
+# (key, label, hint, statuses) in the order the owner reads them.
+KANBAN_BANDS = (
+    ("mine", "要我处理", "需要你答复或拍板", ("need_solution", "await_review", "rejected")),
+    ("ai", "AI 在跑", "等 AI 出结果", ("pending", "fixing")),
+    ("done", "已收尾", "已合入 / 已结案，只作回溯", ("merged", "closed")),
+)
+
 
 def create_app() -> Flask:
     app = Flask(__name__)
@@ -63,8 +71,7 @@ def create_app() -> Flask:
     # ------------------------------------------------------------------
     @app.route("/")
     def kanban():
-        columns = db.kanban_columns()
-        return render_template("kanban.html", columns=columns)
+        return render_template("kanban.html", bands=_kanban_bands())
 
     @app.route("/api/bug/<int:bug_id>")
     def api_bug(bug_id: int):
@@ -289,16 +296,17 @@ def create_app() -> Flask:
     # ------------------------------------------------------------------
     @app.route("/repos")
     def repos_page():
-        edit_id = request.args.get("edit")
-        edit = None
-        if edit_id and str(edit_id).isdigit():
-            edit = _repo_form(int(edit_id))
+        rows = _repo_rows()
+        # Prefill payloads for the bind dialog: keyed by product id, "new" = defaults.
+        forms = {"new": _repo_form(None)}
+        for row in rows:
+            forms[str(row["product_id"])] = _repo_form(row["product_id"])
         return render_template(
             "repos.html",
-            rows=_repo_rows(),
+            rows=rows,
+            forms=forms,
             global_repo=svn_client.global_target(),
             products=db.products_in_use(),
-            edit=edit or _repo_form(None),
         )
 
     @app.route("/repos/bind", methods=["POST"])
@@ -307,7 +315,7 @@ def create_app() -> Flask:
         raw_id = form.get("product_id", "")
         if not str(raw_id).isdigit():
             flash("产品 ID 必须是数字。", "error")
-            return redirect(url_for("repos_page"))
+            return redirect(url_for("repos_page") + "#/repo/new")
         fields = {
             "product_name": form.get("product_name", ""),
             "repo_url": form.get("repo_url", ""),
@@ -324,7 +332,7 @@ def create_app() -> Flask:
             db.bind_product_repo(int(raw_id), fields)
         except ValueError as exc:
             flash(str(exc), "error")
-            return redirect(url_for("repos_page", edit=raw_id))
+            return redirect(url_for("repos_page") + f"#/repo/{raw_id}")
         flash(f"产品 {raw_id} 的代码库已保存，AI 建分支/提交会自动使用该仓库。", "ok")
         return redirect(url_for("repos_page"))
 
@@ -357,6 +365,22 @@ def create_app() -> Flask:
         return render_template("error.html", code=404, message="页面不存在"), 404
 
     return app
+
+
+def _kanban_bands() -> list[dict[str, Any]]:
+    """Statuses folded into the three bands the owner works through."""
+    columns = {col["status"]: col for col in db.kanban_columns()}
+    bands: list[dict[str, Any]] = []
+    for key, label, hint, statuses in KANBAN_BANDS:
+        groups = [columns[s] for s in statuses if columns.get(s) and columns[s]["count"]]
+        bands.append({
+            "key": key,
+            "label": label,
+            "hint": hint,
+            "groups": groups,
+            "total": sum(group["count"] for group in groups),
+        })
+    return bands
 
 
 def _repo_form(product_id: int | None) -> dict[str, Any]:

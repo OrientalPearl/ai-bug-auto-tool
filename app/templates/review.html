@@ -10,7 +10,9 @@
   {% for bug in queue %}
   <div class="panel">
     <h3>禅道 #{{ bug.zentao_id }} · {{ bug.title }}
-      <span class="badge badge-orange">待审查</span></h3>
+      <span class="badge badge-orange">待审查</span>
+      <a class="btn" style="float:right" href="#/bug/{{ bug.id }}">弹窗看完整详情</a>
+    </h3>
     <p class="hint">
       pri {{ bug.pri }} / S{{ bug.severity }} · 分支 <code>{{ bug.branch or '未记录' }}</code> ·
       更新时间 {{ bug.updated_at }}

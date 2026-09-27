@@ -63,27 +63,50 @@ main { padding: 18px; }
 .muted { color: var(--muted); }
 .mono { font-family: Consolas, monospace; }
 
-/* ---- kanban ---- */
-.board { display: flex; gap: 12px; align-items: flex-start; overflow-x: auto; padding-bottom: 10px; }
-.column {
-  min-width: 260px;
-  width: 260px;
+/* ---- kanban: three stacked bands, each collapsible ---- */
+.board { display: block; }
+.band {
   background: #eceef2;
   border-radius: 8px;
-  border-top: 4px solid var(--pending);
-  padding: 8px;
-  flex-shrink: 0;
+  border-left: 5px solid var(--pending);
+  margin-bottom: 12px;
+  overflow: hidden;
 }
-.column h3 { margin: 2px 4px 8px; font-size: 13px; display: flex; justify-content: space-between; }
-.column .count { color: var(--muted); font-weight: 400; }
-
-.col-pending { border-top-color: var(--pending); }
-.col-fixing { border-top-color: var(--fixing); }
-.col-need_solution { border-top-color: var(--need_solution); }
-.col-await_review { border-top-color: var(--await_review); }
-.col-rejected { border-top-color: var(--rejected); }
-.col-merged { border-top-color: var(--merged); }
-.col-closed { border-top-color: var(--closed); }
+.band-mine { border-left-color: var(--await_review); }
+.band-ai { border-left-color: var(--fixing); }
+.band-done { border-left-color: var(--merged); }
+.band > summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+.band > summary::-webkit-details-marker { display: none; }
+.band .chevron { transition: transform .12s ease; font-size: 12px; color: var(--muted); }
+.band[open] .chevron { transform: rotate(90deg); }
+.band-title { font-size: 15px; font-weight: 700; }
+.band-total {
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 0 9px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.band-tags { margin-left: auto; display: flex; gap: 5px; flex-wrap: wrap; }
+.band-group { margin: 0 12px 10px; }
+.band-group h4 { margin: 6px 0 8px; font-size: 13px; font-weight: 600; display: flex; gap: 8px; align-items: center; }
+.band .cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+.band-empty { margin: 0 12px 12px; }
 
 .card {
   background: var(--card);
@@ -91,7 +114,6 @@ main { padding: 18px; }
   border-left: 4px solid var(--pending);
   border-radius: 6px;
   padding: 8px 10px;
-  margin-bottom: 8px;
   cursor: pointer;
 }
 .card:hover { box-shadow: 0 2px 6px rgba(0,0,0,.10); }
@@ -124,27 +146,52 @@ main { padding: 18px; }
 .badge-dark-green { background: var(--closed); }
 .badge-grey { background: var(--pending); }
 
-.detail {
-  display: none;
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px dashed var(--line);
-  font-size: 13px;
+/* ---- dialog (bug detail / bind form) ---- */
+.dialog { position: fixed; inset: 0; z-index: 60; }
+.dialog[hidden] { display: none; }
+.dialog-mask { position: absolute; inset: 0; background: rgba(15, 18, 24, .55); }
+.dialog-panel {
+  position: relative;
+  margin: 4vh auto;
+  width: min(1040px, 94vw);
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--card);
+  border-radius: 10px;
+  box-shadow: 0 14px 44px rgba(0, 0, 0, .3);
+  overflow: hidden;
 }
-.detail.open { display: block; }
-.detail h4 { margin: 10px 0 4px; font-size: 12px; color: var(--muted); text-transform: uppercase; }
-.detail pre {
+.dialog-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 16px;
+  border-bottom: 1px solid var(--line);
+  background: #f0f2f6;
+}
+.dialog-head h3 { margin: 0; font-size: 15px; word-break: break-all; line-height: 1.4; }
+.dialog-head .btn { margin-left: auto; flex-shrink: 0; }
+.dialog-body { padding: 14px 16px; overflow: auto; font-size: 13px; }
+body.dialog-open { overflow: hidden; }
+
+.bugdoc h4 { margin: 12px 0 4px; font-size: 12px; color: var(--muted); text-transform: uppercase; }
+.bugdoc h4:first-of-type { margin-top: 0; }
+.bugdoc pre {
   background: #f7f8fa;
   border: 1px solid var(--line);
   padding: 8px;
   border-radius: 4px;
   white-space: pre-wrap;
   word-break: break-all;
-  max-height: 240px;
+  max-height: 300px;
   overflow: auto;
   margin: 0;
   font-size: 12px;
 }
+.bugdoc table.grid { table-layout: fixed; }
+.bugdoc table.grid th { width: 116px; }
+.bugdoc .gallery .thumb { max-width: 240px; max-height: 160px; }
 
 /* ---- generic table ---- */
 table.grid { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); }
