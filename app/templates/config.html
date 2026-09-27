@@ -53,6 +53,11 @@ I18N_FILE_PATTERNS=*.po,*.mo,*.pot,*.qm   # 白名单：只有命中的词条文
 # ---- 分析结论 ----
 REQUIRE_ANALYSIS=true                 # 没写分析结论（analyses）时 commit 直接失败
 
+# ---- 不许卡住（AUTO_LOOP.md §3.4）----
+RETRY_WAIT=300                        # 限流/5xx/连不上：等这么多秒再重试同一步
+RETRY_MAX=3                           # 总共试几次；只重读类请求，评论与 i18n-commit 不重试
+STALE_CLAIM_MINUTES=40                # claim 后这么久没回音 → 自动回队列（queue_kind=stale），0=关闭
+
 # ---- 服务 / 执行器 ----
 WEB_HOST=127.0.0.1
 WEB_PORT=5000

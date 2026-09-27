@@ -41,6 +41,9 @@ ZENTAO_PRODUCT_IDS=                        # 留空=全部产品；也可写 1,3
 # 执行器行为（放在同一个 .env 里）
 REQUIRE_ANALYSIS=true                      # 没写分析结论不许 commit（默认 true）
 AI_BATCH_SIZE=5                            # 每批处理条数
+RETRY_WAIT=300                             # 限流/5xx/连不上时等这么久再重试（秒）
+RETRY_MAX=3                                # 总共试几次（读类请求；评论等写动作不重试）
+STALE_CLAIM_MINUTES=40                     # claim 后这么久没回音的 bug 自动回队列（0=关闭）
 ```
 
 SVN。**默认方式下本系统不执行 svn**（提交动作由目标代码库自己的提交细则负责），这里填的仓库地址只用于：

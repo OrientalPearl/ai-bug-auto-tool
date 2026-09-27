@@ -278,6 +278,22 @@ python -m app.cli block <禅道ID> --question "..." --options "..." --advice "..
 24. 禁止把 `i18n-commit` 登记的 `r<号>` 当成「这条 bug 已完成」：它只是词条留痕，
     bug 状态与代码草稿仍要走 §「单个 bug 处理流程」的第 10~12 步
 
+25. **限流不许中止任务**：模型或接口返回 `rate limit` / `429` / `overloaded` / `quota` / 502 / 503 /
+    「稍后再试」时，等 5 分钟重试同一步、最多 3 次（`.env` 的 `RETRY_WAIT=300`、`RETRY_MAX=3`；
+    本系统读禅道那侧已内置等待重试，会在 stderr 打 `[retry] …`）。重试期间不许改状态、不许 block、
+    不许退出循环；只有 3 次用完才 `block` 写明「上游限流未恢复」。写类动作（评论推送、`i18n-commit`）
+    **不自动重试** —— 重复提交比一次失败更难收拾。
+    单条处理必须落在 `STALE_CLAIM_MINUTES`（默认 40 分钟）之内：超了就说明上一轮已经死了，
+    系统会把这条重新放回队列（`queue_kind=stale`）让下一轮重跑，所以眼看要超时就先 `commit` 或 `block` 收尾
+26. **禁止出现任何需要授权的操作**：不许触发密码/口令弹窗（含 SSH 密码登录，只准免密 key）、
+    IDE 命令审批、沙箱越权提示、`sudo`、yes/no 交互、提问工具（`AskUserQuestion`）或「是否继续」的确认；
+    无人值守时它们等于把任务冻住。某步确实非授权不可 → 直接 `block` 写清要主人做什么、为什么、
+    影响面、怎么回滚，然后做下一条。**授权需求一律转成 `block` 留痕，不转成等待**
+27. **「本地文件比仓库新 / 要不要比较」自己解决，不许问**：先在 SSH 侧
+    `git -c core.ignorecase=false status --porcelain -- <文件>` + `diff --ignore-cr-at-eol -- <文件>` 取证；
+    差异只剩 CRLF / `$Id$` / 大小写对偶 / `.trae/**` → 按 §「落码位置」的结构性噪音照常做；
+    是别人写的真实改动 → 不覆盖、不 `stash`、不 `revert`、不 `checkout` 复原，`block` 写明摘要
+
 ## 停止条件
 
 1. 所有 pending 和 replied 的 bug 都已处理完（`tasks --limit 1` 返回空）

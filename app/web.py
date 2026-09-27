@@ -579,6 +579,16 @@ def _scope_block(group: dict[str, Any], base_label: str) -> str:
     else:
         lines.append("本队列独占这个目录 → 可以和其他目录的队列并行，但这个目录同时只允许一个操作方。")
     lines.append("取队列后自行过滤，只留本产品/本目录的条目：python -m app.cli tasks --limit 20")
+    lines.append("运行中这三类情况按 §3.4 自己解决，禁止停下来等我（无人值守时等待就是卡死）：")
+    lines.append("  a) 模型/接口限流（rate limit、429、overloaded、quota、502/503、稍后再试）"
+                 "→ 等 5 分钟重试同一步，最多 3 次（RETRY_WAIT/RETRY_MAX），期间不改状态、不 block、不退循环；"
+                 "3 次用完才 block 写「上游限流未恢复」，随后继续下一条；写类动作（评论、i18n-commit）不重试")
+    lines.append("  b) 任何需要授权的动作一律不许触发也不许等待：密码弹窗、SSH 密码登录（只准免密 key）、"
+                 "IDE 命令审批、沙箱越权提示、sudo、yes/no 交互、提问工具；"
+                 "确实绕不开授权就 block 写清「要主人做什么授权/为什么/影响面/怎么回滚」，接着做下一条")
+    lines.append("  c) 出现「本地文件比仓库新，是否比较」：自己在 SSH 侧 status + diff --ignore-cr-at-eol 取证 —— "
+                 "只剩 CRLF/$Id$/大小写对偶/.trae 就当 §1.5 的结构性噪音照常做；"
+                 "是别人写的真实改动就不覆盖、不 stash、不 revert、不 checkout 复原，block 写明摘要")
     lines.append("以下整段是 AUTO_LOOP.md 原文，规则以它为准：")
     return "\n".join(lines)
 
@@ -676,6 +686,29 @@ def _dispatch_checklist(queues: list[dict[str, Any]]) -> list[dict[str, str]]:
             add("warn", f"{'、'.join(missing)} 没配「正式 SVN 工作副本」，"
                         "这些产品的 i18n-commit 会被拒绝。",
                 'python -m app.cli bind-repo <产品ID> "<SVN仓库地址>" --svn-working-copy <正式SVN工作副本>')
+    add("info", f"限流与暂时失败不许中止任务（AUTO_LOOP.md §3.4）：读禅道那侧已内置等待重试 —— "
+                f"等 {settings.retry_wait} 秒、总共 {settings.retry_max} 次（.env 的 RETRY_WAIT / RETRY_MAX），"
+                "等待过程打到 stderr 的 [retry] 行；评论推送与 i18n-commit 是写动作，刻意不重试。"
+                "模型侧的限流要你自己按同一条口径等，不许整轮退出。")
+    stale = db.query_all(
+        "SELECT zentao_id, updated_at FROM bugs WHERE status = 'fixing'"
+        " AND updated_at < datetime('now', 'localtime', ?)",
+        (f"-{int(settings.stale_claim_minutes)} minutes",),
+    ) if int(settings.stale_claim_minutes) > 0 else []
+    if stale:
+        add("warn", f"{len(stale)} 条停在 fixing 已超过 {settings.stale_claim_minutes} 分钟"
+                    "（上一轮被限流或中断打死）：它们已自动回到队列，下一轮会以 queue_kind=stale 重跑，"
+                    "不需要手工改状态。",
+            'python -m app.cli tasks --limit 20')
+    else:
+        add("ok", f"没有超时未收的 fixing 占位（阈值 STALE_CLAIM_MINUTES="
+                  f"{settings.stale_claim_minutes} 分钟，超过就自动回队列）。")
+    add("info", "运行中禁止出现任何需要授权的动作：密码弹窗、SSH 密码登录、IDE 命令审批、sudo、"
+                "yes/no 交互、提问工具都不许触发；确实绕不开就 block 写清要主人做什么授权，继续下一条，"
+                "不要等。")
+    add("info", "「本地文件比仓库新，是否比较」由执行器自己判定（§3.4 第三步）："
+                "只剩 CRLF / $Id$ / 大小写对偶 / .trae 就当噪音照常做；"
+                "是别人写的真实改动就不覆盖不 revert，block 写明摘要。")
     return items
 
 

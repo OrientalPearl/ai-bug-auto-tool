@@ -23,6 +23,7 @@ import requests
 
 from . import zentao_parse as parse
 from .config import get_settings
+from .net_retry import call_with_retry
 
 
 class ZentaoError(RuntimeError):
@@ -114,9 +115,12 @@ class ZentaoClient:
                  params: dict | None = None, retried: bool = False) -> Any:
         url = f"{self.base_url}{path}"
         try:
-            resp = self.session.request(
-                method, url, json=json_body, params=params,
-                headers=self._headers(), timeout=self.timeout, verify=self.verify,
+            resp = call_with_retry(
+                lambda: self.session.request(
+                    method, url, json=json_body, params=params,
+                    headers=self._headers(), timeout=self.timeout, verify=self.verify,
+                ),
+                label=f"禅道 {method} {path}",
             )
         except requests.RequestException as exc:
             raise ZentaoError(f"无法连接禅道 {url}: {exc}") from exc
@@ -170,9 +174,12 @@ class ZentaoClient:
         failures: list[str] = []
         for label, headers, json_body, form_body in attempts:
             try:
-                resp = self.session.post(
-                    url, json=json_body, data=form_body, headers=headers,
-                    timeout=self.timeout, verify=self.verify,
+                resp = call_with_retry(
+                    lambda: self.session.post(
+                        url, json=json_body, data=form_body, headers=headers,
+                        timeout=self.timeout, verify=self.verify,
+                    ),
+                    label=f"禅道登录 [{label}]",
                 )
             except requests.RequestException as exc:
                 failures.append(f"[{label}] 连接失败 {exc}")

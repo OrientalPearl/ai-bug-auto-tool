@@ -172,7 +172,7 @@ def push_comment(zentao_id: int, text: str, *, client: ZentaoClient | None = Non
     if not settings.zentao_ready:
         db.log_sync("comment", zentao_id, {"skipped": "禅道未配置", "comment": text})
         return {"ok": False, "detail": "禅道未配置，评论只写入本地日志"}
-    client = client or ZentaoClient()
+    client = client or make_client()
     try:
         info = client.add_comment(zentao_id, text)
         db.log_sync("comment", zentao_id, {"comment": text, "endpoint": info.get("endpoint")})

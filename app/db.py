@@ -498,9 +498,22 @@ def fetch_task_queue(limit: int = 5) -> list[dict]:
       1. bugs whose need_solution got an owner reply (``replied``)
       2. rejected bugs (review failed, redo)
       3. plain pending bugs
+      4. stale ``fixing`` claims (a run killed by a model rate limit would
+         otherwise strand them forever) -- see ``STALE_CLAIM_MINUTES``
     Sorted by pri asc then severity desc.
     """
-    sql = """
+    stale = int(get_settings().stale_claim_minutes)
+    stale_sql = ""
+    params: list[Any] = []
+    if stale > 0:
+        # A claim older than the threshold means nobody is working on it any more.
+        stale_sql = (
+            "         OR (b.status = 'fixing' AND b.updated_at IS NOT NULL"
+            "             AND b.updated_at < datetime('now', 'localtime', ?))\n"
+        )
+        params.append(f"-{stale} minutes")
+    params.append(int(limit))
+    sql = f"""
         SELECT b.*,
                (SELECT n.id FROM need_solution n
                  WHERE n.bug_id = b.id AND n.status = 'replied'
@@ -509,15 +522,16 @@ def fetch_task_queue(limit: int = 5) -> list[dict]:
                  WHEN (SELECT COUNT(*) FROM need_solution n
                         WHERE n.bug_id = b.id AND n.status = 'replied') > 0 THEN 0
                  WHEN b.status = 'rejected' THEN 1
+                 WHEN b.status = 'fixing' THEN 3
                  ELSE 2 END AS queue_rank
           FROM bugs b
          WHERE b.status IN ('pending', 'rejected')
             OR EXISTS (SELECT 1 FROM need_solution n
                         WHERE n.bug_id = b.id AND n.status = 'replied')
-         ORDER BY queue_rank ASC, b.pri ASC, b.severity DESC, b.id ASC
+{stale_sql}         ORDER BY queue_rank ASC, b.pri ASC, b.severity DESC, b.id ASC
          LIMIT ?
     """
-    rows = query_all(sql, (int(limit),))
+    rows = query_all(sql, tuple(params))
     out = []
     for row in rows:
         row["files_changed"] = _json_load(row.get("files_changed")) or []
@@ -532,6 +546,9 @@ def fetch_task_queue(limit: int = 5) -> list[dict]:
             )
             row["reject_reason"] = (last_review or {}).get("reject_reason")
             row["queue_kind"] = "rejected"
+        elif row["status"] == "fixing":
+            # Reclaimed: some earlier run claimed it and died before reporting.
+            row["queue_kind"] = "stale"
         else:
             row["queue_kind"] = "pending"
         out.append(row)

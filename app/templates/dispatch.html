@@ -166,7 +166,7 @@
         <td>{{ b.title or '(无标题)' }}</td>
         <td>{{ b.product_name or ('产品 ' ~ b.product_id) }}</td>
         <td>{{ b.pri }} / S{{ b.severity }}</td>
-        <td>{{ {'replied': '已答复待处理', 'rejected': '打回重做', 'pending': '待处理'}[b.queue_kind] or b.queue_kind }}</td>
+        <td>{{ {'replied': '已答复待处理', 'rejected': '打回重做', 'stale': '跑挂回收·重跑', 'pending': '待处理'}[b.queue_kind] or b.queue_kind }}</td>
       </tr>
       {% endfor %}
     </tbody>

@@ -34,6 +34,7 @@ import requests
 
 from . import zentao_parse as parse
 from .config import PROJECT_ROOT, get_settings
+from .net_retry import call_with_retry
 from .zentao_client import ZentaoError, _pick, _strip_html
 
 BROWSER_UA = (
@@ -221,8 +222,11 @@ class ZentaoSessionClient:
     # ------------------------------------------------------------------
     def _raw_get(self, path: str) -> str:
         try:
-            resp = self.session.get(f"{self.base_url}{path}", timeout=self.timeout,
-                                    headers={"Accept": "text/html,application/json"})
+            resp = call_with_retry(
+                lambda: self.session.get(f"{self.base_url}{path}", timeout=self.timeout,
+                                         headers={"Accept": "text/html,application/json"}),
+                label=f"禅道会话 GET {path}",
+            )
         except requests.RequestException as exc:
             raise ZentaoError(f"无法连接禅道 {path}: {exc}") from exc
         return resp.text or ""
@@ -230,9 +234,12 @@ class ZentaoSessionClient:
     def get(self, path: str) -> dict[str, Any]:
         """GET a `.json` page and unwrap Zentao's AJAX envelope."""
         try:
-            resp = self.session.get(
-                f"{self.base_url}{path}", timeout=self.timeout,
-                headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"},
+            resp = call_with_retry(
+                lambda: self.session.get(
+                    f"{self.base_url}{path}", timeout=self.timeout,
+                    headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"},
+                ),
+                label=f"禅道会话 GET {path}",
             )
         except requests.RequestException as exc:
             raise ZentaoError(f"无法连接禅道 {path}: {exc}") from exc
@@ -439,7 +446,10 @@ class ZentaoSessionClient:
                 item["size"] = dest.stat().st_size
                 continue
             try:
-                resp = self.session.get(f"{self.base_url}{url}", timeout=self.timeout)
+                resp = call_with_retry(
+                    lambda: self.session.get(f"{self.base_url}{url}", timeout=self.timeout),
+                    label=f"禅道附件 GET {url}",
+                )
             except requests.RequestException as exc:
                 item["error"] = str(exc)
                 continue
@@ -456,6 +466,9 @@ class ZentaoSessionClient:
     # writes
     # ------------------------------------------------------------------
     def add_comment(self, bug_id: int, comment: str, *, extra: dict | None = None) -> dict:
+        """Post one comment. Deliberately NOT retried: a lost 5xx response may
+        still have been applied, and a duplicate comment on a tracked bug is
+        worse than the caller reporting a failed push."""
         del extra
         self.login()
         candidates = [f"/bug-comment-{bug_id}.json", f"/bug-comment-{bug_id}.html"]

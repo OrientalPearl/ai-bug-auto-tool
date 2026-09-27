@@ -73,6 +73,14 @@ class Settings:
     zentao_browse_type: str = field(default_factory=lambda: _env_str("ZENTAO_BROWSE_TYPE", "assigntome"))
     zentao_verify_ssl: bool = field(default_factory=lambda: _env_bool("ZENTAO_VERIFY_SSL", False))
     zentao_timeout: int = field(default_factory=lambda: _env_int("ZENTAO_TIMEOUT", 20))
+    # Transient failures (rate limit / gateway hiccup) must not abort an unattended
+    # run: wait this many seconds and retry, up to RETRY_MAX attempts in total.
+    retry_wait: int = field(default_factory=lambda: _env_int("RETRY_WAIT", 300))
+    retry_max: int = field(default_factory=lambda: _env_int("RETRY_MAX", 3))
+    # A run killed by a model rate limit leaves bugs stuck in `fixing` and the
+    # queue skips them forever; claims older than this many minutes are handed
+    # back. 0 disables the reclaim.
+    stale_claim_minutes: int = field(default_factory=lambda: _env_int("STALE_CLAIM_MINUTES", 40))
     # Override when a Zentao build exposes comment endpoints on another path.
     zentao_comment_path: str = field(default_factory=lambda: _env_str("ZENTAO_COMMENT_PATH"))
     zentao_http_proxy: str = field(default_factory=lambda: _env_str("ZENTAO_HTTP_PROXY"))
@@ -194,6 +202,8 @@ class Settings:
             "i18n_file_patterns": ", ".join(self.i18n_file_patterns) or "(空)",
             "branch_prefix": self.branch_prefix,
             "batch_size": str(self.batch_size),
+            "retry": f"暂时失败等 {self.retry_wait} 秒后重试，总共最多 {self.retry_max} 次"
+                     "（只重读类请求，写评论不重）",
             "require_analysis": "true" if self.require_analysis else "false",
         }
 
