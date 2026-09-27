@@ -83,16 +83,27 @@ python -m app.cli doctor                   # 禅道通道分步诊断
 - **执行器改代码的地方是镜像仓库，不是正式 SVN 工作副本**。镜像地址与工作副本路径由
   `python -m app.cli repos` 的 `working_copy` 给出（存在 `product_repos` 里，不在本文档里），
   正式工作副本对执行器**只读**。
-- 允许：`git checkout -b bugfix/zentao-<禅道ID> refs/remotes/origin/trunk`、`git add`、`git commit`、
-  `git diff`、`git log`、`git status`。
-- 禁止：`git svn dcommit`、`git push`、`git svn fetch/clone`（同步 SVN→git 由主人跑）、
+- **git 只在 SSH（Linux）侧跑**：Windows 那个映射盘路径与 SSH 侧路径是同一条数据、同一个 `.git`。
+  主机/用户/Linux 侧路径读镜像根 `CLAUDE.local.yaml`（`ssh.*` 与 `path_aliases`），本系统不复制。
+  命令形态固定为 `ssh <SSH用户>@<SSH主机> "cd <镜像> && git -c core.ignorecase=false <子命令>"`。
+  Windows 侧**不许跑 git**：那份 `.git/config` 是 Windows 侧 git-svn 写的 `ignorecase=true`+`symlinks=false`，
+  本库有 109 组只差大小写的路径，Windows 侧两个拼名读到的是同一个文件（实测 md5 相同），
+  改 A 会落到 B；另有长路径文件名在 Windows 侧根本创建不了。
+- 允许（均在 SSH 侧）：`git checkout -b bugfix/zentao-<禅道ID> refs/remotes/origin/trunk`、`git add <具体文件>`、
+  `git commit`、`git diff`、`git log`、`git status`。**禁止 `git add -A`/`add .`**（会把结构性噪音卷进提交，见下）。
+- 禁止：`git svn dcommit`、`git push`、`git svn fetch/clone`、`git read-tree`（同步与镜像修复由主人跑）、
   `svn ci`、`svn copy`、在正式工作副本里改码。
   例外只有一处：**词条文件**只能在 `svn_working_copy`（正式 SVN 工作副本）里改，
   且只能用 `i18n-up` / `i18n-commit` 两条命令让系统代跑 `svn update/ci`（闸门 G12）。
-- 开工前必须验就绪（三条都要过，见 `AUTO_LOOP.md` §1.5）：
-  `git -C <镜像> rev-parse --verify refs/remotes/origin/trunk`、`git -C <镜像> rev-parse --verify HEAD`、
-  `git -C <镜像> ls-files --error-unmatch AGENTS.md`；任一条失败（含 ref 在但 index 缺失的半途中止）
+- 开工前必须验就绪（三条都要过，全在 SSH 侧，见 `AUTO_LOOP.md` §1.5）：
+  `git -c core.ignorecase=false rev-parse --verify refs/remotes/origin/trunk`、
+  `git -c core.ignorecase=false rev-parse --verify HEAD`、
+  `git -c core.ignorecase=false ls-files --error-unmatch AGENTS.md`；任一条失败（含 ref 在但 index 缺失的半途中止）
   → 不改码、不转去动正式副本 → `block` 写明「镜像未就绪（缺 ref / 缺 index）」，继续下一条。
+- 结构性噪音（实测 3.0 补完 index 后 `git status` 共 92 条：**不是 bug 造成的**，不许 `checkout`、
+  不许写进 `--files`、不许为此 `block`）：整棵 `.trae/**`（是指向主人知识库根的符号链接）、
+  `openvpn-2.4.8/INSTALL`（仓库里是文件、盘上是同名目录）、约 53 条 `M`（13 条 Windows 检出的 CRLF +
+  40 条 `$Id$` 关键字形态差异，看差异用 `--ignore-cr-at-eol`）、未跟踪的 `CLAUDE.md` / `CLAUDE.local.yaml` / `.trae`。
 - 登记形态区分两种，审查页靠它辨认改动到哪一步了：
   `--revision git:<7位短哈希>` = 已本地提交、未进正式库；`--revision r<号>` = 主人已提交，回填真实号。
 - 镜像与正式副本是**两份独立目录**，改动不会自动同步；回灌由主人审完 `git diff` 后自己做。
@@ -104,22 +115,29 @@ python -m app.cli doctor                   # 禅道通道分步诊断
 
 ## 代码库自带的 AI 知识体系（定位代码前先读它）
 
-这套体系**存在版本库里**，镜像拉下来就有，不需要另外挂载（`AUTO_LOOP.md` §1.6 有逐项实测清单）：
+这套体系分三层，前两层在镜像目录里直接读得到（`AUTO_LOOP.md` §1.6 有逐项实测清单）：
 
-- 入口：镜像根 `AGENTS.md`（全局规则 + 「按问题类型选择入口」 + 「功能反查总纲」）、
-  `.trae/agents/<源码相对路径>/AGENT.md`（目录级：入口 / 文件 / 覆盖 / 坑点）、
-  `.trae/doc/ARCHITECTURE.md`（跨层架构；3.0 有，2.3 没有，缺了就跳过）、`.trae/skills/`
-  （`bug-debug-flow` / `code-review-cn` / `feature-implementer` 流程）。
-- 定位顺序是**强制**的：`AGENTS.md` 选入口 → 跨层或归属不清看 `ARCHITECTURE.md` → 定下落点后读该目录的
-  `AGENT.md` → 再按稳定 token 去 `grep`/`Read`。**不许绕过知识体系全库散搜**，也不许只看目录名猜模块。
+- **常驻注入层**：镜像根 `CLAUDE.md` —— 该库工作区的 AI 首跳规则（硬门禁 + 「触发条件 → 下层路径」指针）。
+  起手顺序固定 `Skill → playbooks/task-precheck-protocol.md → 触发指针`。
+- **按需知识层**：`.trae/`（实测在 3.0 里是**指向主人知识库根的符号链接**）—— `registry/`（症状入口、
+  能力、API、OEM 矩阵）、`doc/`（`DOC_INDEX.md`、`ARCHITECTURE.md`、`CAPABILITY_MAP.md`）、
+  `agents/<源码相对路径>/AGENT.md`、`playbooks/`、`skills/`、`scanners/`、`staging/`、`metrics/`。
+  按 `CLAUDE.md` 的触发指针**定向 Grep 命中段落再局部 Read**，不整篇通读。
+- **仓库正式层**：镜像根 `AGENTS.md` 与进 SVN 的 `.trae/**`。
+- 定位顺序是**强制**的：`CLAUDE.md` 选入口 → 命中哪条就读知识根下哪个文件 → 跨层或归属不清看
+  `ARCHITECTURE.md` → 定下落点后读该目录的 `AGENT.md` → 再按稳定 token 去 `grep`/`Read`。
+  **不许绕过知识体系全库散搜**，也不许只看目录名猜模块。
 - 优先级：代码怎么写、往哪个目录改、命名与分层规范 —— 以代码库内这套为准；本文件只管任务闭环、
   闸门与登记。两者冲突按前者，**唯一不可被覆盖的是 G11**（远端写入只有主人能做）。
-- 知识回写：本次得出**可复用且已被代码或配置验证**的结论时，追加到最近的
-  `.trae/agents/<源码相对路径>/AGENT.md`（没有就按该库规则新建），顺序固定
-  `入口 -> 文件 -> 覆盖 -> 坑点`，并把这个文件一起 `git add` / 写进 `commit --files`，跟代码同分支同审查。
+- 知识回写（知识库靠边用边迭代，但要按下面的边界来）：本次得出**可复用且已被代码或配置验证**的结论时，
+  追加到最近的 `.trae/agents/<源码相对路径>/AGENT.md`（没有就按该库规则新建），顺序固定
+  `入口 -> 文件 -> 覆盖 -> 坑点`。因为 `.trae` 指向的是**主人工作台的另一个 git 仓**，
+  所以这类文件**只追加、不 `git add`、不 commit、不 push**，也不写进本条 bug 的 `--files`；
+  改为在分析结论的 `evidence` 里点名「回写了哪个知识文件、写了什么」，收口由主人自己做。
   禁止：写猜测、写一次性排查过程、新建散落的 `.AGENT` 文件、随手改根 `AGENTS.md`（只有跨目录共性才改）。
-- 仓库之外的那套工作台（`CLAUDE.md`、`playbooks`、`registry`、`scanners`、`staging` 所在的
-  `.trae_local_*` 目录）**不在版本库里**：不去外面找它，不在那个 git 仓里改任何东西。
+- 知识库根的**真实路径只在镜像根 `CLAUDE.local.yaml`**（`path_aliases` / `ssh.*`）；执行器只能通过镜像内的
+  `.trae/` 这条路径访问它，不许绕到镜像外面去找，也不许在那个仓里做 git 动作。生成态读数
+  （`staging/`、`metrics/`、`doc/DOC_INDEX.md`）带 `generated_at` + `max_age_days`，超时效一律当「未知」。
 - `.secrets.env` 在两条产品线的仓库根目录里（已进 SVN，镜像里也会有）：**不许打开、引用、复制、提交**，
   也不许把它的内容写进分析结论、`--files` 或禅道评论。
 
@@ -130,11 +148,12 @@ python -m app.cli doctor                   # 禅道通道分步诊断
 2. 读取该 bug 的禅道描述、截图、备注、历史提交记录、need_solution 中的 owner_reply（如果有）
 3. `python -m app.cli claim <禅道ID>` 占住任务（置 fixing），避免其他子任务重复领同一条
 4. 确认这条 bug 属于哪个产品、哪份代码、镜像工作副本在哪：`python -m app.cli repos`；
-   **镜像未就绪（`refs/remotes/origin/trunk` 不存在）时不许开工**，直接 `block` 写明「镜像未就绪」
-5. 在镜像里为这条 bug 开本地分支：`git -C <镜像> checkout -b bugfix/zentao-<禅道ID> refs/remotes/origin/trunk`；
-   然后**先读该库自带的知识体系**（镜像根 `AGENTS.md` 选入口 → 跨层看 `.trae/doc/ARCHITECTURE.md` →
-   落点目录的 `.trae/agents/<相对路径>/AGENT.md` → 流程按 `.trae/skills/`），再定位修改点，
-   只改与这条 bug 直接相关的文件
+   **镜像未就绪（SSH 侧三条判据任一失败，`AUTO_LOOP.md` §1.5）时不许开工**，直接 `block` 写明「镜像未就绪」
+5. 在镜像里为这条 bug 开本地分支（**git 全部走 SSH 侧**，Windows 映射盘那一份不跑 git）：
+   `ssh <SSH用户>@<SSH主机> "cd <镜像> && git -c core.ignorecase=false checkout -b bugfix/zentao-<禅道ID> refs/remotes/origin/trunk"`；
+   然后**先读该库自带的知识体系**（镜像根 `CLAUDE.md` 选入口 → 命中指针读 `.trae/` 下的 `registry|doc|playbooks` →
+   跨层看 `.trae/doc/ARCHITECTURE.md` → 落点目录的 `.trae/agents/<相对路径>/AGENT.md` → 流程按 `.trae/skills/`），
+   再定位修改点，只改与这条 bug 直接相关的文件；改之前用 `git ls-files <路径>` 在 Linux 侧核对大小写拼名
 6. 如果能高置信度确认修改点（空指针、参数错误、配置缺失、明显逻辑错误），直接修改
 7. 运行该库规定的编译 / 测试（可参考 `repos` 里的 `build_command` / `test_command`；本工程必须走 SSH 编译服务器），
    连续 2 次不过就转需方案
@@ -145,9 +164,11 @@ python -m app.cli doctor                   # 禅道通道分步诊断
 9. **逐条核对提交闸门**（`AUTO_LOOP.md` §2 的 G1–G12：详情与截图看过、根因明确、改动范围与产品仓库一致、
    构建通过、状态矩阵自审、文案与 i18n 同步、目标是 bugfix 分支非 trunk、message 规范无敏感串、
    未验证路径已标注、所需授权已取得、**远端写入留给主人**、**多语言词条走直连通道**）
-10. 闸门全过 → **只在镜像里 `git commit`**（本地），取 `git rev-parse --short HEAD` 当登记的修订号；
+10. 闸门全过 → **只在镜像里 `git commit`**（SSH 侧本地提交，只 `add` 自己改过的那几个文件，禁止 `add -A`），
+    取 `git rev-parse --short HEAD` 当登记的修订号；
     本次得出可复用且已验证的结论时，先把它追加进最近的 `.trae/agents/<相对路径>/AGENT.md`
-    （顺序 `入口 -> 文件 -> 覆盖 -> 坑点`），与该 bug 的代码文件一起 `git add`，同分支同审查
+    （顺序 `入口 -> 文件 -> 覆盖 -> 坑点`）——那是知识根那个独立仓的文件，**只追加不 add/commit**，
+    在 `evidence` 里点名回写了什么，由主人自己收口
     任一条不过 → 不提交，走 `block` 说明卡在哪。**绝不 `git svn dcommit` / `git push` / `svn ci`**
     （G12 的 `i18n-commit` 是唯一被系统代跑 svn 的入口，且只能提白名单词条文件）
 11. **写分析结论**（这是 bug 完成的必交付物，`REQUIRE_ANALYSIS=true` 时没分析 commit 会被直接拒绝）：
@@ -232,12 +253,15 @@ python -m app.cli block <禅道ID> --question "..." --options "..." --advice "..
     唯一例外：闸门 G12 的词条提交，且只能通过 `i18n-up` / `i18n-commit` 两条命令，不许手写 svn 命令
 16. 禁止在正式 SVN 工作副本里改码（执行器只在 `repos` 给出的镜像 `working_copy` 里改），
     也禁止代主人跑 `git svn clone/fetch`；**例外只有白名单词条文件**，它们只能改在 `svn_working_copy` 里
-17. 禁止在镜像未就绪（`refs/remotes/origin/trunk` 不存在或为空）时开始改码或提交；如实 `block`
+17. 禁止在镜像未就绪（SSH 侧三条判据任一失败：trunk ref / HEAD / `ls-files --error-unmatch AGENTS.md`）时
+    开始改码或提交；如实 `block`，禁止自己 `read-tree`/重跑 clone 去补
 18. 禁止把 `git:<哈希>` 与 `r<号>` 混为一谈或在回报里声称已进正式库：`git:<哈希>` 只代表本地草稿
 19. 禁止把多语言词条攒在镜像分支里等审查/回灌：词条必须「改前 `i18n-up`、改完立刻 `i18n-commit`」，
     攒着必然与他人冲突，而这条通道本来就是为此开的
-20. 禁止绕过代码库自带的知识体系（镜像根 `AGENTS.md` + `.trae/agents|doc|skills`）直接全库散搜定位；
-    也禁止去仓库外的 `.trae_local_*` 工作台里找规则或改东西（它不在版本库里，不进镜像）
+20. 禁止绕过代码库自带的知识体系（镜像根 `CLAUDE.md` 常驻层 → `.trae/` 指向的 `registry|doc|agents|playbooks|skills`
+    → 仓库 `AGENTS.md`）直接全库散搜定位；访问知识库只能通过镜像内的 `.trae/` 这条路径，
+    **禁止绕到镜像外面去读 `.trae_local_*` 的绝对路径**，禁止在知识根那个独立 git 仓里做任何 git 动作
+    （它由主人收口，执行器只追加文件内容并在 `evidence` 里点名）
 21. 禁止打开、引用、复制或提交 `.secrets.env`（两条产品线的仓库根都有，已进 SVN，镜像里也会有）；
     同禁把 `.env` 的账号密码写进代码、日志、提交说明、分析结论或禅道评论
 22. 禁止新建散落的 `.AGENT` 文件（该库明令禁止），禁止随手改代码库根 `AGENTS.md`：

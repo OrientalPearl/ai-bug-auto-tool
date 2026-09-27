@@ -29,10 +29,13 @@
    只有镜像互不相同的组之间才并行）
 3) 每条 bug 起一个独立子任务，用 AUTO_LOOP.md §3.2 模板，只替换禅道ID
 4) 落码位置是 git-svn 镜像（AUTO_LOOP.md §1.5）；镜像未就绪就不许改码，也不许动正式 SVN 工作副本
+   所有 git 命令一律 `ssh <SSH用户>@<SSH主机> "cd <镜像> && git -c core.ignorecase=false …"` 在 Linux 侧跑，
+   Windows 侧那份只读代码不跑 git（本库 109 组只差大小写的路径会被 ignorecase 混成一个）
 5) 子任务只做：验镜像就绪 → status(看图看备注) → claim → 先读该库自带的 AI 知识体系
-   （镜像根 AGENTS.md + .trae/agents|doc|skills，见 §1.6）再定位 → 镜像里开 bugfix/zentao-<ID> 改码
-   → SSH 编译/测试 → 逐条核对提交闸门
-6) 闸门全过 → 只在镜像里 git commit（本地），把短哈希当修订号登记，并一起写入分析结论
+   （镜像根 CLAUDE.md 常驻层 → `.trae/` 指向的知识根 registry|doc|agents|playbooks，见 §1.6）
+   再定位 → 镜像里开 bugfix/zentao-<ID> 改码 → SSH 编译/测试 → 逐条核对提交闸门
+6) 闸门全过 → 只在镜像里 git commit（本地，只 add 自己改的那几个文件，禁止 add -A），
+   把短哈希当修订号登记，并一起写入分析结论
    （--analysis-file a.json，字段见 §2.2）：
    commit --no-svn --revision git:<哈希> --analysis-file a.json；
    闸门任一条不过 → block 回填（也带上分析），继续下一条
@@ -51,7 +54,7 @@
 
 | 方式 | 提交动作由谁做 | 本系统命令 | 适用 |
 | --- | --- | --- | --- |
-| 只管任务 | 执行器按**代码库知识体系**的提交细则做（含 SSH 门禁、同意流程、真实修订号） | `claim` → 提交 → `commit --no-svn --revision <真实号> --analysis-file a.json` | 有自己规则体系的仓库（如带 `CLAUDE.md` 的工作区） |
+| 只管任务 | 执行器按**代码库知识体系**的提交细则做（含 SSH 门禁、同意流程、真实修订号） | `claim` → 提交 → `commit --no-svn --revision <真实号> --analysis-file a.json` | 有自己规则体系的仓库（如带 `CLAUDE.md` + `.trae` 知识根的工作区） |
 | 托管 svn | 本系统代跑 `svn copy/switch/commit` | `branch <ID>` → `commit <ID> --files ...` | 无门禁的独立工作副本（`svn_workspace/p<产品ID>-<hash>`），想彻底无人值守时 |
 | **本地 git 草稿**（本工程采用） | 执行器只在 git-svn 镜像里 `git commit`，**不推任何远端**；进正式库由主人事后做 | `claim` → 镜像里 `git commit` → `commit <ID> --no-svn --revision git:<哈希> --analysis-file a.json` | 仓库带 git-svn 镜像、要求「改动先落地可见、正式库在你点头之前不动」（见 §1.5） |
 
@@ -76,9 +79,11 @@
    唯一例外是 §2.1 的多语言通道：词条文件由 `i18n-up` / `i18n-commit` 两条命令代跑 `svn update/ci`。
 2. **登记时用 git 哈希，不带 `r` 前缀**：`--revision git:<7位短哈希>`，与本系统的 SVN 修订号用两种形态区分，
    审查页一眼能看出这条是「本地草稿」还是「已进正式库」。
-3. **镜像未就绪时不许开工**：`git -C <镜像> rev-parse --verify refs/remotes/origin/trunk` 失败、
-   或 `refs/remotes/origin/trunk` 为空（clone/fetch 还在跑）→ 不改码、不转去动正式工作副本，
-   直接 `block` 写明「镜像未就绪」并继续下一条。
+3. **镜像未就绪时不许开工**：判据见下面「就绪」，任一条不过 → 不改码、不转去动正式工作副本，
+   直接 `block` 写明「镜像未就绪（缺 ref / 缺 commit / 缺 index）」并继续下一条。
+4. **所有 git 动作只在 SSH 侧（Linux）做**，命令形态固定为
+   `ssh <SSH主机> "cd <镜像目录> && git -c core.ignorecase=false <子命令>"`；
+   Windows 侧那份只是同一份目录的映射视图，**只用来读代码，不许在它里面跑 git**（理由见下面「代价」）。
 
 为什么这么分：SVN 没有本地提交，`svn ci` 一跑就进正式库；git 有。用镜像当草稿区，就把「AI 已改完」
 和「已进正式库」这两件事拆成了两个独立动作 —— 前者随时可 `git reset` 回退，后者只在人点头后发生。
@@ -90,39 +95,68 @@
 - 两边共用同一个 `.git` 目录（跨 Samba）时**只能有一个操作方**，git 的文件锁在 SMB 上不可靠；
   所以「同一镜像串行」是硬约束，且划分单位是镜像而不是产品 —— 两个产品绑定到同一个镜像时，
   它们必须共用一条串行队列（见 §5）。Windows 侧与编译服务器侧同样不得同时动镜像。
-- 就绪 = **三条一起满足**，只满足前两条不算就绪（真实踩过：clone 最后一步 `Filename too long`
+- 镜像目录**两侧是同一条数据**：Windows 那个映射盘路径与 SSH 侧的 Linux 路径指向同一份 checkout、同一个
+  `.git`（映射关系与真实值只存在该库工作区根的 `CLAUDE.local.yaml`（`path_aliases` / `ssh.*`）与本系统的
+  `product_repos` 里，本文档不复制一份）。**主机、用户、路径都从 `CLAUDE.local.yaml` 读**，别猜也别写死。
+- 就绪 = **三条一起满足**，全部在 SSH 侧验（真实踩过：clone 最后一步在 Windows 侧报 `Filename too long`
   中止，ref 与对象都在，但 `.git/index` 没落盘，执行器一上来 `checkout -b` 就失败）：
 
   ```
-  git -C <镜像目录> rev-parse --verify refs/remotes/origin/trunk   # ① 基线 ref
-  git -C <镜像目录> rev-parse --verify HEAD                        # ② 基线 commit
-  git -C <镜像目录> ls-files --error-unmatch AGENTS.md             # ③ index + 工作树真的铺好了
+  ssh <SSH主机> "cd <镜像目录> && git -c core.ignorecase=false rev-parse --verify refs/remotes/origin/trunk"
+  ssh <SSH主机> "cd <镜像目录> && git -c core.ignorecase=false rev-parse --verify HEAD"
+  ssh <SSH主机> "cd <镜像目录> && git -c core.ignorecase=false ls-files --error-unmatch AGENTS.md"
   ```
 
-  ③ 报 `Not a valid object name` 或没有任何输出 = 工作树/index 缺失 → 不许改码，
-  按 §8「checkout 阶段报 Filename too long」那行修复后再开工。
+  ③ 报错或没有输出 = 工作树/index 缺失 → 不许改码，按 §8 那行让主人补 index 后再开工。
+- **Windows 侧禁止跑 git**（三条实测，不是理论）：
+  1. 那份 `.git/config` 是 Windows 侧 git-svn 写的：`ignorecase = true`、`symlinks = false`；
+  2. 本库有 **109 组只差大小写的路径**，Windows 侧两个拼名读到的是同一个文件（实测
+     `xt_DSCP.c` 与 `xt_dscp.c` 在 Windows 侧 md5 相同、在 Linux 侧一个是 4028B 一个是 2839B）
+     → 在 Windows 侧「改 A 文件」会把改动落到 B 文件上，且另一半在 git 眼里永远是 deleted；
+  3. 长路径文件名（如 higress 的 envoy fuzz corpus）Windows 侧创建不了。
+  Linux 侧必须带 `-c core.ignorecase=false`，因为上面那份 `ignorecase = true` 会被 Linux 侧 git 照抄。
+- SSH 侧的 `~/.gitconfig` 身份是占位值（`user.name=123` / `you@example.com`）→ 提交时必须显式带上
+  `-c user.name=<...> -c user.email=<...>`（用主人给的值），否则草稿 commit 的作者是垃圾身份。
+- 工作树有一批**结构性噪音**（实测 3.0 补完 index 后 `git status` 共 92 条，占 777,157 个条目的万分之一），
+  不是这次 bug 造成的：`--files` 里一律不许带、**禁止 `git add -A` / `add .`**，也别去「修复」它们——
+  1. ` D` 36 条：35 条是整棵 `.trae/**`（镜像里它是指向主人知识库根的符号链接，`symlinks=false` 让 git
+     认不了它；真去 `checkout` 会**写穿符号链接覆盖知识库根**），1 条是 `openvpn-2.4.8/INSTALL`
+     （仓库里是文件、盘上是同名目录，任何平台都只能存在一个）；
+  2. ` M` 53 条：其中 13 条纯粹是 Windows 侧检出留下的 CRLF（HEAD 里是 LF），另外 40 条连
+     `$Id: <哈希> $` 关键字行也不一样（HEAD 里是展开形态、盘上是 `$Id$`）；看真实差异用
+     `--ignore-cr-at-eol`，它只能消掉 CRLF 那一半，剩下 40 条本来就跟你无关，别管；
+  3. `??` 3 条：`.trae`、`CLAUDE.md`、`CLAUDE.local.yaml` —— 主人的本地知识框架文件，永远不进版本库。
+   `git add <单个文件>` 时 CRLF 会被 git 自动归一回 LF（提交内容不受影响）；但那 40 条 `$Id$` 差异 git
+   不会归一 —— **如果你正好要改的文件在这 40 条里**，提交就会顺带把 `$Id: <哈希> $` 改成 `$Id$`，
+   这时必须在分析结论里写明「该文件本来就有 $Id$ 形态差异，本次一并带上了」，别让它当成本次的改动量。
 - 编译与实测仍只能在 SSH 编译服务器上做（镜像目录在 Windows 本地编译不了）。
 - 绑定关系仍要落进本系统，G3 才有判据（真实地址与镜像路径存 `product_repos`，不写进文档）：
   `python -m app.cli bind-repo <产品ID> "<SVN仓库地址>" --name "<产品名>" --working-copy <镜像目录>`
 
 ## 1.6 代码库自带的 AI 知识体系（执行器先读它，再动手）
 
-这套体系**就在 SVN 版本库里**（`svn list` 实测），所以它会随镜像一起被 clone 下来，
-在镜像目录里直接能读，不需要额外挂载、也不需要另建索引：
+这套体系有**三层**，前两层在镜像目录里直接能读（实测），第三层是仓库正式那份：
 
-| 入口（相对镜像根） | 实测内容 | 什么时候读 |
-| --- | --- | --- |
-| `AGENTS.md` | 全局规则、「按问题类型选择入口」、「功能反查总纲」 | 每条 bug 定位前的第一件事 |
-| `.trae/agents/<源码相对路径>/AGENT.md` | 3.0 已覆盖 16 个目录：`ace_include` `asset_scanning` `bin` `cgi` `hycli` `image` `kernelModule` `l7-feature` `l7dpi` `l7mail` `page` `php-5.6.26` `reporter` `sysapp` `vpage` `vpp-23.02` | 定下落点目录后下钻该目录的 入口 / 文件 / 覆盖 / 坑点 |
-| `.trae/doc/ARCHITECTURE.md` | 架构分层、跨层协同、模块归属、链路分流（**3.0 有，2.3 没有**） | 问题跨层或归属不清时先看它 |
-| `.trae/doc/<模块>/…` | 已验证的专项结论（3.0：`bin` `image` `vpp-23.02`） | 命中该模块时 |
-| `.trae/skills/…` | `bug-debug-flow` `code-review-cn` `feature-implementer` | 按流程走，别自创流程 |
+| 层 | 位置（相对镜像根） | 是什么 | 什么时候读 |
+| --- | --- | --- | --- |
+| 常驻注入层 | `CLAUDE.md` | 该库工作区的 AI 首跳规则：硬门禁 + 「触发条件 → 下层路径」一行式指针（实测 65 行、与知识库根那份逐字节一致） | 每条 bug 动手前的第一跳；起手顺序固定 `Skill → playbooks/task-precheck-protocol.md → 触发指针` |
+| 按需知识层 | `.trae/`（实测是符号链接 → 主人的知识库根 `<LOCAL_KNOWLEDGE_ROOT>`） | `registry/`（症状入口、能力、API、OEM 矩阵等 23 个）`doc/`（含 `DOC_INDEX.md`、`ARCHITECTURE.md`、`CAPABILITY_MAP.md`）`agents/`（25 个目录级 `AGENT.md`）`playbooks/` `skills/` `scanners/` `staging/` `metrics/` | 按 `CLAUDE.md` 的触发指针**定向 Grep 命中段落再局部 Read**，不整篇通读 |
+| 仓库正式层 | `AGENTS.md`、`.trae/…`（进 SVN 的那些） | 库作者维护、随版本走的正式规则与目录级 `AGENT.md` | 常驻层没覆盖该域时；两者口径以代码库为准 |
 
+- 路径真实源只有一个：镜像根 `CLAUDE.local.yaml` 的 `path_aliases`（`LOCAL_KNOWLEDGE_ROOT` /
+  `LOCAL_RUNTIME_ROOT` / `LOCAL_WORKSPACE_ROOT`）与 `ssh.*`。本系统不复制这些值，也不写进本文档。
+- 生成态读数（`staging/`、`metrics/`、`doc/DOC_INDEX.md`）有 `generated_at` + `max_age_days`；
+  超过时效一律当「未知」，不许把过期的空清单读成「没有问题」（实测 `DOC_INDEX.md` 30 天时效）。
 - 该产品**没有**对应文件时（例如 2.3 的 `.trae/doc/`）就跳过，别为不存在的入口反复找；
   目录级 `AGENT.md` 不存在时也直接按下钻规则新建（见下面「知识回写」），不算越界。
-- 仓库外那些 `.trae_local_3.0` / `.trae_local_2.3`（`CLAUDE.md`、`playbooks`、`registry`、
-  `scanners`、`staging` 那份）**不在 SVN 里、也不在镜像里**，是主人自己的工作台：
-  执行器不许去外面找它们，更不许在那个 git 仓里改任何东西。
+- **两条产品线的知识层不一样**（实测）：3.0 有镜像根 `CLAUDE.md` + `CLAUDE.local.yaml`，且 `.trae` 是指向
+  知识根的符号链接；2.3 的镜像里**没有** `CLAUDE.md` / `CLAUDE.local.yaml`，`.trae` 是实体目录 ——
+  在 2.3 上就只走「仓库正式层」，第 1 跳直接读它的 `AGENTS.md`，别去找不存在的常驻层；
+  2.3 的 SSH 目标与路径也不在 `CLAUDE.local.yaml` 里，向主人要。
+- 知识库根本体（实测 3.0 是镜像旁边的 `.trae_local_3.0`，**自己是一个独立 git 仓、当前在 `main` 上
+  有 100+ 条未提交改动**）由主人维护：执行器只允许**通过镜像内的 `.trae/` 这条路径**读写它，
+  不许绕到镜像外面去找那个目录、更不许在那个仓里 `git add/commit/push/checkout`。
+  镜像里 `.trae` 是符号链接这件事本身，就是 §1.5 那条「`.trae/**` 永久 deleted」噪音的来源。
 
 冲突时谁说了算：
 
@@ -269,6 +303,7 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
   - 需我给方案（我要去 /need 答复）
   - 闸门未过/未提交及原因
 期间不要复述规则、不要问我是否继续、不要碰 trunk、不要推远端（dcommit/push/svn ci）、不要替代码库判定提交细则。
+不要在 Windows 侧跑任何 git（那份 .git 与 Linux 侧是同一个，Windows 的 ignorecase 会把改动落到大小写对偶文件上）；
 唯一例外是词条：改了 .po/.mo 就按 §2.1 用 i18n-up + i18n-commit 单独提交，其余文件一律不碰 svn。
 ```
 
@@ -279,25 +314,31 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
 任务管理命令的工作目录：<项目目录>
 落码位置：镜像仓库 <镜像路径>（见 §1.5）；正式 SVN 工作副本只读，禁止在里面改码
         —— 唯一例外：多语言词条文件按 G12 走 §2.1 的通道，改前先 up、改完立刻单独提交
+   <SSH主机> / <SSH用户> / Linux 侧镜像路径 = 该库镜像根 `CLAUDE.local.yaml` 里的 `ssh.*` 与
+   `path_aliases.LOCAL_WORKSPACE_ROOT`（同一份目录，Windows 侧只读代码，git 一律走 SSH）
 
-0) 先验镜像就绪（三条都要过，见 §1.5；不就绪就别开工）：
-   git -C <镜像路径> rev-parse --verify refs/remotes/origin/trunk
-   git -C <镜像路径> rev-parse --verify HEAD
-   git -C <镜像路径> ls-files --error-unmatch AGENTS.md
+0) 先验镜像就绪（三条都要过，见 §1.5；不就绪就别开工）—— 全部走 SSH 且带 -c core.ignorecase=false：
+   ssh <SSH用户>@<SSH主机> "cd <镜像路径> && git -c core.ignorecase=false rev-parse --verify refs/remotes/origin/trunk"
+   ssh <SSH用户>@<SSH主机> "cd <镜像路径> && git -c core.ignorecase=false rev-parse --verify HEAD"
+   ssh <SSH用户>@<SSH主机> "cd <镜像路径> && git -c core.ignorecase=false ls-files --error-unmatch AGENTS.md"
    任一条失败 = clone 没跑完或最后检出没落盘 → 直接跳到第 7 步 block，
-   原因写「镜像未就绪（缺 ref / 缺 index）」，不许自己重跑 clone/fetch 去补
+   原因写「镜像未就绪（缺 ref / 缺 index）」，不许自己重跑 clone/fetch/read-tree 去补
 1) python -m app.cli status <禅道ID>
    读 product_id / product_name / steps / comments(备注) / attachments[].local_path / 历史提交 / owner_reply
    → 有截图必须用 Read 打开 local_path 真正看图，只看文字就动手是最常见的误判来源
    → 若 attachments 为空且没抓过详情：python -m app.cli detail <禅道ID>
 2) python -m app.cli claim <禅道ID>        # 占住任务，置 fixing，避免被别的子任务重复领
 3) 先读这条 bug 所在代码库自带的 AI 知识体系（§1.6），再动手定位：
-   镜像根的 `AGENTS.md`（「按问题类型选择入口」/「功能反查总纲」）→ 跨层或归属不清先看
-   `.trae/doc/ARCHITECTURE.md` → 定下落点后读 `.trae/agents/<源码相对路径>/AGENT.md`
-   → 命中专项结论再翻 `.trae/doc/<模块>/`；流程按 `.trae/skills/` 走，不许绕过知识体系全库散搜
-   然后在镜像里为这条 bug 开本地分支：
-   git -C <镜像路径> checkout -b bugfix/zentao-<禅道ID> refs/remotes/origin/trunk
+   镜像根 `CLAUDE.md`（常驻层：硬门禁 + 触发指针）→ 命中哪条就读 `<LOCAL_KNOWLEDGE_ROOT>` 下哪个
+   `registry/` / `doc/` / `agents/` / `playbooks/`（实测镜像里 `.trae` 已是指向知识根的符号链接，
+   从镜像内走这条路即可，别绕到镜像外面）→ 常驻层没覆盖该域时再读仓库正式的 `AGENTS.md`
+   → 定下落点后读 `.trae/agents/<源码相对路径>/AGENT.md`，流程按 `.trae/skills/` 走，
+   不许绕过知识体系全库散搜；跨文件检索与遍历也按该库硬门禁走 SSH（Windows 映射盘上本机 grep/find 会卡死）
+   然后在镜像里为这条 bug 开本地分支（SSH 侧）：
+   ssh <SSH用户>@<SSH主机> "cd <镜像路径> && git -c core.ignorecase=false checkout -b bugfix/zentao-<禅道ID> refs/remotes/origin/trunk"
    只改与这条 bug 直接相关的文件，且路径必须属于这条 bug 的产品仓库（闸门 G3）
+   改文件前先用 `git -c core.ignorecase=false ls-files <那个路径>` 确认大小写拼名 —— 本库有 109 组
+   只差大小写的同名对偶，Windows 侧两个拼名读到的是同一个文件，只有 Linux 侧才是真身份
 4) 编译 / 测试：用该库规定的构建方式（本系统 `repos` 里的 build_command / test_command 可作参考）
    本工程只能在 SSH 编译服务器上实测；连续 2 次不过 → 直接走第 7 步 block，写清失败现象，不要硬试
 5) 多语言词条（改了 .po/.mo 才做，G12；镜像分支里不留词条文件）
@@ -310,11 +351,15 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
    python -m app.cli i18n-commit <禅道ID> --files <同一批文件> --message "<一句话说明>"
    → 输出里的 r<号> 就是词条的真实修订号，稍后写进分析结论的 change_desc / evidence
 6) 提交判定（§2 的 G1–G12）
-   - 全过：只在镜像里做一次本地提交，并记下短哈希
-     本次若得出可复用、且已被代码或配置验证的结论 → 先追加进
-     `.trae/agents/<改动目录>/AGENT.md`（§1.6 的知识回写），跟代码文件一起 add、同一次审查
-     git -C <镜像路径> add <改的文件> ; git -C <镜像路径> commit -m "fix #<禅道ID> <一句话根因>"
-     git -C <镜像路径> rev-parse --short HEAD
+   - 全过：只在镜像里做一次本地提交（SSH 侧，并记下短哈希）
+     本次若得出可复用、且已被代码或配置验证的结论 → 追加进
+     `.trae/agents/<改动目录>/AGENT.md`（§1.6 的知识回写）；它是知识根那个独立仓的内容，
+     **只追加文件、不 add 不 commit**，也不要写进本条 bug 的 `--files`，改为在 analysis 的
+     evidence 里点名「回写了哪个知识文件、写了什么」，由主人自己收口
+     ssh <SSH用户>@<SSH主机> "cd <镜像路径> && git -c core.ignorecase=false add <改的文件> && git -c core.ignorecase=false -c user.name=<主人指定> -c user.email=<主人指定> commit -m 'fix #<禅道ID> <一句话根因>'"
+     ssh <SSH用户>@<SSH主机> "cd <镜像路径> && git -c core.ignorecase=false rev-parse --short HEAD"
+     只 add 你改过的那几个文件；`git add -A` / `add .` 禁止 —— 会把 §1.5 那批结构性噪音
+     （整棵 `.trae/**`、`openvpn-2.4.8/INSTALL`、Windows 检出留下的 CRLF `M`）一起卷进提交
    - 禁止：git svn dcommit / git push / svn ci（G11，进正式库只由主人做；词条已由 i18n-commit 单独提过）
    - 任一条不过或需要业务决策：不提交，仍要写分析，跳到第 7 步的 block 分支
 7) 把分析结论写成 JSON 文件（字段规范见 §2.2，gates 必须逐条给结论，含 G11/G12），然后回本系统登记
@@ -338,13 +383,14 @@ resolve/close 禅道 bug；改无关文件；把 .env 内容写进任何输出�
 # 1) 看这轮结果与待办
 python -m app.cli report
 
-# 2) 逐条读 AI 的分析结论 + files + summary + verify，并审它本地的提交：
+# 2) 逐条读 AI 的分析结论 + files + summary + verify，并审它本地的提交
+#    （审改动也在 SSH 侧看：Windows 侧的 git 会把大小写对偶文件混成一个，diff 不可信）
 python -m app.cli status <禅道ID>       # 输出里的 analysis 就是 AI 写的分析（gates_parsed 是闸门逐条）
-git -C <镜像目录> show <短哈希>          # 真实改动长什么样，这里看
-git -C <镜像目录> diff refs/remotes/origin/trunk..<分支名>   # 整条分支相对 trunk 的全部改动
+ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git -c core.ignorecase=false show <短哈希>"
+ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git -c core.ignorecase=false diff --ignore-cr-at-eol refs/remotes/origin/trunk..<分支名>"
 
 # 3) 你判定可以进正式库，就自己做回灌（这一步执行器绝不代做），拿到真实 r 号后回填：
-git svn dcommit          # 在镜像目录里执行；或出 patch 打到正式工作副本再 svn ci
+git svn dcommit          # 在有 git-svn 的那一侧执行；或出 patch 打到正式工作副本再 svn ci
 python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.c --no-svn --revision r<真实号>
 ```
 
@@ -378,6 +424,9 @@ python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.
 用 §1.5 的 git 镜像时这条约束还要往外扩一层：镜像的 `.git` 跨 Samba 共享时 git 的文件锁不可靠，
 **Windows 侧与编译服务器侧绝不能同时操作同一个镜像**。所以：动镜像前先确认没有另一侧在跑
 `git` / `git svn fetch`。
+
+现在这条已经收成一句更简单的规定：**Windows 侧完全不跑 git**（§1.5），所以「两侧同时动镜像」
+只剩「主人在 Windows 侧手抖敲了 git」这一种来源；执行器侧永远只有 SSH 一个写入方。
 
 多语言通道再加一层：`svn_working_copy`（正式 SVN 工作副本）是**第三份共享目录**，
 串行单位从「镜像」扩到「镜像 + 正式副本」—— 同一产品的两条 bug 不许并行提词条
@@ -442,9 +491,13 @@ Web /repos    各产品用哪个仓库、镜像在哪、正式 SVN 工作副本�
 | `i18n-up` / `i18n-commit` 报冲突 | 不许硬解（尤其 `.mo` 是二进制）：`block` 写「多语言冲突待人工处理」，把冲突文件名写进 `--question`，继续下一条 |
 | 报「未配置正式 SVN 工作副本」 | 该产品的 `svn_working_copy` 是空的：`bind-repo <产品ID> "<SVN仓库地址>" --svn-working-copy <正式SVN工作副本>` 补上；没补之前词条按老规矩留在镜像里，`block` 说明 |
 | 镜像 `refs/remotes/origin/trunk` 不存在或为空（clone/fetch 未完成） | 执行器**不许改码**，也不许转去动正式工作副本；`block` 写明「镜像未就绪」，等主人把 `git svn clone/fetch` 跑完 |
-| clone 末尾报 `Filename too long` + `read-tree -m -u -v HEAD HEAD: command returned error: 128` | **不用重拉**：对象、基线 commit、`.git/svn/…/.rev_map` 都已写好，只是 `.git/index` 没落盘。主人执行：`git -C <镜像目录> config core.longpaths true` → `git -C <镜像目录> read-tree HEAD` → `git -C <镜像目录> checkout -- <报错的那个目录>` → `git status` 干净即就绪。执行器遇到这种情况一律 `block` 写「镜像缺 index」，别自己动 |
-| 本地 git 分支攒了一堆 commit 没进正式库 | 正常状态（G11 设计如此）。由主人 `git -C <镜像> diff origin/trunk..<分支>` 审，通过后自行 `git svn dcommit` 或出 patch 打到正式副本，再回填真实修订号 |
-| 工作树/分支基线莫名变化，或 `git status` 里冒出**别的产品/别的禅道 ID** 的文件 | 两个产品共用了同一份镜像却被并行处理（违反 §5）：立刻停掉其中一条队列，`git -C <镜像> status` 核对，被串味的分支 `git reset --hard <基线>` 重做；要让它们真并行只能给其中一个另开一份镜像 |
+| 另一条产品线（2.3 那份镜像）缺 index | 同上，但它挂在**另一台服务器**的共享目录上，那台目前不认这里的 key（`Permission denied (publickey)`）→ 主人要么在那台上用密码登录执行同一套 `read-tree` + 补文件，要么把执行侧的公钥装上去；在此之前该产品的 bug 全部 `block`「镜像未就绪（缺 index）」，不许转去动正式副本 |
+| clone 末尾报 `Filename too long` + `read-tree -m -u -v HEAD HEAD: command returned error: 128` | **不用重拉**：对象、基线 commit、`.git/svn/…/.rev_map` 都已写好，只是 `.git/index` 没落盘。**必须在 SSH（Linux）侧修** —— 本库有 109 组只差大小写的路径，Windows 侧的 `ignorecase` 修不出完整工作树。主人执行：`ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git read-tree HEAD"` 建 index，再 `git -c core.ignorecase=false ls-files -z -d` 列出盘上缺的文件、`grep -zv '^\.trae/'` 滤掉符号链接那棵，`git -c core.ignorecase=false checkout --pathspec-from-file=<清单> --pathspec-file-nul` 补齐（实测 3.0 缺 129 条、补回 128 条，剩下 `.trae/doc/vpp-23.02/VPP_CORE_SHOW_LOG_AND_ERROR.md` 属符号链接噪音）。清单务必排掉 `.trae/` —— 那会写穿符号链接覆盖主人知识库。执行器遇到这种情况一律 `block` 写「镜像缺 index」，别自己动 |
+| 本地 git 分支攒了一堆 commit 没进正式库 | 正常状态（G11 设计如此）。由主人在 SSH 侧 `git -c core.ignorecase=false diff refs/remotes/origin/trunk..<分支>` 审，通过后自行 `git svn dcommit` 或出 patch 打到正式副本，再回填真实修订号 |
+| SSH 侧 `git status` 一跑冒出几十条 `M`，diff 是整文件重写 | Windows 侧检出留下的 CRLF（HEAD 里是 LF），本库实测 53 条（php / openvpn / products 那几棵第三方树居多）。不是改动，别去「修复」也别 `add -A`；看真实差异用 `git -c core.ignorecase=false diff --ignore-cr-at-eol`，`git add` 单文件时 git 会自动归一回 LF，提交内容不受影响。剩约 40 条是 `$Id$` 关键字形态差异，`--ignore-cr-at-eol` 消不掉，改到这类文件时在分析里点明 |
+| `git status` 里整棵 `.trae/**` 是 ` D`、`openvpn-2.4.8/INSTALL` 是 ` D` | 结构性噪音（`.trae` 是指向主人知识库根的符号链接 + 仓库里文件与盘上目录同名），**不是这次 bug 造成的**：不许 `checkout` 它们（会写穿符号链接覆盖知识库）、不许写进 `--files`、不许为此 `block` |
+| 在 Windows 侧改了 `xt_dscp.c`，结果 `xt_DSCP.c` 变了 / `git status` 说另一半被删 | Windows 的 `ignorecase` 把大小写对偶混成一个（实测两个拼名 md5 相同）。立刻 `git -c core.ignorecase=false checkout -- <被误改的那个>` 回退，改到 SSH 侧重做；这类事故只有 Linux 侧能看出来 |
+| 工作树/分支基线莫名变化，或 `git status` 里冒出**别的产品/别的禅道 ID** 的文件 | 两个产品共用了同一份镜像却被并行处理（违反 §5）：立刻停掉其中一条队列，在 SSH 侧 `git -c core.ignorecase=false status` 核对，被串味的分支 `git reset --hard <基线>` 重做；要让它们真并行只能给其中一个另开一份镜像 |
 | 某条被 AI 反复处理不满意 | `/review` 填原因「打回」→ `rejected`，自动回队列且优先级提升 |
 | 某条想先搁置 | 让它 `need_solution`，或直接在库里改状态，它就不在队列里 |
 | PENDING 一直没人提交 | 它已在 `await_review`，`report` 与 `/review` 都能看到；不提交就不会变 `merged` |
@@ -456,7 +509,8 @@ Web /repos    各产品用哪个仓库、镜像在哪、正式 SVN 工作副本�
 ## 9. 一次完整实操（§1.5 本地 git 草稿方式）
 
 ```
-# 你（一次性，且必须在有 git-svn 的那一侧跑 —— 编译服务器上通常没有 git-svn）
+# 你（一次性，且必须在有 git-svn 的那一侧跑 —— 编译服务器上通常没有 git-svn；
+#     而且只能在 Linux 侧 clone：Windows 侧的 ignorecase + MAX_PATH 会让检出天生不全）
 git svn clone --trunk=. --no-metadata <SVN仓库地址> <镜像目录>
 git -C <镜像目录> rev-parse --verify refs/remotes/origin/trunk     # 有输出才算就绪
 python -m app.cli bind-repo <产品ID> "<SVN仓库地址>" --name "<产品名>" --working-copy <镜像目录> --svn-working-copy <正式SVN工作副本> --build "<编译命令>" --test "<测试命令>"
@@ -468,11 +522,13 @@ python -m app.cli repos                       # 确认该产品已 bound、worki
 sync --details -1 → tasks → 每条一个子任务
    （验镜像就绪 → status → claim → 在镜像开 bugfix/zentao-<ID> → 改 → SSH 编译测试
      → 改了词条就 i18n-up → 改词条 → i18n-commit（单独进 SVN，拿 r<号>）
-     → 闸门 G1–G12 → git commit（只本地）→ commit --no-svn --revision git:<哈希> --analysis-file a.json）
+     → 闸门 G1–G12 → git commit（只本地，SSH 侧、只 add 自己改的文件）
+     → commit --no-svn --revision git:<哈希> --analysis-file a.json）
    → 下一条 → report
+   注：所有 git 子命令都长这样 —— ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git -c core.ignorecase=false …"
 
 # 你（收尾）
-/need 答复 → /review 逐条看分析与闸门 → git -C <镜像目录> log/diff 审改动
+/need 答复 → /review 逐条看分析与闸门 → 同样在 SSH 侧 git -c core.ignorecase=false log/diff 审改动
    → 通过后自己执行 git svn dcommit（或出 patch 打到正式副本再 svn ci）→ 拿到真实 r 号后回填：
 python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.c --no-svn --revision r<真实号>
    → 是否 merge 到 trunk 由你决定 → merged 卡片点「标记已结案」

@@ -546,7 +546,19 @@ def _scope_block(group: dict[str, Any], base_label: str) -> str:
         lines.append("这些产品都还没有绑定代码库（会落到上面的全局目录）：本轮一律不许落码，"
                      "逐条 block 写明「产品未绑定代码库」，等主人 bind-repo 之后再接手。")
     else:
-        lines.append("开工前先验镜像就绪；不就绪就按 §1.5 直接 block，不改码，也不许转去动正式 SVN 工作副本。")
+        lines.append("开工前先验镜像就绪（§1.5 的三条判据全部在 SSH 侧跑）；"
+                     "不就绪就直接 block，不改码，也不许转去动正式 SVN 工作副本。")
+        lines.append("这个目录两侧是同一条数据：Windows 映射盘只用来读代码，**git 一律走 SSH 侧**，"
+                     "命令形态 `ssh <SSH用户>@<SSH主机> \"cd <镜像> && git -c core.ignorecase=false …\"`；"
+                     "主机/用户/Linux 侧路径读该库镜像根的 CLAUDE.local.yaml（ssh.* 与 path_aliases）。"
+                     "Windows 侧的 ignorecase 会把只差大小写的同名文件混成一个（本库实测 109 组），"
+                     "在它里面改 A 会落到 B 上。")
+        lines.append("只 add 自己改过的那几个文件，禁止 git add -A / add .；下列是结构性噪音、不是本次改动，"
+                     "不许 checkout 复原、不许写进 --files、也不许为此 block（3.0 实测共 92 条）："
+                     "整棵 .trae/**（镜像里它是指向主人知识库根的符号链接，checkout 会写穿覆盖知识库）、"
+                     "openvpn-2.4.8/INSTALL（仓库里是文件、盘上是同名目录）、"
+                     "约 53 条 M（Windows 检出的 CRLF 约 13 条 + $Id$ 关键字形态约 40 条，"
+                     "看差异用 --ignore-cr-at-eol）、未跟踪的 CLAUDE.md / CLAUDE.local.yaml / .trae。")
     no_i18n = [str(p["product_id"]) for p in group["products"]
                if p["source"] == "product" and not p.get("i18n_wc")]
     if no_i18n:
@@ -629,10 +641,13 @@ def _dispatch_checklist(queues: list[dict[str, Any]]) -> list[dict[str, str]]:
             add("ok", f"队列 #{group['no']}：产品 {group['ids']} 独占 {group['working_copy']}，"
                       f"可以和其他队列并行。")
 
-    add("info", "每条队列开跑前验一次镜像就绪（三条都要有输出；最后一条失败 = ref 在但 index/工作树没落盘）：",
-        "git -C <镜像目录> rev-parse --verify refs/remotes/origin/trunk ; "
-        "git -C <镜像目录> rev-parse --verify HEAD ; "
-        "git -C <镜像目录> ls-files --error-unmatch AGENTS.md")
+    add("info", "每条队列开跑前验一次镜像就绪（三条都要有输出；最后一条失败 = ref 在但 index/工作树没落盘）。"
+                "全部在 SSH 侧跑 —— Windows 侧那份只读代码不跑 git，主机与路径见该库镜像根的 CLAUDE.local.yaml：",
+        'ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git -c core.ignorecase=false rev-parse --verify refs/remotes/origin/trunk" ; '
+        'ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git -c core.ignorecase=false rev-parse --verify HEAD" ; '
+        'ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git -c core.ignorecase=false ls-files --error-unmatch AGENTS.md"')
+    add("info", "index 缺失只在 SSH（Linux）侧修：Windows 侧 ignorecase 遇上 109 组只差大小写的路径修不出完整工作树；"
+                "清单里排掉 .trae/，否则会写穿符号链接覆盖主人知识库。")
     if settings.require_analysis:
         add("ok", "REQUIRE_ANALYSIS=true：没写分析结论的 commit 会被命令直接拒掉。")
     else:
