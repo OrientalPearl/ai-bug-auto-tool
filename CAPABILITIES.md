@@ -15,6 +15,7 @@
 | 分析结论落库 | 每条 bug 收尾必须写回结构化分析（现象/根因/定位依据/链路/改动/影响面/验证/未验证/回退/结论 + 闸门逐条），`REQUIRE_ANALYSIS` 让无分析的 commit 直接失败 | `analyze` / `commit --analysis-file` / `/review` |
 | 任务编排 | SQLite 队列 + 7 态状态机；优先级 = 已答复 > 已打回 > 待处理，再 pri 升序 / severity 降序 | `tasks` / `claim` / 看板 |
 | 无人值守连跑 | 一条 bug 跑完自动取下一条、卡点回填后不阻塞、断线可续跑；下达「提交闸门 G1–G12」清单 | `AUTO_LOOP.md` |
+| 代码库知识体系优先 | 目标库把 `AGENTS.md` + `.trae/`（`agents/` 目录级知识、`doc/ARCHITECTURE.md`、`skills/` 流程）提交在 SVN 里，随 git-svn 镜像一起落下来；执行器定位前必须按其入口下钻，得出可复用结论时按同规则追加回目录级 `AGENT.md` | `AUTO_LOOP.md` §1.6 |
 | 一键下达 | Web 页现场从 `AUTO_LOOP.md` 抽取提示词（永不与规则分叉）+ 开跑前检查清单 + 按落码目录归组的串行队列；可勾选产品生成已填好产品 ID / 目录 / 串行要求的下达语，每段一个复制按钮 | `/dispatch` |
 | 多代码库 | 一个禅道产品 = 一个 SVN 仓库；仓库归属用于闸门判定与审查展示，工作副本默认按产品独立（共用同一镜像的产品必须并入同一串行队列） | `repos` / `bind-repo` / `/repos` |
 | 多语言直连提交（G12） | 词条文件（`I18N_FILE_PATTERNS` 白名单）不草稿化、不排队：改前系统代跑 `svn update`，改完单独 `svn ci` 进正式库并登记真实 r 号；夹带非白名单文件直接拒绝 | `i18n-up` / `i18n-commit` |

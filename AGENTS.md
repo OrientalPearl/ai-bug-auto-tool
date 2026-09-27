@@ -100,6 +100,27 @@ python -m app.cli doctor                   # 禅道通道分步诊断
 - 绑定关系要落进本系统（闸门 G3 的判据）：
   `python -m app.cli bind-repo <产品ID> <SVN仓库地址> --name "<产品名>" --working-copy <镜像目录>`
 
+## 代码库自带的 AI 知识体系（定位代码前先读它）
+
+这套体系**存在版本库里**，镜像拉下来就有，不需要另外挂载（`AUTO_LOOP.md` §1.6 有逐项实测清单）：
+
+- 入口：镜像根 `AGENTS.md`（全局规则 + 「按问题类型选择入口」 + 「功能反查总纲」）、
+  `.trae/agents/<源码相对路径>/AGENT.md`（目录级：入口 / 文件 / 覆盖 / 坑点）、
+  `.trae/doc/ARCHITECTURE.md`（跨层架构；3.0 有，2.3 没有，缺了就跳过）、`.trae/skills/`
+  （`bug-debug-flow` / `code-review-cn` / `feature-implementer` 流程）。
+- 定位顺序是**强制**的：`AGENTS.md` 选入口 → 跨层或归属不清看 `ARCHITECTURE.md` → 定下落点后读该目录的
+  `AGENT.md` → 再按稳定 token 去 `grep`/`Read`。**不许绕过知识体系全库散搜**，也不许只看目录名猜模块。
+- 优先级：代码怎么写、往哪个目录改、命名与分层规范 —— 以代码库内这套为准；本文件只管任务闭环、
+  闸门与登记。两者冲突按前者，**唯一不可被覆盖的是 G11**（远端写入只有主人能做）。
+- 知识回写：本次得出**可复用且已被代码或配置验证**的结论时，追加到最近的
+  `.trae/agents/<源码相对路径>/AGENT.md`（没有就按该库规则新建），顺序固定
+  `入口 -> 文件 -> 覆盖 -> 坑点`，并把这个文件一起 `git add` / 写进 `commit --files`，跟代码同分支同审查。
+  禁止：写猜测、写一次性排查过程、新建散落的 `.AGENT` 文件、随手改根 `AGENTS.md`（只有跨目录共性才改）。
+- 仓库之外的那套工作台（`CLAUDE.md`、`playbooks`、`registry`、`scanners`、`staging` 所在的
+  `.trae_local_*` 目录）**不在版本库里**：不去外面找它，不在那个 git 仓里改任何东西。
+- `.secrets.env` 在两条产品线的仓库根目录里（已进 SVN，镜像里也会有）：**不许打开、引用、复制、提交**，
+  也不许把它的内容写进分析结论、`--files` 或禅道评论。
+
 ## 单个 bug 处理流程
 
 1. **先抓详情**：`python -m app.cli detail <禅道ID>`，把禅道描述里的截图、备注（操作记录）、附件下载到本地
@@ -109,7 +130,9 @@ python -m app.cli doctor                   # 禅道通道分步诊断
 4. 确认这条 bug 属于哪个产品、哪份代码、镜像工作副本在哪：`python -m app.cli repos`；
    **镜像未就绪（`refs/remotes/origin/trunk` 不存在）时不许开工**，直接 `block` 写明「镜像未就绪」
 5. 在镜像里为这条 bug 开本地分支：`git -C <镜像> checkout -b bugfix/zentao-<禅道ID> refs/remotes/origin/trunk`；
-   然后**先读该库自己的知识入口**（它的 `CLAUDE.md` / 首跳规程）再定位修改点，只改与这条 bug 直接相关的文件
+   然后**先读该库自带的知识体系**（镜像根 `AGENTS.md` 选入口 → 跨层看 `.trae/doc/ARCHITECTURE.md` →
+   落点目录的 `.trae/agents/<相对路径>/AGENT.md` → 流程按 `.trae/skills/`），再定位修改点，
+   只改与这条 bug 直接相关的文件
 6. 如果能高置信度确认修改点（空指针、参数错误、配置缺失、明显逻辑错误），直接修改
 7. 运行该库规定的编译 / 测试（可参考 `repos` 里的 `build_command` / `test_command`；本工程必须走 SSH 编译服务器），
    连续 2 次不过就转需方案
@@ -121,6 +144,8 @@ python -m app.cli doctor                   # 禅道通道分步诊断
    构建通过、状态矩阵自审、文案与 i18n 同步、目标是 bugfix 分支非 trunk、message 规范无敏感串、
    未验证路径已标注、所需授权已取得、**远端写入留给主人**、**多语言词条走直连通道**）
 10. 闸门全过 → **只在镜像里 `git commit`**（本地），取 `git rev-parse --short HEAD` 当登记的修订号；
+    本次得出可复用且已验证的结论时，先把它追加进最近的 `.trae/agents/<相对路径>/AGENT.md`
+    （顺序 `入口 -> 文件 -> 覆盖 -> 坑点`），与该 bug 的代码文件一起 `git add`，同分支同审查
     任一条不过 → 不提交，走 `block` 说明卡在哪。**绝不 `git svn dcommit` / `git push` / `svn ci`**
     （G12 的 `i18n-commit` 是唯一被系统代跑 svn 的入口，且只能提白名单词条文件）
 11. **写分析结论**（这是 bug 完成的必交付物，`REQUIRE_ANALYSIS=true` 时没分析 commit 会被直接拒绝）：
@@ -209,9 +234,15 @@ python -m app.cli block <禅道ID> --question "..." --options "..." --advice "..
 18. 禁止把 `git:<哈希>` 与 `r<号>` 混为一谈或在回报里声称已进正式库：`git:<哈希>` 只代表本地草稿
 19. 禁止把多语言词条攒在镜像分支里等审查/回灌：词条必须「改前 `i18n-up`、改完立刻 `i18n-commit`」，
     攒着必然与他人冲突，而这条通道本来就是为此开的
-20. 禁止用 `i18n-commit` 提交任何非白名单文件（代码、配置、脚本）：命令会直接拒绝，
+20. 禁止绕过代码库自带的知识体系（镜像根 `AGENTS.md` + `.trae/agents|doc|skills`）直接全库散搜定位；
+    也禁止去仓库外的 `.trae_local_*` 工作台里找规则或改东西（它不在版本库里，不进镜像）
+21. 禁止打开、引用、复制或提交 `.secrets.env`（两条产品线的仓库根都有，已进 SVN，镜像里也会有）；
+    同禁把 `.env` 的账号密码写进代码、日志、提交说明、分析结论或禅道评论
+22. 禁止新建散落的 `.AGENT` 文件（该库明令禁止），禁止随手改代码库根 `AGENTS.md`：
+    只有跨目录共性才改，且要在分析结论里写清改了什么、凭什么
+23. 禁止用 `i18n-commit` 提交任何非白名单文件（代码、配置、脚本）：命令会直接拒绝，
     也不许为了过校验去改 `.env` 的 `I18N_FILE_PATTERNS`
-21. 禁止把 `i18n-commit` 登记的 `r<号>` 当成「这条 bug 已完成」：它只是词条留痕，
+24. 禁止把 `i18n-commit` 登记的 `r<号>` 当成「这条 bug 已完成」：它只是词条留痕，
     bug 状态与代码草稿仍要走 §「单个 bug 处理流程」的第 10~12 步
 
 ## 停止条件

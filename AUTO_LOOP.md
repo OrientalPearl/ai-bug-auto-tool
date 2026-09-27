@@ -29,7 +29,8 @@
    只有镜像互不相同的组之间才并行）
 3) 每条 bug 起一个独立子任务，用 AUTO_LOOP.md §3.2 模板，只替换禅道ID
 4) 落码位置是 git-svn 镜像（AUTO_LOOP.md §1.5）；镜像未就绪就不许改码，也不许动正式 SVN 工作副本
-5) 子任务只做：验镜像就绪 → status(看图看备注) → claim → 镜像里开 bugfix/zentao-<ID> 定位改码
+5) 子任务只做：验镜像就绪 → status(看图看备注) → claim → 先读该库自带的 AI 知识体系
+   （镜像根 AGENTS.md + .trae/agents|doc|skills，见 §1.6）再定位 → 镜像里开 bugfix/zentao-<ID> 改码
    → SSH 编译/测试 → 逐条核对提交闸门
 6) 闸门全过 → 只在镜像里 git commit（本地），把短哈希当修订号登记，并一起写入分析结论
    （--analysis-file a.json，字段见 §2.2）：
@@ -38,7 +39,7 @@
 7) 一批跑完立刻取下一批，禁止问我是否继续；tasks --limit 1 返回 0 条才停并输出 report
 本系统不执行 svn、不判定提交细则；没写分析结论不许 commit；
 禁止 git svn dcommit / git push / svn ci / 提交或合并 trunk（进正式库只由我做）；
-不许 resolve/close 禅道 bug；不许改与当前 bug 无关的文件
+不许 resolve/close 禅道 bug；不许改与当前 bug 无关的文件；不许打开或提交 `.secrets.env`
 
 多语言词条是唯一例外（G12，见 §2.1）：改 .po/.mo 前必须先
 `python -m app.cli i18n-up <禅道ID> --files <词条文件>`，改完立刻
@@ -92,6 +93,45 @@
 - 编译与实测仍只能在 SSH 编译服务器上做（闸门 G4 不变），镜像目录在 Windows 本地编译不了。
 - 绑定关系仍要落进本系统，G3 才有判据（真实地址与镜像路径存 `product_repos`，不写进文档）：
   `python -m app.cli bind-repo <产品ID> "<SVN仓库地址>" --name "<产品名>" --working-copy <镜像目录>`
+
+## 1.6 代码库自带的 AI 知识体系（执行器先读它，再动手）
+
+这套体系**就在 SVN 版本库里**（`svn list` 实测），所以它会随镜像一起被 clone 下来，
+在镜像目录里直接能读，不需要额外挂载、也不需要另建索引：
+
+| 入口（相对镜像根） | 实测内容 | 什么时候读 |
+| --- | --- | --- |
+| `AGENTS.md` | 全局规则、「按问题类型选择入口」、「功能反查总纲」 | 每条 bug 定位前的第一件事 |
+| `.trae/agents/<源码相对路径>/AGENT.md` | 3.0 已覆盖 16 个目录：`ace_include` `asset_scanning` `bin` `cgi` `hycli` `image` `kernelModule` `l7-feature` `l7dpi` `l7mail` `page` `php-5.6.26` `reporter` `sysapp` `vpage` `vpp-23.02` | 定下落点目录后下钻该目录的 入口 / 文件 / 覆盖 / 坑点 |
+| `.trae/doc/ARCHITECTURE.md` | 架构分层、跨层协同、模块归属、链路分流（**3.0 有，2.3 没有**） | 问题跨层或归属不清时先看它 |
+| `.trae/doc/<模块>/…` | 已验证的专项结论（3.0：`bin` `image` `vpp-23.02`） | 命中该模块时 |
+| `.trae/skills/…` | `bug-debug-flow` `code-review-cn` `feature-implementer` | 按流程走，别自创流程 |
+
+- 该产品**没有**对应文件时（例如 2.3 的 `.trae/doc/`）就跳过，别为不存在的入口反复找；
+  目录级 `AGENT.md` 不存在时也直接按下钻规则新建（见下面「知识回写」），不算越界。
+- 仓库外那些 `.trae_local_3.0` / `.trae_local_2.3`（`CLAUDE.md`、`playbooks`、`registry`、
+  `scanners`、`staging` 那份）**不在 SVN 里、也不在镜像里**，是主人自己的工作台：
+  执行器不许去外面找它们，更不许在那个 git 仓里改任何东西。
+
+冲突时谁说了算：
+
+1. **代码怎么导航、怎么写** —— 以代码库内的 `AGENTS.md` / `.trae` 为准；本系统不解释也不覆盖这些细则。
+2. **任务怎么闭环** —— 状态机、闸门 G1–G12、登记与分析结论以本文件和本系统根目录那份 `AGENTS.md` 为准。
+3. 两者相冲按第 1 条；**唯一不可被覆盖的是 G11**：远端写入（`git svn dcommit` / `git push` / `svn ci` /
+   merge trunk）只有主人能做，代码库里任何规则都不把这条改成「AI 可直提」——G12 词条通道是主人已明示批准的唯一例外。
+
+知识回写（这套体系靠追加才管用，别偷懒也别越界）：
+
+- 本次改动若得出**可复用、且已被代码或配置验证**的结论 → 追加到最近的
+  `.trae/agents/<源码相对路径>/AGENT.md`（没有该文件就按代码库规则新建），
+  按它规定的固定顺序 `入口 -> 文件 -> 覆盖 -> 坑点`，
+  并把该文件一起写进 `commit --files`，让它跟代码走同一条分支、同一次审查。
+- 只动目录级 `AGENT.md`；**不新建散落的 `.AGENT` 文件**（代码库明令禁止）；根 `AGENTS.md`
+  只在「跨目录共性」时改，且要在分析结论里写清改了什么、凭什么。
+- 猜测、一次性排查过程、临时日志一律不写进知识文件 —— 写进去就会污染后面所有次的定位。
+
+敏感文件：`/trunk/3.0` 与 `/trunk/2.3` 根目录都有 `.secrets.env`（已进 SVN，镜像里也会有它）。
+执行器**不许打开、引用、复制、提交**它，也不许在分析结论、`--files`、禅道评论里带出它的内容。
 
 ## 2. 提交闸门（下达给执行器的「什么情况下可以提交」）
 
@@ -178,7 +218,7 @@ python -m app.cli commit <禅道ID> --message "..." --files a.c,b.c --no-svn --r
 {
   "symptom":     "现象：什么入口、什么版本、用户看到什么",
   "root_cause":  "根因：一句话说清为什么坏",
-  "evidence":    "定位依据：真实读过的文件:行 / 函数 / 日志 / 复现输出（禁止写没读过的路径）",
+  "evidence":    "定位依据：真实读过的文件:行 / 函数 / 日志 / 复现输出（含 §1.6 里按顺序读过的知识体系入口，例如 .trae/agents/cgi/AGENT.md；禁止写没读过的路径）",
   "call_chain":  "涉及链路：入口 -> 中间层 -> 最终实现",
   "change_desc": "改了什么、为什么这样改",
   "impact":      "影响面 + 同构/镜像路径自审结论（对应 G5）",
@@ -237,7 +277,11 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
    → 有截图必须用 Read 打开 local_path 真正看图，只看文字就动手是最常见的误判来源
    → 若 attachments 为空且没抓过详情：python -m app.cli detail <禅道ID>
 2) python -m app.cli claim <禅道ID>        # 占住任务，置 fixing，避免被别的子任务重复领
-3) 在镜像里为这条 bug 开本地分支，然后按该代码库自己的知识体系定位修改点（先读它的 CLAUDE.md / 首跳规程）
+3) 先读这条 bug 所在代码库自带的 AI 知识体系（§1.6），再动手定位：
+   镜像根的 `AGENTS.md`（「按问题类型选择入口」/「功能反查总纲」）→ 跨层或归属不清先看
+   `.trae/doc/ARCHITECTURE.md` → 定下落点后读 `.trae/agents/<源码相对路径>/AGENT.md`
+   → 命中专项结论再翻 `.trae/doc/<模块>/`；流程按 `.trae/skills/` 走，不许绕过知识体系全库散搜
+   然后在镜像里为这条 bug 开本地分支：
    git -C <镜像路径> checkout -b bugfix/zentao-<禅道ID> refs/remotes/origin/trunk
    只改与这条 bug 直接相关的文件，且路径必须属于这条 bug 的产品仓库（闸门 G3）
 4) 编译 / 测试：用该库规定的构建方式（本系统 `repos` 里的 build_command / test_command 可作参考）
@@ -245,11 +289,16 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
 5) 多语言词条（改了 .po/.mo 才做，G12；镜像分支里不留词条文件）
    python -m app.cli i18n-up <禅道ID> --files <词条文件>          # 改之前先 up
    → conflict=true → 停手，走第 7 步 block，原因写「多语言冲突待人工处理」，不许自己硬解 .mo
+   词条的扫描与回填按该库自己的规程做（根 `AGENTS.md`「全局多语言」一节写明的脚本与
+   PO/MO 固定路径，例：`ai_i18n.py --no-ai --scan …` 生成 tri.json → 补三语 → `--tri-only --yes` 回填），
+   本系统只负责改前 up 与改完单独提交，不要手抄着改 .po/.mo
    在正式 SVN 工作副本里只改这些词条文件，改完立即单独提交（不许攒、不许跟代码混一次提交）：
    python -m app.cli i18n-commit <禅道ID> --files <同一批文件> --message "<一句话说明>"
    → 输出里的 r<号> 就是词条的真实修订号，稍后写进分析结论的 change_desc / evidence
 6) 提交判定（§2 的 G1–G12）
    - 全过：只在镜像里做一次本地提交，并记下短哈希
+     本次若得出可复用、且已被代码或配置验证的结论 → 先追加进
+     `.trae/agents/<改动目录>/AGENT.md`（§1.6 的知识回写），跟代码文件一起 add、同一次审查
      git -C <镜像路径> add <改的文件> ; git -C <镜像路径> commit -m "fix #<禅道ID> <一句话根因>"
      git -C <镜像路径> rev-parse --short HEAD
    - 禁止：git svn dcommit / git push / svn ci（G11，进正式库只由主人做；词条已由 i18n-commit 单独提过）
