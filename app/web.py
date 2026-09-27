@@ -547,6 +547,16 @@ def _scope_block(group: dict[str, Any], base_label: str) -> str:
                      "逐条 block 写明「产品未绑定代码库」，等主人 bind-repo 之后再接手。")
     else:
         lines.append("开工前先验镜像就绪；不就绪就按 §1.5 直接 block，不改码，也不许转去动正式 SVN 工作副本。")
+    no_i18n = [str(p["product_id"]) for p in group["products"]
+               if p["source"] == "product" and not p.get("i18n_wc")]
+    if no_i18n:
+        lines.append(f"产品 {'、'.join(no_i18n)} 没配「正式 SVN 工作副本」（svn_working_copy）→ "
+                     "G12 词条直连通道不可用：本轮不许打开或修改任何 .po/.mo/.pot/.qm 词条文件，"
+                     "需要改词条就 block 写明「未配正式SVN工作副本，词条待主人处理」；"
+                     '补齐：python -m app.cli bind-repo <产品ID> "<SVN仓库地址>" --svn-working-copy <正式SVN工作副本>')
+    elif all(p["source"] == "product" for p in group["products"]):
+        lines.append("词条通道可用：这条 bug 若涉及词条，按 §2.1 走 i18n-up → 该库 AGENTS.md 规定的 "
+                     "ai_i18n.py 规程 → i18n-commit 单独立即提交；不跟代码混提交，也不许攒进镜像分支。")
     if group["mixed"]:
         lines.append("本组跨了多个目录：同一目录内部严格串行，不同目录之间才可以并行 —— "
                      "更稳妥的做法是每个目录各下达一条。")
@@ -619,8 +629,10 @@ def _dispatch_checklist(queues: list[dict[str, Any]]) -> list[dict[str, str]]:
             add("ok", f"队列 #{group['no']}：产品 {group['ids']} 独占 {group['working_copy']}，"
                       f"可以和其他队列并行。")
 
-    add("info", "每条队列开跑前验一次镜像就绪（无输出 = 未就绪，执行器必须 block 而不是改码）：",
-        "git -C <镜像目录> rev-parse --verify refs/remotes/origin/trunk")
+    add("info", "每条队列开跑前验一次镜像就绪（三条都要有输出；最后一条失败 = ref 在但 index/工作树没落盘）：",
+        "git -C <镜像目录> rev-parse --verify refs/remotes/origin/trunk ; "
+        "git -C <镜像目录> rev-parse --verify HEAD ; "
+        "git -C <镜像目录> ls-files --error-unmatch AGENTS.md")
     if settings.require_analysis:
         add("ok", "REQUIRE_ANALYSIS=true：没写分析结论的 commit 会被命令直接拒掉。")
     else:

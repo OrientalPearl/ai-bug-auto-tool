@@ -89,8 +89,10 @@ python -m app.cli doctor                   # 禅道通道分步诊断
   `svn ci`、`svn copy`、在正式工作副本里改码。
   例外只有一处：**词条文件**只能在 `svn_working_copy`（正式 SVN 工作副本）里改，
   且只能用 `i18n-up` / `i18n-commit` 两条命令让系统代跑 `svn update/ci`（闸门 G12）。
-- 开工前必须验就绪：`git -C <镜像> rev-parse --verify refs/remotes/origin/trunk` 失败或 ref 为空
-  → 不改码、不转去动正式副本 → `block` 写明「镜像未就绪」，继续下一条。
+- 开工前必须验就绪（三条都要过，见 `AUTO_LOOP.md` §1.5）：
+  `git -C <镜像> rev-parse --verify refs/remotes/origin/trunk`、`git -C <镜像> rev-parse --verify HEAD`、
+  `git -C <镜像> ls-files --error-unmatch AGENTS.md`；任一条失败（含 ref 在但 index 缺失的半途中止）
+  → 不改码、不转去动正式副本 → `block` 写明「镜像未就绪（缺 ref / 缺 index）」，继续下一条。
 - 登记形态区分两种，审查页靠它辨认改动到哪一步了：
   `--revision git:<7位短哈希>` = 已本地提交、未进正式库；`--revision r<号>` = 主人已提交，回填真实号。
 - 镜像与正式副本是**两份独立目录**，改动不会自动同步；回灌由主人审完 `git diff` 后自己做。

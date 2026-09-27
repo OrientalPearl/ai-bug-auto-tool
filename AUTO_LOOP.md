@@ -90,7 +90,18 @@
 - 两边共用同一个 `.git` 目录（跨 Samba）时**只能有一个操作方**，git 的文件锁在 SMB 上不可靠；
   所以「同一镜像串行」是硬约束，且划分单位是镜像而不是产品 —— 两个产品绑定到同一个镜像时，
   它们必须共用一条串行队列（见 §5）。Windows 侧与编译服务器侧同样不得同时动镜像。
-- 编译与实测仍只能在 SSH 编译服务器上做（闸门 G4 不变），镜像目录在 Windows 本地编译不了。
+- 就绪 = **三条一起满足**，只满足前两条不算就绪（真实踩过：clone 最后一步 `Filename too long`
+  中止，ref 与对象都在，但 `.git/index` 没落盘，执行器一上来 `checkout -b` 就失败）：
+
+  ```
+  git -C <镜像目录> rev-parse --verify refs/remotes/origin/trunk   # ① 基线 ref
+  git -C <镜像目录> rev-parse --verify HEAD                        # ② 基线 commit
+  git -C <镜像目录> ls-files --error-unmatch AGENTS.md             # ③ index + 工作树真的铺好了
+  ```
+
+  ③ 报 `Not a valid object name` 或没有任何输出 = 工作树/index 缺失 → 不许改码，
+  按 §8「checkout 阶段报 Filename too long」那行修复后再开工。
+- 编译与实测仍只能在 SSH 编译服务器上做（镜像目录在 Windows 本地编译不了）。
 - 绑定关系仍要落进本系统，G3 才有判据（真实地址与镜像路径存 `product_repos`，不写进文档）：
   `python -m app.cli bind-repo <产品ID> "<SVN仓库地址>" --name "<产品名>" --working-copy <镜像目录>`
 
@@ -269,9 +280,12 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
 落码位置：镜像仓库 <镜像路径>（见 §1.5）；正式 SVN 工作副本只读，禁止在里面改码
         —— 唯一例外：多语言词条文件按 G12 走 §2.1 的通道，改前先 up、改完立刻单独提交
 
-0) 先验镜像就绪（不就绪就别开工）：
+0) 先验镜像就绪（三条都要过，见 §1.5；不就绪就别开工）：
    git -C <镜像路径> rev-parse --verify refs/remotes/origin/trunk
-   失败或该 ref 为空 = clone/fetch 还没跑完 → 直接跳到第 7 步 block，原因写「镜像未就绪」
+   git -C <镜像路径> rev-parse --verify HEAD
+   git -C <镜像路径> ls-files --error-unmatch AGENTS.md
+   任一条失败 = clone 没跑完或最后检出没落盘 → 直接跳到第 7 步 block，
+   原因写「镜像未就绪（缺 ref / 缺 index）」，不许自己重跑 clone/fetch 去补
 1) python -m app.cli status <禅道ID>
    读 product_id / product_name / steps / comments(备注) / attachments[].local_path / 历史提交 / owner_reply
    → 有截图必须用 Read 打开 local_path 真正看图，只看文字就动手是最常见的误判来源
@@ -428,6 +442,7 @@ Web /repos    各产品用哪个仓库、镜像在哪、正式 SVN 工作副本�
 | `i18n-up` / `i18n-commit` 报冲突 | 不许硬解（尤其 `.mo` 是二进制）：`block` 写「多语言冲突待人工处理」，把冲突文件名写进 `--question`，继续下一条 |
 | 报「未配置正式 SVN 工作副本」 | 该产品的 `svn_working_copy` 是空的：`bind-repo <产品ID> "<SVN仓库地址>" --svn-working-copy <正式SVN工作副本>` 补上；没补之前词条按老规矩留在镜像里，`block` 说明 |
 | 镜像 `refs/remotes/origin/trunk` 不存在或为空（clone/fetch 未完成） | 执行器**不许改码**，也不许转去动正式工作副本；`block` 写明「镜像未就绪」，等主人把 `git svn clone/fetch` 跑完 |
+| clone 末尾报 `Filename too long` + `read-tree -m -u -v HEAD HEAD: command returned error: 128` | **不用重拉**：对象、基线 commit、`.git/svn/…/.rev_map` 都已写好，只是 `.git/index` 没落盘。主人执行：`git -C <镜像目录> config core.longpaths true` → `git -C <镜像目录> read-tree HEAD` → `git -C <镜像目录> checkout -- <报错的那个目录>` → `git status` 干净即就绪。执行器遇到这种情况一律 `block` 写「镜像缺 index」，别自己动 |
 | 本地 git 分支攒了一堆 commit 没进正式库 | 正常状态（G11 设计如此）。由主人 `git -C <镜像> diff origin/trunk..<分支>` 审，通过后自行 `git svn dcommit` 或出 patch 打到正式副本，再回填真实修订号 |
 | 工作树/分支基线莫名变化，或 `git status` 里冒出**别的产品/别的禅道 ID** 的文件 | 两个产品共用了同一份镜像却被并行处理（违反 §5）：立刻停掉其中一条队列，`git -C <镜像> status` 核对，被串味的分支 `git reset --hard <基线>` 重做；要让它们真并行只能给其中一个另开一份镜像 |
 | 某条被 AI 反复处理不满意 | `/review` 填原因「打回」→ `rejected`，自动回队列且优先级提升 |
