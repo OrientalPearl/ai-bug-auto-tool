@@ -84,6 +84,7 @@
 4. **所有 git 动作只在 SSH 侧（Linux）做**，命令形态固定为
    `ssh <SSH主机> "cd <镜像目录> && git -c core.ignorecase=false <子命令>"`；
    Windows 侧那份只是同一份目录的映射视图，**只用来读代码，不许在它里面跑 git**（理由见下面「代价」）。
+   2.3 那台的 git 是 1.7.1，不认 `-c` 也不认 `-C` —— 改用 §1.6 写的 `GIT_CONFIG=` + `--git-dir=` 写法。
 
 为什么这么分：SVN 没有本地提交，`svn ci` 一跑就进正式库；git 有。用镜像当草稿区，就把「AI 已改完」
 和「已进正式库」这两件事拆成了两个独立动作 —— 前者随时可 `git reset` 回退，后者只在人点头后发生。
@@ -147,12 +148,20 @@
   `LOCAL_RUNTIME_ROOT` / `LOCAL_WORKSPACE_ROOT`）与 `ssh.*`。本系统不复制这些值，也不写进本文档。
 - 生成态读数（`staging/`、`metrics/`、`doc/DOC_INDEX.md`）有 `generated_at` + `max_age_days`；
   超过时效一律当「未知」，不许把过期的空清单读成「没有问题」（实测 `DOC_INDEX.md` 30 天时效）。
-- 该产品**没有**对应文件时（例如 2.3 的 `.trae/doc/`）就跳过，别为不存在的入口反复找；
-  目录级 `AGENT.md` 不存在时也直接按下钻规则新建（见下面「知识回写」），不算越界。
-- **两条产品线的知识层不一样**（实测）：3.0 有镜像根 `CLAUDE.md` + `CLAUDE.local.yaml`，且 `.trae` 是指向
-  知识根的符号链接；2.3 的镜像里**没有** `CLAUDE.md` / `CLAUDE.local.yaml`，`.trae` 是实体目录 ——
-  在 2.3 上就只走「仓库正式层」，第 1 跳直接读它的 `AGENTS.md`，别去找不存在的常驻层；
-  2.3 的 SSH 目标与路径也不在 `CLAUDE.local.yaml` 里，向主人要。
+- 该产品**没有**对应文件时就跳过（实测两条线现在都有 `doc/ARCHITECTURE.md` 与 `doc/CAPABILITY_MAP.md`，
+  但覆盖面不同：3.0 知识根 `agents/` 下 25 个目录级 `AGENT.md`、2.3 是 11 个；`registry/` 各 23 个文件），
+  别为不存在的入口反复找；目录级 `AGENT.md` 不存在时也直接按下钻规则新建（见下面「知识回写」），不算越界。
+- **两条产品线的 SSH 侧不是一套环境**（实测）：3.0 那台是 git 2.33.0，支持 `git -c` / `git -C`；
+  2.3 那台是 **git 1.7.1（RHEL6）—— `git -c` 与 `git -C` 都不认**（报 `Unknown option: -c / -C`），
+  所以在那台上要写成 `cd <镜像> && git --git-dir=.git <子命令>`，覆盖配置改用环境变量
+  `GIT_CONFIG=<一个写着 core.ignorecase=false 的文件>`（实测有效）。
+  另外 2.3 那台的 OpenSSH 是 5.3：只认 RSA 密钥，必须带
+  `-i <identity_file> -o IdentitiesOnly=yes -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa`
+  （`identity_file` 也在该库 `CLAUDE.local.yaml` 的 `ssh.*` 里，不在 `.ssh` 目录、不在网络盘上）。
+- 两条线**各有一份常驻层**（2026-09-27 实测：3.0 与 2.3 的镜像根都有 `CLAUDE.md` + `CLAUDE.local.yaml`，
+  `.trae` 都是指向各自知识根的符号链接：`.trae -> ../../.trae_local_3.0` / `../../.trae_local_2.3`）；
+  两族事实**禁止互相套用**（数据面 3.0=VPP、2.3=kernelModule；PHP 扩展面 3.0=5.6.26、2.3=5.5.20），
+  在 2.3 上别拿 3.0 的 registry 结论当依据，反之也一样。
 - 知识库根本体（实测 3.0 是镜像旁边的 `.trae_local_3.0`，**自己是一个独立 git 仓、当前在 `main` 上
   有 100+ 条未提交改动**）由主人维护：执行器只允许**通过镜像内的 `.trae/` 这条路径**读写它，
   不许绕到镜像外面去找那个目录、更不许在那个仓里 `git add/commit/push/checkout`。
@@ -177,6 +186,26 @@
 
 敏感文件：`/trunk/3.0` 与 `/trunk/2.3` 根目录都有 `.secrets.env`（已进 SVN，镜像里也会有它）。
 执行器**不许打开、引用、复制、提交**它，也不许在分析结论、`--files`、禅道评论里带出它的内容。
+
+## 1.7 镜像备份与恢复（主人动作，执行器不碰）
+
+备份单位是**整个 `.git` 目录**，不是工作树：`refs/`（基线与本地草稿分支）、`objects/`（内容）、
+`config`（含 `svn-remote` 映射）和 `.git/svn/…/.rev_map`（SVN 修订号 ↔ git commit 的对照表）全在里面；
+工作树随时可以由 `read-tree` + `checkout` 重建，不必进包（3.0 工作树 23G，`.git` 才 6.9G）。
+
+```
+# 在 SSH 侧、镜像的上一级目录执行（3.0 用 pigz -p 8，2.3 那台只有 gzip）
+tar -cf - <镜像名>/.git | pigz -p 8 > ~/hy-10G-2/mirror-backup/<镜像名>-dotgit-<短哈希>-<日期>.tar.gz
+tar -tzf <那个包> | wc -l          # 能列出来就说明 gzip 完整
+sha256sum <那个包> > <那个包>.sha256
+git --git-dir=<镜像名>/.git fsck   # dangling blob 是镜像的正常现象，不是损坏
+```
+
+恢复：解开 `.git` 放回镜像目录 → `git read-tree HEAD` → 按 §8 那行补 `ls-files -d` 列出的缺失文件
+（清单排掉 `.trae/`）→ 三条判据验收。**只解 `.git` 时工作树是空的，别直接开始改码。**
+
+包放在各台服务器自己的 `~/hy-10G-2/mirror-backup/`（3.0 的包在 3.0 那台，2.3 的包在 2.3 那台），
+不跨机拷贝；换盘或重装前先补一份新的，包名带短哈希，能看出它是哪条基线的备份。
 
 ## 2. 提交闸门（下达给执行器的「什么情况下可以提交」）
 

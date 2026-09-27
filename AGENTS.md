@@ -86,6 +86,11 @@ python -m app.cli doctor                   # 禅道通道分步诊断
 - **git 只在 SSH（Linux）侧跑**：Windows 那个映射盘路径与 SSH 侧路径是同一条数据、同一个 `.git`。
   主机/用户/Linux 侧路径读镜像根 `CLAUDE.local.yaml`（`ssh.*` 与 `path_aliases`），本系统不复制。
   命令形态固定为 `ssh <SSH用户>@<SSH主机> "cd <镜像> && git -c core.ignorecase=false <子命令>"`。
+  **两条线的 SSH 侧不是一套环境**：3.0 那台 git 2.33.0 支持 `-c`/`-C`；2.3 那台是 git 1.7.1（RHEL6），
+  `-c` 与 `-C` 都不认，要写成 `cd <镜像> && git --git-dir=.git <子命令>` 并用
+  `GIT_CONFIG=<写着 core.ignorecase=false 的文件>` 覆盖配置；它的 OpenSSH 是 5.3，只认 RSA 密钥，
+  连接必须带 `-i <identity_file> -o IdentitiesOnly=yes -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa`。
+  两边的主机/用户/路径/密钥路径都读各自镜像根的 `CLAUDE.local.yaml`。
   Windows 侧**不许跑 git**：那份 `.git/config` 是 Windows 侧 git-svn 写的 `ignorecase=true`+`symlinks=false`，
   本库有 109 组只差大小写的路径，Windows 侧两个拼名读到的是同一个文件（实测 md5 相同），
   改 A 会落到 B；另有长路径文件名在 Windows 侧根本创建不了。
@@ -119,10 +124,12 @@ python -m app.cli doctor                   # 禅道通道分步诊断
 
 - **常驻注入层**：镜像根 `CLAUDE.md` —— 该库工作区的 AI 首跳规则（硬门禁 + 「触发条件 → 下层路径」指针）。
   起手顺序固定 `Skill → playbooks/task-precheck-protocol.md → 触发指针`。
-- **按需知识层**：`.trae/`（实测在 3.0 里是**指向主人知识库根的符号链接**）—— `registry/`（症状入口、
+- **按需知识层**：`.trae/`（实测两条线的镜像里它都是**指向主人知识库根的符号链接**：
+  `.trae -> ../../.trae_local_3.0` / `../../.trae_local_2.3`）—— `registry/`（症状入口、
   能力、API、OEM 矩阵）、`doc/`（`DOC_INDEX.md`、`ARCHITECTURE.md`、`CAPABILITY_MAP.md`）、
   `agents/<源码相对路径>/AGENT.md`、`playbooks/`、`skills/`、`scanners/`、`staging/`、`metrics/`。
   按 `CLAUDE.md` 的触发指针**定向 Grep 命中段落再局部 Read**，不整篇通读。
+  两族知识根**各自独立、事实禁止互相套用**（3.0=VPP 数据面 / 2.3=kernelModule 数据面）。
 - **仓库正式层**：镜像根 `AGENTS.md` 与进 SVN 的 `.trae/**`。
 - 定位顺序是**强制**的：`CLAUDE.md` 选入口 → 命中哪条就读知识根下哪个文件 → 跨层或归属不清看
   `ARCHITECTURE.md` → 定下落点后读该目录的 `AGENT.md` → 再按稳定 token 去 `grep`/`Read`。
