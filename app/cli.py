@@ -309,6 +309,91 @@ def cmd_commit(args: argparse.Namespace) -> None:
     })
 
 
+def _i18n_target(args: argparse.Namespace) -> tuple[dict, Any]:
+    """Shared front part of the i18n commands: bug -> repo -> real SVN checkout."""
+    bug = _bug_ref(args.ref)
+    target = svn_client.require_target(bug=bug)
+    return bug, target
+
+
+def cmd_i18n_up(args: argparse.Namespace) -> None:
+    """`svn update` the translation files right before editing them (G12 step 1)."""
+    settings = get_settings()
+    if not settings.i18n_direct_commit:
+        raise SystemExit(json.dumps({
+            "ok": False,
+            "error": "I18N_DIRECT_SVN_COMMIT=false，多语言直连通道已关闭",
+        }, ensure_ascii=False))
+    bug, target = _i18n_target(args)
+    files = [f.strip() for f in (args.files or "").split(",") if f.strip()]
+    try:
+        wc = svn_client.i18n_working_copy(target)
+        rels = svn_client.i18n_relatives(files, wc) if files else []
+        refused = [p for p in rels if not svn_client.is_i18n_path(p)]
+        if refused:
+            raise svn_client.SvnError(
+                "以下文件不在多语言白名单内，不许走直连通道：" + ", ".join(refused))
+        output = svn_client.update(rels, wc=wc)
+    except svn_client.SvnError as exc:
+        raise SystemExit(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)) from None
+    conflicted = svn_client.has_conflict(output)
+    _out({
+        "ok": not conflicted,
+        "action": "i18n-up",
+        "zentao_id": bug["zentao_id"],
+        "working_copy": str(wc),
+        "updated": rels or ["<整个工作副本>"],
+        "conflict": conflicted,
+        "output": output.strip()[:1000],
+        "note": ("存在冲突：先解决冲突再改，改完立刻 i18n-commit" if conflicted
+                 else "可以开始改多语言文件；改完立即 i18n-commit"),
+    })
+
+
+def cmd_i18n_commit(args: argparse.Namespace) -> None:
+    """Commit translation files straight to SVN (AUTO_LOOP.md G12)."""
+    bug, target = _i18n_target(args)
+    files = [f.strip() for f in (args.files or "").split(",") if f.strip()]
+    message = f"fix #{bug['zentao_id']} {args.message or '同步多语言词条'}".strip()
+    try:
+        result = svn_client.i18n_commit(files, message, target=target,
+                                        dry_run=bool(args.dry_run))
+    except svn_client.SvnError as exc:
+        raise SystemExit(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)) from None
+
+    revision = result.get("revision") or ""
+    recorded = None
+    comment = {"ok": False, "detail": "dry-run 未登记"}
+    if revision and not args.dry_run:
+        recorded = db.add_revision(
+            bug["id"], f"r{revision}",
+            branch=args.branch or "i18n-direct",
+            message=message,
+            author=args.author or get_settings().svn_username or "ai",
+            files=result.get("committed_files") or [],
+        )
+        comment = sync.comment_commit(
+            bug["zentao_id"], "i18n 直连提交", f"r{revision}",
+            extra=args.extra or "多语言词条已单独提交 SVN（G12），不涉及代码版本",
+        )
+    _out({
+        "ok": True,
+        "action": "i18n-commit",
+        "zentao_id": bug["zentao_id"],
+        "revision": f"r{revision}" if revision else "",
+        "committed_files": result.get("committed_files") or [],
+        "skipped_unchanged": result.get("skipped_unchanged") or [],
+        "working_copy": result.get("working_copy"),
+        "url": result.get("url"),
+        "patterns": result.get("patterns"),
+        "update_output": result.get("update_output"),
+        "revision_record": recorded,
+        "status": bug["status"],
+        "note": result.get("note") or "多语言已单独提交；代码改动仍走镜像 + 闸门流程",
+        "zentao_comment": comment,
+    })
+
+
 def cmd_block(args: argparse.Namespace) -> None:
     bug = _bug_ref(args.ref)
     payload = _normalized_analysis(args)
@@ -377,6 +462,7 @@ def cmd_repos(_args: argparse.Namespace) -> None:
             "repo_url": target.repo_url or "",
             "effective_source": target.source,
             "working_copy": str(target.working_copy),
+            "svn_working_copy": str(target.svn_working_copy or ""),
             "trunk": target.trunk_url(),
             "branch_root": target.branch_root_url(),
             "build_command": (repo or {}).get("build_command", ""),
@@ -631,6 +717,25 @@ def build_parser() -> argparse.ArgumentParser:
     _add_analysis_args(p)
     p.set_defaults(func=cmd_commit)
 
+    p = sub.add_parser("i18n-up",
+                       help="改多语言文件前先 svn update（G12：修改前必须先 up）")
+    p.add_argument("ref")
+    p.add_argument("--files", help="逗号分隔的多语言文件（相对正式工作副本）；留空=整个副本")
+    p.set_defaults(func=cmd_i18n_up)
+
+    p = sub.add_parser("i18n-commit",
+                       help="多语言文件单独直连提交 SVN（G12：改完立即提交，不进审查流）")
+    p.add_argument("ref")
+    p.add_argument("--files", required=True,
+                   help="逗号分隔的多语言文件（相对正式工作副本），必须全部命中 I18N_FILE_PATTERNS")
+    p.add_argument("--message", help="提交说明，最终为 fix #<ID> <说明>")
+    p.add_argument("--author")
+    p.add_argument("--branch", default="", help="登记用的分支标记，默认 i18n-direct")
+    p.add_argument("--extra", help="附加到禅道评论的补充说明")
+    p.add_argument("--dry-run", action="store_true",
+                   help="只做白名单/改动校验与 svn update，不提交")
+    p.set_defaults(func=cmd_i18n_commit)
+
     p = sub.add_parser("block", help="登记需方案并置为 need_solution，同时回写禅道评论")
     p.add_argument("ref")
     p.add_argument("--question", required=True)
@@ -670,7 +775,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--trunk-path", default=None, help="留空则沿用已存值（新绑定为 /trunk）")
     p.add_argument("--branch-root", default=None, help="留空则沿用已存值（新绑定为 /branches）")
     p.add_argument("--working-copy", default=None,
-                   help="留空则沿用已存值；新绑定自动用 svn_workspace/p<产品ID>-<仓库哈希>")
+                   help="执行器改码目录（git-svn 镜像）；留空则沿用已存值，"
+                        "新绑定自动用 svn_workspace/p<产品ID>-<仓库哈希>")
+    p.add_argument("--svn-working-copy", default=None,
+                   help="正式 SVN 工作副本（你日常开发那一份），多语言直连通道专用；"
+                        "留空则沿用已存值")
     p.add_argument("--branch-prefix", default=None, help="留空则沿用已存值")
     p.add_argument("--build", default=None, help="该库的编译命令，供 AI 修复后执行")
     p.add_argument("--test", default=None, help="该库的测试命令，供 AI 修复后执行")

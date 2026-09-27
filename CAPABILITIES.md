@@ -14,8 +14,10 @@
 | 禅道回填 | 提交后自动评论（分支 + 修订号 + 待审查）、阻塞时评论「AI 阻塞」；**不提供** resolve/close | `commit` / `block` / `comment` |
 | 分析结论落库 | 每条 bug 收尾必须写回结构化分析（现象/根因/定位依据/链路/改动/影响面/验证/未验证/回退/结论 + 闸门逐条），`REQUIRE_ANALYSIS` 让无分析的 commit 直接失败 | `analyze` / `commit --analysis-file` / `/review` |
 | 任务编排 | SQLite 队列 + 7 态状态机；优先级 = 已答复 > 已打回 > 待处理，再 pri 升序 / severity 降序 | `tasks` / `claim` / 看板 |
-| 无人值守连跑 | 一条 bug 跑完自动取下一条、卡点回填后不阻塞、断线可续跑；下达「提交闸门 G1–G11」清单 | `AUTO_LOOP.md` |
+| 无人值守连跑 | 一条 bug 跑完自动取下一条、卡点回填后不阻塞、断线可续跑；下达「提交闸门 G1–G12」清单 | `AUTO_LOOP.md` |
+| 一键下达 | Web 页现场从 `AUTO_LOOP.md` 抽取提示词（永不与规则分叉）+ 开跑前检查清单 + 按落码目录归组的串行队列；可勾选产品生成已填好产品 ID / 目录 / 串行要求的下达语，每段一个复制按钮 | `/dispatch` |
 | 多代码库 | 一个禅道产品 = 一个 SVN 仓库；仓库归属用于闸门判定与审查展示，工作副本默认按产品独立（共用同一镜像的产品必须并入同一串行队列） | `repos` / `bind-repo` / `/repos` |
+| 多语言直连提交（G12） | 词条文件（`I18N_FILE_PATTERNS` 白名单）不草稿化、不排队：改前系统代跑 `svn update`，改完单独 `svn ci` 进正式库并登记真实 r 号；夹带非白名单文件直接拒绝 | `i18n-up` / `i18n-commit` |
 | SVN 操作（可选方式） | 建/切分支（`svn copy trunk→branches`，自动补 `/branches` 根）、提交、状态、diff、log、info —— **默认不启用**，提交动作归目标代码库自己的提交细则 | `branch` / `commit --no-svn` |
 | 安全护栏 | trunk 写保护、禁止 AI 结案、工作副本归属校验、`.env` 密码脱敏、只读诊断 | 内置 + `svn-check` |
 | 诊断 | 禅道分步诊断（配置/站点/会话/端点/产品/Bug）、会话原始样本落盘、SVN 逐仓库自检 | `doctor` / `session-probe` / `svn-check` |
@@ -45,14 +47,16 @@
 | `analyze` | `<ref>` `--kind[commit\|block\|manual]` `--analysis-file <json>` `--analysis-stdin`，或单字段 `--symptom --root-cause --evidence --chain --change --impact --verify-result --unverified --rollback --conclusion --gates "G1=pass,G5=未验证:xxx"` | 写 `analyses`（一条 bug 可累积多份） | `analysis_id`, `kind`, `gates`, `analysis` |
 | `note` | `<ref>` `--summary` `--verify` `--files`（也可带全套分析参数） | 只写说明字段，不改状态；带分析则追加 `analyses` | `bug`, `analysis_id` |
 | `commit` | `<ref>` `--message` `--files` `--revision` `--summary` `--verify` `--author` `--extra` `--need-done <id>…` `--no-svn` + 全套分析参数 | 存 `analyses` + 写 `svn_revisions` + 状态 → `await_review` + 禅道评论；**不带 `--no-svn`/`--revision` 时才真的跑 `svn commit`**；`REQUIRE_ANALYSIS=true` 时无分析直接失败 | `revision`, `branch`, `repo`, `repo_source`, `working_copy`, `status`, `analysis_id`, `analysis_fields`, `zentao_comment`, `note` |
+| `i18n-up` | `<ref>` `--files`（逗号分隔，留空=整个正式副本） | 只读地跑 `svn update`（G12 的「改前先 up」）；文件必须全部命中 `I18N_FILE_PATTERNS` | `working_copy`, `updated[]`, `conflict`, `output`, `note` |
+| `i18n-commit` | `<ref>` `--files`（必填） `--message` `--author` `--branch` `--extra` `--dry-run` | 校验白名单→`svn update`→`svn commit`（只提这几个文件，含 trunk）→ 写 `svn_revisions`（`r<号>`，branch 默认 `i18n-direct`）+ 禅道评论；**不改 bugs.status** | `revision`, `committed_files[]`, `skipped_unchanged[]`, `working_copy`, `url`, `patterns`, `revision_record`, `status`, `zentao_comment` |
 | `block` | `<ref>` `--question`（必填）`--options` `--advice` + 全套分析参数 | 写 `need_solution` + 状态 → `need_solution` + 禅道评论；带分析则同时存 `analyses` | `need`, `status`, `analysis_id`, `zentao_comment` |
 | `need-done` | `<need_id>` | 阻塞项 → `done` | `need` |
 | `comment` | `<ref>` `--text` | 仅回写禅道评论 | `result{ok,detail}` |
 | `status` | `<ref>` | 只读 | `bug`（全文 + `steps`/`comments`/`attachments`/`product_*`/`files_changed`/历史/`analysis`+`analyses`） |
 | `report` | — | 只读 | `counts`, `submitted_await_review[]`, `need_owner_solution[]`, `resumed_after_reply[]`, `remaining_queue[]`, `remaining_work` |
-| `repos` | — | 只读 | `count`, `global_repo`, `unbound_products`, `repos[]`（`product_id`, `product_name`, `bugs`, `pending`, `bound`, `repo_url`, `effective_source`, `trunk`, `branch_root`, `working_copy`, `build_command`, `test_command`） |
-| `bind-repo` | `<产品ID> [仓库地址]` `--name` `--trunk-path` `--branch-root` `--working-copy` `--branch-prefix` `--build` `--test` `--note` `--disabled` `--unbind` | 写/删 `product_repos` | `repo`, `trunk`；解绑时 `unbind`, `note` |
-| `svn-check` | `--all` \| `--product <pid>` | 只读（`svn --version` / `svn info`） | `ok`, `steps[]{name,ok,detail}`, `hint`（`ok` 为 `false` 是失败，`null` 是提示） |
+| `repos` | — | 只读 | `count`, `global_repo`, `unbound_products`, `repos[]`（`product_id`, `product_name`, `bugs`, `pending`, `bound`, `repo_url`, `effective_source`, `trunk`, `branch_root`, `working_copy`, `svn_working_copy`, `build_command`, `test_command`） |
+| `bind-repo` | `<产品ID> [仓库地址]` `--name` `--trunk-path` `--branch-root` `--working-copy` `--svn-working-copy` `--branch-prefix` `--build` `--test` `--note` `--disabled` `--unbind` | 写/删 `product_repos` | `repo`, `trunk`；解绑时 `unbind`, `note` |
+| `svn-check` | `--all` \| `--product <pid>` | 只读（`svn --version` / `svn info`） | `ok`, `steps[]{name,ok,detail}`（含「多语言工作副本」一步）, `hint`（`ok` 为 `false` 是失败，`null` 是提示） |
 | `doctor` | — | 只读探测禅道 | `ok`, `auth_mode`, `steps[]`, `hint` |
 | `session-probe` | — | 登录并抓原始样本到 `session_dump/` | `steps[]`, `files[]` |
 | `config` | — | 只读 | 脱敏配置 |
@@ -103,7 +107,7 @@ GET /api/bug/9 -> {"id":9,"zentao_id":51579,"product_id":25,"product_name":"DPDK
 | 表 | 作用 | 关键列 |
 | --- | --- | --- |
 | `bugs` | 任务主表（禅道镜像 + 本地工作流） | `zentao_id` UNIQUE、`status`、`pri`、`severity`、`product_id`/`product_name`、`steps`/`steps_html`/`comments`/`attachments`、`branch`、`fix_summary`/`verify_steps`/`files_changed`、`detail_synced_at`、`raw_json` |
-| `product_repos` | 产品 → 代码库 | `product_id` PK、`repo_url`、`trunk_path`、`branch_root`、`working_copy`、`branch_prefix`、`build_command`、`test_command`、`enabled` |
+| `product_repos` | 产品 → 代码库 | `product_id` PK、`repo_url`、`trunk_path`、`branch_root`、`working_copy`（= 执行器改码的 git 镜像目录）、`svn_working_copy`（= 正式 SVN 工作副本，只有 G12 多语言通道可写）、`branch_prefix`、`build_command`、`test_command`、`enabled` |
 | `analyses` | 执行器写回的分析结论（一条 bug 可多份） | `kind[commit\|block\|manual]`、`symptom`、`root_cause`、`evidence`、`call_chain`、`change_desc`、`impact`、`verify`、`gates`(JSON)、`unverified`、`rollback`、`conclusion`、`author` |
 | `need_solution` | AI 阻塞与主人答复 | `question`/`ai_options`/`ai_advice`/`owner_reply`/`status` |
 | `svn_revisions` | 提交记录 | `revision`、`branch`、`message`、`author`、`files` |
@@ -183,11 +187,17 @@ svn copy <trunk> <branches>/bugfix/zentao-<ID> -m "..."     # 缺 /branches 时�
 svn switch <branch url> <工作副本>
 svn checkout <trunk> <工作副本>                              # 工作副本不存在时
 svn commit -m "fix #<ID> <说明>" [文件...]
+svn update [文件...]                                        # 仅 i18n-up / i18n-commit 用到
 svn st / diff / log -l N
 ```
 
-约束：分支名 = `branch_prefix + 禅道ID`；`SVN_ALLOW_TRUNK_WRITE=false` 时提交目标指向 trunk 直接报错；
+约束：分支名 = `branch_prefix + 禅道ID`；`SVN_ALLOW_TRUNK_WRITE=false` 时提交目标指向 trunk 直接报错
+（**唯一例外**：`i18n-commit` 提的是 `I18N_FILE_PATTERNS` 白名单词条文件，允许落在副本当前路径含 trunk）；
 工作副本 URL 与产品仓库不匹配时自检 FAIL；输出解码按 UTF-8 → GBK 回退（中文 Windows 的 svn 输出为 GBK）。
+
+多语言通道（G12）的调用面被刻意收得很窄：只有 `i18n-up` / `i18n-commit` 两条命令会跑
+`svn update` / `svn commit`，且 commit 永远带显式文件列表（不整目录提交）、
+路径必须落在该产品的 `svn_working_copy` 内、每个文件都必须命中白名单，任一不满足即拒绝且不提交。
 
 ## 6. 环境与健康
 

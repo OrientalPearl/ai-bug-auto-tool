@@ -9,15 +9,22 @@ Hard rules enforced here:
 * every automatic commit goes to a branch under ``<repo>/branches/<prefix><id>``
 * commits touching the trunk URL are refused unless ``SVN_ALLOW_TRUNK_WRITE=true``
   (that flag exists for the *human* merge step only)
+* the single exception is the i18n channel (``AUTO_LOOP.md`` G12): translation
+  files listed in ``I18N_FILE_PATTERNS`` may be committed straight into the
+  product's real SVN checkout, because holding them in a local draft branch
+  only guarantees conflicts and pure new entries cannot affect a release.
+  Anything outside that whitelist is refused.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from . import db
 from .config import PROJECT_ROOT, get_settings
@@ -39,6 +46,9 @@ class RepoTarget:
     working_copy: Path
     branch_prefix: str
     source: str = "global"          # "global" | "product"
+    # The human's real SVN checkout of this product (not the git mirror).
+    # Only the i18n channel is allowed to write there.
+    svn_working_copy: Path | None = None
 
     def trunk_url(self) -> str:
         return f"{self.repo_url.rstrip('/')}{('/' + self.trunk_path.strip('/')) if self.trunk_path.strip('/') else ''}"
@@ -127,6 +137,12 @@ def _short_hash(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
 
 
+def _opt_path(raw: Any) -> Path | None:
+    """Empty / missing column value must stay "not configured", not Path('')."""
+    text = str(raw or "").strip()
+    return Path(text) if text else None
+
+
 def resolve_target(bug: dict | None = None, product_id: int | None = None) -> RepoTarget:
     """Pick the repository for a bug: per-product binding first, then defaults.
 
@@ -158,6 +174,7 @@ def resolve_target(bug: dict | None = None, product_id: int | None = None) -> Re
             working_copy=Path(wc),
             branch_prefix=str(binding.get("branch_prefix") or "") or settings.branch_prefix,
             source="product",
+            svn_working_copy=_opt_path(binding.get("svn_working_copy")),
         )
 
     target = global_target()
@@ -309,15 +326,20 @@ def parse_revision(text: str) -> str:
     return ""
 
 
-def commit(files: list[str] | None, message: str, *, target: RepoTarget) -> str:
-    """Commit and return the new revision number (e.g. ``"1234"``)."""
+def commit(files: list[str] | None, message: str, *, target: RepoTarget,
+           wc: Path | None = None, allow_trunk: bool = False) -> str:
+    """Commit and return the new revision number (e.g. ``"1234"``).
+
+    ``allow_trunk`` is only for the i18n channel: the trunk guard stays in place
+    for every code commit the review pipeline handles.
+    """
     settings = get_settings()
-    wc = Path(target.working_copy)
+    wc = Path(wc or target.working_copy)
     if not (wc / ".svn").exists():
         raise SvnError(f"工作副本 {wc} 尚未检出，请先执行 branch 建立/切换分支")
     url = current_url(wc)
     trunk = target.trunk_url().rstrip("/")
-    if not settings.svn_allow_trunk_write and url.rstrip("/") == trunk:
+    if not settings.svn_allow_trunk_write and not allow_trunk and url.rstrip("/") == trunk:
         raise SvnError(
             f"当前工作副本指向 trunk（{url}）。AI 禁止直接提交主干，"
             "请先创建/切换到 bugfix 分支。"
@@ -332,6 +354,170 @@ def commit(files: list[str] | None, message: str, *, target: RepoTarget) -> str:
     if not revision:
         raise SvnError(f"提交成功但无法解析修订号: {result.output.strip()[:400]}")
     return revision
+
+
+# ---------------------------------------------------------------------------
+# i18n channel (AUTO_LOOP.md G12): translation files go straight to SVN
+# ---------------------------------------------------------------------------
+
+def is_i18n_path(rel_path: str, patterns: list[str] | None = None) -> bool:
+    """Whitelist test: is this working-copy-relative path a translation file?
+
+    Patterns from ``I18N_FILE_PATTERNS`` are matched against the file name and
+    the whole relative path; a directory pattern (``locale/*``) also matches a
+    folder at any depth, which is how most products organize their catalogues.
+    """
+    posix = str(rel_path).replace("\\", "/").strip().lstrip("/")
+    parts = [p for p in posix.split("/") if p]
+    if not parts:
+        return False
+    name = parts[-1]
+    for raw in (patterns if patterns is not None else get_settings().i18n_file_patterns):
+        pat = str(raw).replace("\\", "/").strip().lstrip("/")
+        if not pat:
+            continue
+        if fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(posix, pat):
+            return True
+        head = pat.rstrip("/*")
+        if head and "/" in pat and head in parts[:-1]:
+            return True
+    return False
+
+
+def i18n_working_copy(target: RepoTarget) -> Path:
+    """The product's real SVN checkout -- the only place `svn ci` may run."""
+    if target.svn_working_copy is None:
+        raise SvnError(
+            f"产品 {target.product_id or '(未绑定)'} 没有配置正式 SVN 工作副本，"
+            "多语言通道要求真正的 svn 工作目录（git 镜像里没有 .svn，提交不了）。"
+            f"配置命令：python -m app.cli bind-repo {target.product_id or '<产品ID>'} "
+            f"{target.repo_url or '<SVN仓库地址>'} --svn-working-copy <正式SVN工作副本>"
+        )
+    wc = Path(target.svn_working_copy)
+    if not (wc / ".svn").exists():
+        raise SvnError(f"{wc} 不是 SVN 工作副本（缺 .svn 目录），无法执行 svn update/commit")
+    return wc
+
+
+def i18n_relatives(files: list[str], wc: Path) -> list[str]:
+    """Normalize given files to working-copy-relative paths (POSIX separators).
+
+    Anything resolving outside the working copy is refused, so a typo can never
+    turn into a commit of an unrelated checkout.
+    """
+    root = wc.resolve()
+    out: list[str] = []
+    for raw in files:
+        candidate = Path(raw)
+        absolute = candidate if candidate.is_absolute() else wc / candidate
+        try:
+            rel = absolute.resolve().relative_to(root)
+        except ValueError:
+            raise SvnError(f"文件不在正式工作副本 {wc} 内：{raw}") from None
+        text = str(rel).replace("\\", "/")
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def update(paths: list[str], *, wc: Path) -> str:
+    """`svn update` the given paths (empty = whole working copy)."""
+    return run(["update"] + list(paths), cwd=wc).output
+
+
+def _status_key(path: str) -> str:
+    return str(path).replace("\\", "/").strip().rstrip("/")
+
+
+def dirty_paths(wc: Path) -> dict[str, str]:
+    """{normalized path: svn status flag} for one working copy."""
+    result = run(["st", str(wc)])
+    flags: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if not line.strip() or len(line) < 2:
+            continue
+        flag = line[0]
+        if flag in ("?", "I"):
+            continue
+        path = line[8:].strip() if len(line) > 8 else line[1:].strip()
+        if not path:
+            continue
+        flags[_status_key(path)] = flag
+    return flags
+
+
+_CONFLICT_COUNT = re.compile(r"conflicts?:\s*(\d+)", re.I)
+
+
+def has_conflict(text: str) -> bool:
+    """Detect conflicts in `svn update` / `svn status` output.
+
+    The column flag ``C`` marks one conflicted file; newer clients also print a
+    "Summary of conflicts" block whose zero counts must not trigger a false hit.
+    """
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if line[0] == "C":
+            return True
+        match = _CONFLICT_COUNT.search(line)
+        if match and int(match.group(1)) > 0:
+            return True
+    return False
+
+
+def i18n_commit(files: list[str], message: str, *, target: RepoTarget,
+                dry_run: bool = False) -> dict[str, Any]:
+    """update -> whitelist check -> commit exactly the given translation files."""
+    settings = get_settings()
+    if not settings.i18n_direct_commit:
+        raise SvnError("I18N_DIRECT_SVN_COMMIT=false，多语言直连通道已关闭，"
+                       "请把 i18n 改动并入正常闸门流程后由主人提交")
+    if not files:
+        raise SvnError("必须显式给出 --files 多语言文件，禁止整目录提交")
+    wc = i18n_working_copy(target)
+    rels = i18n_relatives(files, wc)
+    refused = [p for p in rels if not is_i18n_path(p)]
+    if refused:
+        raise SvnError(
+            "以下文件不在多语言白名单（I18N_FILE_PATTERNS="
+            + ", ".join(settings.i18n_file_patterns) + "）内，禁止走直连通道："
+            + ", ".join(refused)
+        )
+    missing = [p for p in rels if not (wc / p).exists()]
+    if missing:
+        raise SvnError(f"正式工作副本里找不到这些文件，先确认改错了目录：{', '.join(missing)}")
+
+    flags = dirty_paths(wc)
+    conflicted = [p for p in rels if flags.get(_status_key(p)) == "C"]
+    if conflicted:
+        raise SvnError(f"这些多语言文件处于冲突状态，先解决冲突再提交：{', '.join(conflicted)}")
+
+    update_output = update(rels, wc=wc)
+    if has_conflict(update_output):
+        raise SvnError("svn update 产生冲突，未提交。请人工处理后再试："
+                       + update_output.strip()[:400])
+
+    flags_after = dirty_paths(wc)
+    to_commit = [p for p in rels if _status_key(p) in flags_after]
+    skipped = [p for p in rels if p not in to_commit]
+    payload: dict[str, Any] = {
+        "working_copy": str(wc),
+        "url": current_url(wc),
+        "patterns": list(settings.i18n_file_patterns),
+        "committed_files": to_commit,
+        "skipped_unchanged": skipped,
+        "update_output": update_output.strip()[:1000],
+    }
+    if dry_run:
+        payload["revision"] = ""
+        payload["note"] = "dry-run：只做校验与 svn update，未提交"
+        return payload
+    if not to_commit:
+        raise SvnError("这些多语言文件没有本地改动，无需提交（可能改在了镜像目录而不是正式工作副本）")
+
+    payload["revision"] = commit(to_commit, message, target=target, wc=wc, allow_trunk=True)
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +572,22 @@ def preflight_target(target: RepoTarget) -> list[dict]:
                                f"进正式库由主人 dcommit"))
         else:
             steps.append(_step("工作副本", None, f"{wc} 未检出，首次建分支时自动 checkout"))
+
+    # The i18n channel is the only write path into the human's own checkout.
+    i18n_wc = target.svn_working_copy
+    if i18n_wc is None:
+        steps.append(_step("多语言工作副本", None,
+                           "未配置：bind-repo --svn-working-copy 指定正式 SVN 工作副本后，"
+                           "才能用 i18n-commit 直连通道（见 AUTO_LOOP.md G12）"))
+    elif not (Path(i18n_wc) / ".svn").exists():
+        steps.append(_step("多语言工作副本", False, f"{i18n_wc} 不是 SVN 工作副本（缺 .svn 目录）"))
+    else:
+        cur = current_url(i18n_wc)
+        owned = bool(cur) and (not target.repo_url
+                               or cur.startswith(target.repo_url.rstrip("/")))
+        steps.append(_step("多语言工作副本", owned,
+                           f"{i18n_wc} 指向 {cur or '未知 URL'}"
+                           + ("" if owned else "（不属于本产品仓库，禁止提交）")))
     return steps
 
 

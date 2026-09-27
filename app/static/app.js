@@ -255,8 +255,60 @@
 
   window.addEventListener("hashchange", route);
 
+  // ------------------------------------------------------------------
+  // one-click copy: the dispatch page hands prompts to another window,
+  // so nobody has to retype (or worse, re-transcribe by hand) a rules block.
+  // ------------------------------------------------------------------
+  function flashCopied(button) {
+    const label = button.textContent;
+    button.textContent = "已复制";
+    button.disabled = true;
+    window.setTimeout(function () {
+      button.textContent = label;
+      button.disabled = false;
+    }, 1600);
+  }
+
+  function copyViaTextArea(text) {
+    const box = document.createElement("textarea");
+    box.value = text;
+    box.setAttribute("readonly", "");
+    box.style.position = "fixed";
+    box.style.top = "-2000px";
+    document.body.appendChild(box);
+    box.select();
+    try {
+      document.execCommand("copy");
+    } catch (err) {
+      window.alert("浏览器拒绝了复制操作，请手动选中这段文字。");
+    }
+    document.body.removeChild(box);
+  }
+
+  function copyFrom(button) {
+    const src = document.querySelector('[data-copy-src="' + button.dataset.copy + '"]');
+    if (!src) return;
+    const text = src.textContent;
+    const done = function () { flashCopied(button); };
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(done, function () {
+        copyViaTextArea(text);
+        done();
+      });
+    } else {
+      copyViaTextArea(text);
+      done();
+    }
+  }
+
   document.addEventListener("click", function (event) {
     if (!event.target || !event.target.closest) return;
+    const copy = event.target.closest("[data-copy]");
+    if (copy) {
+      event.preventDefault();
+      copyFrom(copy);
+      return;
+    }
     if (event.target.closest("[data-dialog-close]")) {
       event.preventDefault();
       closeDialog();

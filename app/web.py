@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,10 @@ STATUS_LABELS = {
     "closed": "已结案",
 }
 
+# Headings in AUTO_LOOP.md whose code block is meant to be pasted verbatim;
+# the 下达 page renders them instead of duplicating the text.
+LOOP_PROMPT_SECTIONS = (r"^## 0\.", r"^### 3\.1 ", r"^### 3\.2 ", r"^## 9\.")
+
 # Kanban shows three stacked bands instead of one column per status:
 # (key, label, hint, statuses) in the order the owner reads them.
 KANBAN_BANDS = (
@@ -31,6 +36,12 @@ KANBAN_BANDS = (
     ("ai", "AI 在跑", "等 AI 出结果", ("pending", "fixing")),
     ("done", "已收尾", "已合入 / 已结案，只作回溯", ("merged", "closed")),
 )
+
+# AUTO_LOOP.md sections the dispatch page can build a scoped prompt from.
+DISPATCH_BASES = {
+    "0": "§0 最短下达语",
+    "3.1": "§3.1 主循环（调度器）",
+}
 
 
 def create_app() -> Flask:
@@ -307,6 +318,9 @@ def create_app() -> Flask:
             forms=forms,
             global_repo=svn_client.global_target(),
             products=db.products_in_use(),
+            i18n_patterns=", ".join(get_settings().i18n_file_patterns) or "(空)",
+            i18n_direct="开（I18N_DIRECT_SVN_COMMIT=true）"
+            if get_settings().i18n_direct_commit else "关（I18N_DIRECT_SVN_COMMIT=false）",
         )
 
     @app.route("/repos/bind", methods=["POST"])
@@ -322,6 +336,7 @@ def create_app() -> Flask:
             "trunk_path": form.get("trunk_path") or "/trunk",
             "branch_root": form.get("branch_root") or "/branches",
             "working_copy": form.get("working_copy", ""),
+            "svn_working_copy": form.get("svn_working_copy", ""),
             "branch_prefix": form.get("branch_prefix", ""),
             "build_command": form.get("build_command", ""),
             "test_command": form.get("test_command", ""),
@@ -341,6 +356,36 @@ def create_app() -> Flask:
         db.unbind_product_repo(product_id)
         flash(f"产品 {product_id} 已解绑，回落到 .env 的全局 SVN 配置。", "ok")
         return redirect(url_for("repos_page"))
+
+    # ------------------------------------------------------------------
+    # 7) dispatch: the copy-paste下达 page
+    # ------------------------------------------------------------------
+    @app.route("/dispatch")
+    def dispatch_page():
+        prompts = _prompt_map()
+        base = str(request.args.get("base", "0"))
+        if base not in DISPATCH_BASES:
+            base = "0"
+        rows = _repo_rows()
+        queues = _dispatch_queues(rows)
+        for group in queues:
+            group["dispatch"] = _dispatch_text(group, prompts, base)
+            group["picked"] = str(group["ids"]).replace(", ", "+")
+        selected = _selected_queue(",".join(request.args.getlist("ids")), rows)
+        if selected:
+            selected["dispatch"] = _dispatch_text(selected, prompts, base)
+            selected["picked"] = str(selected["ids"]).replace(", ", "+")
+        return render_template(
+            "dispatch.html",
+            prompts=_loop_prompts(),
+            queues=queues,
+            checklist=_dispatch_checklist(queues),
+            queue=db.fetch_task_queue(10),
+            products=rows,
+            selected=selected,
+            bases=DISPATCH_BASES,
+            base=base,
+        )
 
     # ------------------------------------------------------------------
     # config / usage
@@ -383,6 +428,225 @@ def _kanban_bands() -> list[dict[str, Any]]:
     return bands
 
 
+def _loop_prompts() -> list[dict[str, Any]]:
+    """Lift the copy-paste prompts straight out of AUTO_LOOP.md.
+
+    Rendering them from the rules file keeps the page from ever offering a prompt
+    that has drifted from what the executor is actually held to.
+    """
+    path = PROJECT_ROOT / "AUTO_LOOP.md"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    found: list[dict[str, Any]] = []
+    wanted = None
+    title = ""
+    body: list[str] = []
+    in_fence = False
+    for line in lines:
+        if wanted is None:
+            for pattern in LOOP_PROMPT_SECTIONS:
+                if re.match(pattern, line):
+                    wanted = pattern
+                    title = line.lstrip("#").strip()
+                    break
+            continue
+        if not in_fence:
+            if line.startswith("```"):
+                in_fence = True
+            elif line.startswith("#"):
+                # The section turned out to have no code block: stop looking at it.
+                wanted = None
+            continue
+        if line.startswith("```"):
+            found.append({"title": title, "code": "\n".join(body).rstrip()})
+            wanted = None
+            body = []
+            in_fence = False
+        else:
+            body.append(line)
+    return found
+
+
+def _prompt_map() -> dict[str, str]:
+    """Extracted AUTO_LOOP.md blocks, keyed by their section number."""
+    mapping: dict[str, str] = {}
+    for section in _loop_prompts():
+        head = section["title"].split(" ")[0].rstrip(".")
+        mapping[head] = section["code"]
+    return mapping
+
+
+def _make_group(index: int, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """One serial queue: the products that share a single landing directory."""
+    directories = {row["effective_wc"] or "(无法解析)" for row in rows}
+    group: dict[str, Any] = {
+        "no": index,
+        "working_copy": rows[0]["effective_wc"] or "(无法解析)",
+        "products": rows,
+        "bugs": sum(int(row["bugs"] or 0) for row in rows),
+        "pending": sum(int(row["pending"] or 0) for row in rows),
+        "bound": all(row["source"] == "product" for row in rows),
+        "error": next((row["error"] for row in rows if row["error"]), ""),
+        "mixed": len(directories) > 1,
+        "directories": sorted(directories),
+        "ids": ", ".join(str(row["product_id"]) for row in rows),
+        "names": "、".join((row["product_name"] or f"产品 {row['product_id']}") for row in rows),
+    }
+    if group["mixed"]:
+        group["serial"] = f"所选产品跨了 {len(directories)} 个目录 → 必须拆成多条下达语"
+    elif len(rows) > 1:
+        group["serial"] = f"{len(rows)} 个产品共用这一份镜像 → 只能开一条串行队列"
+    else:
+        group["serial"] = "单产品独占镜像 → 可与其他队列并行"
+    return group
+
+
+def _dispatch_queues(rows: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Products grouped by the directory the executor would actually touch.
+
+    One directory is one serial queue (AUTO_LOOP §5): two products sharing a
+    mirror must never be worked on in parallel, so the grouping is the thing a
+    human needs to see before starting a second main loop.
+    """
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for row in (rows if rows is not None else _repo_rows()):
+        buckets.setdefault(row["effective_wc"] or "(无法解析)", []).append(row)
+    queues = [_make_group(index, items)
+              for index, (_, items) in enumerate(sorted(
+                  buckets.items(),
+                  key=lambda kv: (not all(r["source"] == "product" for r in kv[1]),
+                                  -sum(int(r["pending"] or 0) for r in kv[1]),
+                                  -sum(int(r["bugs"] or 0) for r in kv[1]),
+                                  kv[0])), 1)]
+    return queues
+
+
+def _scope_block(group: dict[str, Any], base_label: str) -> str:
+    """The scope preamble that turns a generic prompt into this queue's prompt.
+
+    Kept separate from the AUTO_LOOP.md body on purpose: the rules text stays
+    verbatim (and keeps updating itself), only this part is filled per selection.
+    """
+    lines = [f"【本轮范围 · {base_label} · 产品 {group['ids']}】",
+             f"只处理禅道产品 ID ∈ {{{group['ids']}}}（{group['names']}）的 bug；"
+             f"其他产品一律不接手、不 claim、不改码。"]
+    if group["mixed"]:
+        lines.append("注意：所选产品跨了 " + " / ".join(group["directories"]) +
+                     " 这几个落码目录，不能并成一条队列；本轮只做其中与本目录相关的产品，"
+                     "其余的另开一条下达。")
+    lines.append(f"落码目录 working_copy = {group['working_copy']}")
+    unbound = [str(p["product_id"]) for p in group["products"] if p["source"] != "product"]
+    if unbound and len(unbound) < len(group["products"]):
+        lines.append(f"其中产品 {'、'.join(unbound)} 还没有绑定代码库（会落到全局目录）："
+                     "这几个产品的 bug 本轮一律不许落码，逐条 block 写明「产品未绑定代码库」，"
+                     "等主人 bind-repo 之后再接手；其余已绑定的产品照常做。")
+    elif unbound:
+        lines.append("这些产品都还没有绑定代码库（会落到上面的全局目录）：本轮一律不许落码，"
+                     "逐条 block 写明「产品未绑定代码库」，等主人 bind-repo 之后再接手。")
+    else:
+        lines.append("开工前先验镜像就绪；不就绪就按 §1.5 直接 block，不改码，也不许转去动正式 SVN 工作副本。")
+    if group["mixed"]:
+        lines.append("本组跨了多个目录：同一目录内部严格串行，不同目录之间才可以并行 —— "
+                     "更稳妥的做法是每个目录各下达一条。")
+    elif len(group["products"]) > 1:
+        lines.append(f"{len(group['products'])} 个产品共用这一份镜像 → 严格串行：一条 bug 提交完"
+                     "（或 block 登记完）才允许开下一条，同一时刻只能有一个分支被 checkout；"
+                     "禁止为了并行再开第二个主对话动这个目录。")
+    else:
+        lines.append("本队列独占这个目录 → 可以和其他目录的队列并行，但这个目录同时只允许一个操作方。")
+    lines.append("取队列后自行过滤，只留本产品/本目录的条目：python -m app.cli tasks --limit 20")
+    lines.append("以下整段是 AUTO_LOOP.md 原文，规则以它为准：")
+    return "\n".join(lines)
+
+
+def _dispatch_text(group: dict[str, Any], prompts: dict[str, str], base: str) -> str:
+    label = DISPATCH_BASES.get(base, base)
+    body = prompts.get(base) or prompts.get("0") or "(读不到 AUTO_LOOP.md 的下达语，请检查该文件是否存在)"
+    return f"{_scope_block(group, label)}\n\n{body}"
+
+
+def _selected_queue(raw_ids: str, rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """A queue built from an arbitrary product selection instead of by directory."""
+    picked = [int(x) for x in re.findall(r"\d+", raw_ids or "")]
+    if not picked:
+        return None
+    chosen = [row for row in rows if int(row["product_id"]) in picked]
+    if not chosen:
+        return None
+    # Keep the order the user picked, then any product that only exists in the table.
+    ordered = sorted(chosen, key=lambda r: picked.index(int(r["product_id"])))
+    return _make_group(0, ordered)
+
+
+def _dispatch_checklist(queues: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """What still has to be fixed before the loop prompt is worth pasting."""
+    settings = get_settings()
+    counts = db.counts_by_status()
+    items: list[dict[str, str]] = []
+
+    def add(level: str, text: str, cmd: str = "") -> None:
+        items.append({"level": level, "text": text, "cmd": cmd})
+
+    if settings.zentao_ready:
+        add("ok", f"禅道已配置（{settings.zentao_base_url}），同步与评论回写可用。")
+    else:
+        add("err", "禅道账号未配置：同步、抓详情、回写评论都不通。先编辑 .env，再到「配置」页重新加载。")
+
+    open_rows = db.query_all(
+        "SELECT detail_synced_at FROM bugs WHERE status IN "
+        "('pending','fixing','rejected','need_solution','await_review')"
+    )
+    missing = sum(1 for row in open_rows if not row["detail_synced_at"])
+    if missing:
+        add("warn", f"{missing} 条未抓详情（截图 / 备注 / 附件）：执行器看不到现场只能靠猜。",
+            "python -m app.cli sync --details -1")
+    else:
+        add("ok", "未关闭 bug 的详情都已抓到（描述 / 截图 / 备注）。")
+
+    for group in queues:
+        if not group["bound"]:
+            add("err", f"队列 #{group['no']}：产品 {group['ids']}（{group['names']}）没有绑定仓库，"
+                       f"会落到全局目录 {group['working_copy']} —— 那很可能是你日常开发那份代码，"
+                       f"先 bind-repo 指到它自己的镜像再下达。",
+                'python -m app.cli bind-repo <产品ID> "<SVN仓库根地址>" --working-copy <镜像目录>')
+    for group in queues:
+        if len(group["products"]) > 1:
+            add("warn", f"队列 #{group['no']}：产品 {group['ids']} 共用 {group['working_copy']}，"
+                        f"只能由同一个主对话串行做；要并行只能给其中一个另开一份镜像。")
+        elif group["bound"]:
+            add("ok", f"队列 #{group['no']}：产品 {group['ids']} 独占 {group['working_copy']}，"
+                      f"可以和其他队列并行。")
+
+    add("info", "每条队列开跑前验一次镜像就绪（无输出 = 未就绪，执行器必须 block 而不是改码）：",
+        "git -C <镜像目录> rev-parse --verify refs/remotes/origin/trunk")
+    if settings.require_analysis:
+        add("ok", "REQUIRE_ANALYSIS=true：没写分析结论的 commit 会被命令直接拒掉。")
+    else:
+        add("warn", "REQUIRE_ANALYSIS=false：没有分析结论也能提交，审查页会是空的。建议改回 true。")
+
+    if counts.get("await_review"):
+        add("info", f"已攒 {counts['await_review']} 条待审查：先审再下达，草稿不会自己进正式库。")
+    if counts.get("need_solution"):
+        add("info", f"{counts['need_solution']} 条在等你给方案（/need）：答复后它们以最高优先级回队列。")
+    add("info", "G11：执行器只做本地 git commit；dcommit / git push / svn ci 由你亲自做，"
+                "回填时用 --revision r<真实号>。唯一例外是 G12 的多语言词条通道（白名单文件单独立即提交）。")
+    if not settings.i18n_direct_commit:
+        add("warn", "I18N_DIRECT_SVN_COMMIT=false：多语言通道（G12）已关闭，词条改动会留在镜像里等"
+                    "回灌，攒久了必然冲突。")
+    else:
+        add("info", f"G12：多语言文件走直连通道（{', '.join(settings.i18n_file_patterns)}）—— "
+                    "i18n-up 改前先 up，改完 i18n-commit 单独立即提交 SVN。")
+        missing = [f"#{q['no']}（产品 {q['ids']}）" for q in queues
+                   if not any(p["i18n_wc"] for p in q["products"])]
+        if missing:
+            add("warn", f"{'、'.join(missing)} 没配「正式 SVN 工作副本」，"
+                        "这些产品的 i18n-commit 会被拒绝。",
+                'python -m app.cli bind-repo <产品ID> "<SVN仓库地址>" --svn-working-copy <正式SVN工作副本>')
+    return items
+
+
 def _repo_form(product_id: int | None) -> dict[str, Any]:
     """Prefill values for the bind form: existing binding, else global defaults."""
     settings = get_settings()
@@ -402,6 +666,7 @@ def _repo_form(product_id: int | None) -> dict[str, Any]:
         "trunk_path": binding.get("trunk_path") or "/trunk",
         "branch_root": binding.get("branch_root") or "/branches",
         "working_copy": binding.get("working_copy") or "",
+        "svn_working_copy": binding.get("svn_working_copy") or "",
         "branch_prefix": binding.get("branch_prefix") or settings.branch_prefix,
         "build_command": binding.get("build_command") or "",
         "test_command": binding.get("test_command") or "",
@@ -430,11 +695,13 @@ def _repo_row(product_id: int, name: str, bugs: int, pending: int,
         "repo_url": binding.get("repo_url") or "",
         "trunk_path": binding.get("trunk_path") or "",
         "working_copy": binding.get("working_copy") or "",
+        "svn_working_copy": binding.get("svn_working_copy") or "",
         "build_command": binding.get("build_command") or "",
         "test_command": binding.get("test_command") or "",
         "source": target.source if target else "",
         "effective_trunk": target.trunk_url() if target else "",
         "effective_wc": str(target.working_copy) if target else "",
+        "i18n_wc": str(target.svn_working_copy) if target and target.svn_working_copy else "",
         "error": error,
     }
 

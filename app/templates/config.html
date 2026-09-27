@@ -45,6 +45,11 @@ SVN_PASSWORD=
 SVN_BIN=svn
 SVN_ALLOW_TRUNK_WRITE=false           # 保持 false：AI 永远不许提交主干
 
+# ---- 多语言直连通道（闸门 G12）----
+I18N_DIRECT_SVN_COMMIT=true           # false = 关掉这条例外，i18n-up / i18n-commit 都会被拒绝
+I18N_FILE_PATTERNS=*.po,*.mo,*.pot,*.qm   # 白名单：只有命中的词条文件允许走直连单独提交 SVN
+                                      # 正式 SVN 工作副本按产品配（bind-repo --svn-working-copy），不是环境变量
+
 # ---- 分析结论 ----
 REQUIRE_ANALYSIS=true                 # 没写分析结论（analyses）时 commit 直接失败
 

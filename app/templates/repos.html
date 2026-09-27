@@ -23,7 +23,10 @@
     <code>{{ global_repo.working_copy }}\p&lt;产品ID&gt;-&lt;仓库哈希&gt;</code>）；但它是手工填的，
     <b>两个产品填同一个目录（共用一份 git 镜像）时不再互相隔离</b>，必须并入同一条串行队列
     —— 串行按<b>目录</b>划分，不按产品（见 <code>AUTO_LOOP.md</code> §5）；<br>
-    5. 主干始终只读：AI 只能提交到 <code>&lt;仓库&gt;/&lt;分支根&gt;/{{ forms.new.branch_prefix }}&lt;禅道ID&gt;</code>。
+    5. 主干始终只读：AI 只能提交到 <code>&lt;仓库&gt;/&lt;分支根&gt;/{{ forms.new.branch_prefix }}&lt;禅道ID&gt;</code>；<br>
+    6. <b>唯一例外是多语言通道（G12）</b>：填了「正式 SVN 工作副本」的产品，可以用
+    <code>i18n-up</code> / <code>i18n-commit</code> 把 <code>{{ i18n_patterns }}</code> 命中的词条文件
+    单独 <code>svn up</code> 后立刻 <code>svn ci</code>（含主干）；非多语言文件一律被拒绝。
   </p>
 </div>
 
@@ -34,7 +37,9 @@
     主干：<code>{{ global_repo.trunk_url() if global_repo.repo_url else '-' }}</code>
     　分支根：<code>{{ global_repo.branch_root_url() if global_repo.repo_url else '-' }}</code><br>
     工作副本：<code>{{ global_repo.working_copy }}</code>
-    　分支前缀：<code>{{ global_repo.branch_prefix }}&lt;禅道ID&gt;</code>
+    　分支前缀：<code>{{ global_repo.branch_prefix }}&lt;禅道ID&gt;</code><br>
+    多语言白名单：<code>{{ i18n_patterns }}</code>
+    　直连提交：<code>{{ i18n_direct }}</code>
   </p>
   {% if not global_repo.repo_url %}
   <p class="hint" style="color:#d93025">
@@ -54,7 +59,7 @@
         <th style="width:60px">Bug</th>
         <th style="width:60px">待处理</th>
         <th style="width:90px">仓库来源</th>
-        <th>实际生效的 trunk / 工作副本</th>
+        <th>实际生效的 trunk / 镜像 / 多语言工作副本</th>
         <th style="width:120px">操作</th>
       </tr>
     </thead>
@@ -76,6 +81,7 @@
           <div class="wc">{{ r.effective_trunk }}</div>
           <div class="wc muted">{{ r.effective_wc }}</div>
           {% else %}<span class="muted">-</span>{% endif %}
+          {% if r.i18n_wc %}<div class="wc">多语言副本：<span class="mono">{{ r.i18n_wc }}</span></div>{% endif %}
           {% if r.error %}<div class="wc" style="color:#d93025">{{ r.error }}</div>{% endif %}
           {% if r.bound and not r.enabled %}<div class="hint" style="color:#d93025">该绑定已禁用</div>{% endif %}
         </td>
@@ -104,7 +110,7 @@
   <p class="hint">点右上「新增绑定」或某行的「编辑」，在弹窗里填写；保存后弹窗会自动关闭并刷新列表。</p>
   <p class="hint">
     等价的命令行写法（Trae / 脚本用这个）：<br>
-    <code>python -m app.cli bind-repo &lt;产品ID&gt; &lt;仓库地址&gt; --name "产品名" --trunk-path /trunk/3.0 --working-copy &lt;镜像目录&gt;</code><br>
+    <code>python -m app.cli bind-repo &lt;产品ID&gt; &lt;仓库地址&gt; --name "产品名" --trunk-path /trunk/3.0 --working-copy &lt;镜像目录&gt; --svn-working-copy &lt;正式SVN工作副本&gt;</code><br>
     省略的选项沿用库里已有值，不会把没填的列清空；<code>python -m app.cli repos</code> 查看每个产品实际生效的仓库。
   </p>
 </div>
@@ -142,6 +148,10 @@
       <div class="field field-wide">
         <label>本地工作副本 / git 镜像目录（留空自动按产品分配独立目录）</label>
         <input type="text" name="working_copy" placeholder="留空 = {{ global_repo.working_copy }}\p&lt;pid&gt;-&lt;hash&gt;">
+      </div>
+      <div class="field field-wide">
+        <label>正式 SVN 工作副本（多语言直连通道 G12 用，必须是真正的 svn 检出目录）</label>
+        <input type="text" name="svn_working_copy" placeholder="留空 = 该产品不能用 i18n-commit">
       </div>
       <div class="field">
         <label>分支前缀（AI 分支名 = 前缀 + 禅道ID）</label>

@@ -160,6 +160,9 @@ CREATE INDEX IF NOT EXISTS idx_analysis_bug ON analyses(bug_id);
 
 -- One Zentao product == one code repository. Rows here override the global
 -- SVN_* defaults in .env, so a bug is always committed to its own repo.
+-- working_copy     = where the executor edits code (the git-svn mirror draft area)
+-- svn_working_copy = the human's real SVN checkout, used only by the i18n
+--                    direct-commit channel (AUTO_LOOP.md G12)
 CREATE TABLE IF NOT EXISTS product_repos (
     product_id     INTEGER PRIMARY KEY,
     product_name   TEXT    NOT NULL DEFAULT '',
@@ -167,6 +170,7 @@ CREATE TABLE IF NOT EXISTS product_repos (
     trunk_path     TEXT    NOT NULL DEFAULT '/trunk',
     branch_root    TEXT    NOT NULL DEFAULT '/branches',
     working_copy   TEXT    NOT NULL DEFAULT '',
+    svn_working_copy TEXT  NOT NULL DEFAULT '',
     branch_prefix  TEXT    NOT NULL DEFAULT '',
     build_command  TEXT    NOT NULL DEFAULT '',
     test_command   TEXT    NOT NULL DEFAULT '',
@@ -234,6 +238,7 @@ EXTRA_COLUMNS = (
     ("bugs", "detail_synced_at", "TEXT"),
     ("svn_revisions", "files", "TEXT"),
     ("need_solution", "done_at", "TEXT"),
+    ("product_repos", "svn_working_copy", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -742,6 +747,7 @@ def has_analysis(bug_id: int) -> bool:
 
 REPO_COLUMNS = {
     "product_name", "repo_url", "trunk_path", "branch_root", "working_copy",
+    "svn_working_copy",
     "branch_prefix", "build_command", "test_command", "note", "enabled",
 }
 
@@ -785,12 +791,12 @@ def bind_product_repo(product_id: int, fields: dict[str, Any]) -> dict:
             conn.execute(
                 """
                 INSERT INTO product_repos (product_id, product_name, repo_url, trunk_path,
-                                           branch_root, working_copy, branch_prefix,
-                                           build_command, test_command, note, enabled,
-                                           created_at, updated_at)
+                                           branch_root, working_copy, svn_working_copy,
+                                           branch_prefix, build_command, test_command,
+                                           note, enabled, created_at, updated_at)
                 VALUES (:product_id, :product_name, :repo_url, :trunk_path, :branch_root,
-                        :working_copy, :branch_prefix, :build_command, :test_command,
-                        :note, :enabled, :ts, :ts)
+                        :working_copy, :svn_working_copy, :branch_prefix, :build_command,
+                        :test_command, :note, :enabled, :ts, :ts)
                 """,
                 {**row, "product_id": pid, "ts": ts},
             )

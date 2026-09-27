@@ -111,6 +111,21 @@ class Settings:
         default_factory=lambda: _env_bool("SVN_ALLOW_TRUNK_WRITE", False)
     )
 
+    # --- i18n direct-commit channel (AUTO_LOOP.md G12) ---
+    # Translation files held in a local draft branch always end up in conflicts,
+    # while pure new entries cannot affect a released version; so they bypass the
+    # review pipeline and go straight into SVN.
+    i18n_direct_commit: bool = field(
+        default_factory=lambda: _env_bool("I18N_DIRECT_SVN_COMMIT", True)
+    )
+    # Whitelist of what counts as a translation file. `i18n-commit` refuses every
+    # path outside it, so the channel can never carry source code into SVN.
+    i18n_file_patterns: list[str] = field(
+        default_factory=lambda: _split_list(
+            _env_str("I18N_FILE_PATTERNS", "*.po,*.mo,*.pot,*.qm")
+        )
+    )
+
     # --- Attachments (Zentao screenshots / uploaded files) ---
     attachment_dir: Path = field(
         default_factory=lambda: Path(
@@ -175,6 +190,8 @@ class Settings:
             "zentao_product_ids": ", ".join(map(str, self.zentao_product_ids)) or "(自动发现)",
             "svn_repo_url": self.svn_repo_url or "(未配置)",
             "svn_working_copy": str(self.svn_working_copy),
+            "i18n_direct_commit": "true" if self.i18n_direct_commit else "false",
+            "i18n_file_patterns": ", ".join(self.i18n_file_patterns) or "(空)",
             "branch_prefix": self.branch_prefix,
             "batch_size": str(self.batch_size),
             "require_analysis": "true" if self.require_analysis else "false",

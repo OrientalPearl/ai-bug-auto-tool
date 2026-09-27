@@ -214,7 +214,7 @@ button, .btn {
   background: #fff;
   cursor: pointer;
 }
-.btn-primary { background: var(--fixing); color: #fff; border-color: var(--fixing); }
+button.btn-primary, .btn.btn-primary { background: var(--fixing); color: #fff; border-color: var(--fixing); }
 .btn-pass { background: var(--merged); color: #fff; border-color: var(--merged); }
 .btn-reject { background: var(--rejected); color: #fff; border-color: var(--rejected); }
 .btn:hover { filter: brightness(0.95); }
@@ -269,3 +269,68 @@ ul.tight li { margin-bottom: 3px; }
   background: #fff;
 }
 .thumb:hover { max-width: none; max-height: none; object-fit: contain; }
+
+/* ---- dispatch: checklist + copyable prompts ---- */
+.checklist { list-style: none; margin: 0; padding: 0; }
+.checklist li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 0 7px 10px;
+  border-left: 3px solid var(--line);
+  border-bottom: 1px dashed var(--line);
+}
+.checklist li:last-child { border-bottom: none; }
+.ck-ok { border-left-color: var(--merged); }
+.ck-warn { border-left-color: var(--need_solution); }
+.ck-err { border-left-color: var(--rejected); }
+.ck-info { border-left-color: var(--pending); }
+.ck-text { flex: 1; min-width: 280px; }
+.copy-row { width: 100%; display: flex; align-items: center; gap: 8px; }
+.copy-row code { flex: 1; word-break: break-all; }
+pre.prompt {
+  background: #f7f8fa;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 0;
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 420px;
+  overflow: auto;
+}
+.panel h3 .btn { float: right; font-size: 12px; padding: 4px 10px; }
+.panel-scope { border-left: 4px solid var(--fixing); }
+
+/* product picker: build a prompt for a chosen set of products */
+.pick-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 8px; }
+.pick {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: center;
+  gap: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 13px;
+}
+.pick:hover { border-color: var(--fixing); }
+.pick input[type=checkbox] { width: auto; margin: 0; }
+.pick-id { font-weight: 700; }
+.pick-meta { font-size: 12px; color: var(--muted); text-align: right; }
+.pick-wc { grid-column: 1 / -1; color: var(--muted); font-size: 11px; }
+.scope-detail {
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  background: #fff;
+}
+.scope-detail > summary { cursor: pointer; font-size: 13px; }
+.scope-detail[open] > summary { margin-bottom: 8px; }

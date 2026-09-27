@@ -11,6 +11,7 @@
   <div class="brand">禅道 Bug 自动修复闭环系统</div>
   <nav>
     <a href="{{ url_for('kanban') }}" class="{{ 'active' if request.endpoint == 'kanban' }}">看板</a>
+    <a href="{{ url_for('dispatch_page') }}" class="{{ 'active' if request.endpoint == 'dispatch_page' }}">下达任务</a>
     <a href="{{ url_for('sync_page') }}" class="{{ 'active' if request.endpoint == 'sync_page' }}">禅道同步</a>
     <a href="{{ url_for('need_page') }}" class="{{ 'active' if request.endpoint == 'need_page' }}">需方案清单
       {% if counts.need_solution %}<span class="badge badge-yellow">{{ counts.need_solution }}</span>{% endif %}</a>

@@ -5,7 +5,7 @@
 - 服务地址：<http://127.0.0.1:5000>
 - 数据库：`bug_system.db`（已建好全部表）
 - AI 执行器规则：`AGENTS.md`（Trae 读它干活）
-- 自动连跑下达手册：`AUTO_LOOP.md`（一条跑完自动下一条 + 提交闸门 G1–G11 + 可复制指令）
+- 自动连跑下达手册：`AUTO_LOOP.md`（一条跑完自动下一条 + 提交闸门 G1–G12 + 多语言直连通道 + 可复制指令）
 - 能力清单 / 接口协议：`CAPABILITIES.md`
 - 账号密码配置：`.env`（已被 `.gitignore` 忽略）
 
@@ -45,6 +45,8 @@ AI_BATCH_SIZE=5                            # 每批处理条数
 
 SVN。**默认方式下本系统不执行 svn**（提交动作由目标代码库自己的提交细则负责），这里填的仓库地址只用于：
 闸门 G3 判断「改的文件属不属于这个产品」、审查页展示归属、以及你想让本系统代跑 svn 时的可选方式。
+**唯一例外是多语言词条（闸门 G12）**：词条攒着不提交必然冲突，而新增词条对版本没有影响，
+所以 `i18n-up`（改前 `svn update`）+ `i18n-commit`（改完单独 `svn ci`）会代跑 svn，且只允许白名单文件。
 各产品自己的仓库在「产品仓库」页或 `bind-repo` 里绑定（见第 3 节）：
 
 ```
@@ -55,6 +57,10 @@ SVN_BRANCH_ROOT=/branches
 SVN_USERNAME= SVN_PASSWORD=
 SVN_ALLOW_TRUNK_WRITE=false                # 保持 false，AI 禁止碰主干
 BRANCH_PREFIX=bugfix/zentao-               # 分支名 = 前缀 + 禅道ID（产品可各自覆盖）
+I18N_DIRECT_SVN_COMMIT=true                # G12：多语言单独直连提交（false = 关掉这条例外）
+I18N_FILE_PATTERNS=*.po,*.mo,*.pot,*.qm    # 白名单：只有命中的文件能走 i18n-commit
+# 每个产品另配「正式 SVN 工作副本」（多语言通道的唯一可写目录）：
+#   bind-repo <pid> <仓库地址> --working-copy <镜像目录> --svn-working-copy <正式SVN工作副本>
 ```
 
 改完在「配置」页点 **重新读取 .env**。「禅道同步」页点 **立即同步** 验证是否通：
@@ -128,7 +134,7 @@ BRANCH_PREFIX=bugfix/zentao-               # 分支名 = 前缀 + 禅道ID（产
 ```
 python -m app.cli repos                       # 看每个产品的 bug 数与生效仓库、工作副本
 python -m app.cli bind-repo 25 svn://10.0.0.1/repo/dpdkuac --name "DPDKUAC&NGFW" --build "make all" --test "make test"
-                                              # 编译/测试命令会一并下发给 AI；还可加 --trunk-path/--branch-root/--working-copy/--branch-prefix/--note/--disabled
+                                              # 编译/测试命令会一并下发给 AI；还可加 --trunk-path/--branch-root/--working-copy/--svn-working-copy/--branch-prefix/--note/--disabled
 python -m app.cli svn-check --all             # 逐仓库只读自检（客户端/可达/trunk/工作副本归属）
 python -m app.cli svn-check --product 25      # 只检查某个产品解析出来的仓库
 python -m app.cli bind-repo 25 --unbind       # 解绑，回落到全局 SVN_REPO_URL
@@ -155,10 +161,11 @@ python -m app.cli branch 51452 --dry-run
 
 **职责边界**：本系统只做**任务管理**（拉禅道、抓截图备注、排队、状态、登记修订号、审查、回写评论）。
 「什么情况下允许提交、提交怎么走（SSH / 是否需同意）/ 真实修订号从哪来」这些**提交细则由目标代码库自己的知识体系决定**，
-本系统只下达一份「提交闸门 G1–G11」清单，不复制也不解释那些细则。默认本系统**不执行 svn**。
+本系统只下达一份「提交闸门 G1–G12」清单，不复制也不解释那些细则。默认本系统**不执行 svn**
+（唯一例外：闸门 G12 的多语言词条，由 `i18n-up` / `i18n-commit` 两条命令代跑 `svn update` / `svn ci`）。
 
-> 「一条跑完自动下一条」的完整下达方式（三种执行方式、G1–G11 提交闸门、可复制的主循环与子任务指令、
-> 并行约束）见 **`AUTO_LOOP.md`**。下面只是最小骨架。
+> 「一条跑完自动下一条」的完整下达方式（三种执行方式、G1–G12 提交闸门、多语言直连通道、
+> 可复制的主循环与子任务指令、并行约束）见 **`AUTO_LOOP.md`**。下面只是最小骨架。
 
 ```
 ① 准备（一次性）
@@ -174,7 +181,8 @@ python -m app.cli branch 51452 --dry-run
    python -m app.cli status <禅道ID>     # 全文 + 截图本地路径 + 备注 + 历史提交 + 主人答复 + 所属产品
    python -m app.cli claim  <禅道ID>     # 占住任务，避免被别的子任务重复领
    ... 在该库自己的知识体系下定位并改代码、跑该库的编译/测试 ...
-   ... 逐条核对 AUTO_LOOP.md 的提交闸门 G1–G11 ...
+   ... 改了词条就单独走 G12：i18n-up <禅道ID> --files a.po（先 up）→ 改 → i18n-commit <禅道ID> --files a.po（立即单独提交，拿 r<号>） ...
+   ... 逐条核对 AUTO_LOOP.md 的提交闸门 G1–G12 ...
    闸门全过 → 只在落码位置（git 镜像/独立工作副本）本地提交，回本系统登记：
    python -m app.cli commit <禅道ID> --message "..." --files a.c,b.c --summary "..." --verify "..." --no-svn --revision git:<短哈希> --analysis-file a.json
         # = 存 analyses（分析结论） + 写 svn_revisions + 状态置 await_review + 回写禅道评论（不跑 svn）
@@ -203,7 +211,8 @@ python -m app.cli branch 51452 --dry-run
 
 | 页面 | 用途 |
 | --- | --- |
-| **看板** `/` | 按 7 种状态分列展示（灰/蓝/黄/橙/绿/深绿/红），卡片上有产品标签；点开展开描述、截图画廊、备注、分支、SVN 记录、需方案记录、审查记录，并有「拉取截图/备注/附件」按钮 |
+| **看板** `/` | 三类纵向行块（要我处理 / AI 在跑 / 已收尾），点块头折叠且会记住；块内按状态分组，卡片上有产品标签；点卡片在**弹窗**里看描述、截图画廊、备注、分支、SVN 记录、需方案记录、审查记录，后退键或「返回」回到列表 |
+| **下达任务** `/dispatch` | 开跑前一页看全：检查清单（禅道是否可用、详情是否抓全、哪些产品没绑定、哪些产品共用同一镜像必须串行）+ 按落码目录归组的串行队列 + **从 `AUTO_LOOP.md` 现场抽取的 §0 / §3.1 / §3.2 / §9 提示词**；可勾选产品或点「选这组」生成**已填好产品 ID、落码目录与串行要求**的下达语（§0 / §3.1 二选一），每段一个复制按钮，粘给新开的 Trae 主对话即可 + 下一条会被处理的 bug |
 | **禅道同步** `/sync` | 「立即同步」+「批量抓取详情（0=全量）」+ 待抓详情条数 + 今日新增/更新 + 同步日志 + 一键诊断 |
 | **需方案清单** `/need` | AI 卡住的问题、可选方案、AI 建议；你在输入框写答复提交 → 状态 `replied`，AI 下次优先处理 |
 | **审查清单** `/review` | AI 的分析结论（根因/定位依据/链路/影响面/验证结果/未验证项/闸门逐条）+ 修改文件列表 + SVN 提交号 + 修复说明与验证步骤 + 截图；填 trunk 号点「通过」→ `merged`；填原因点「打回」→ `rejected` 并重回 AI 队列 |
@@ -229,6 +238,12 @@ python -m app.cli tasks --limit 5         # 取队列：已答复 > 已打回 > 
 python -m app.cli status 1024             # 读全文 + 历史提交 + 主人答复 + 所属产品
 python -m app.cli repos                   # 每个产品的 bug 数与生效仓库
 python -m app.cli bind-repo 25 <仓库地址> --name "产品名" --build "..." --test "..."
+                                     # 加 --working-copy <git 镜像> 指定改码目录，加 --svn-working-copy <正式SVN副本> 开多语言通道
+python -m app.cli i18n-up 1024 --files i18n/zh_CN.po
+                                     # G12 第 1 步：改词条前先 svn update（只碰白名单文件，返回 conflict 就别动手）
+python -m app.cli i18n-commit 1024 --files i18n/zh_CN.po --message "补充 xx 词条" [--dry-run]
+                                     # G12 第 2 步：改完立即单独 svn ci（含 trunk），真实 r 号自动登记 + 回写禅道评论
+                                     # 白名单外的文件、副本外的路径、没有本地改动 —— 一律拒绝且不提交
 python -m app.cli branch 1024 [--dry-run] # 在 bug 所属产品的仓库 svn copy trunk -> branches/bugfix/zentao-1024 并 switch
 python -m app.cli note 1024 --summary "..." --verify "..." --files a.py,b.py
 python -m app.cli analyze 1024 --kind commit --analysis-file a.json
@@ -265,13 +280,14 @@ bugs(id, zentao_id UNIQUE, title, severity, pri, status, branch,
                    # (file_id/ext/url/name/local_path/web_path/size)
                    # product_id = 禅道产品，决定这条 bug 用哪个代码库
 product_repos(product_id PK, product_name, repo_url, trunk_path, branch_root,
-              working_copy, branch_prefix, build_command, test_command, note,
+              working_copy, svn_working_copy,
+              branch_prefix, build_command, test_command, note,
               enabled, created_at, updated_at)
                    # 一个产品 = 一个仓库；enabled=0 或删行则回落全局 SVN_*
 need_solution(id, bug_id, question, ai_options, ai_advice, owner_reply,
               status[awaiting|replied|done], created_at, replied_at, done_at)
 analyses(id, bug_id, kind[commit|block|manual], symptom, root_cause, evidence,
-         call_chain, change_desc, impact, verify, gates(JSON G1–G11), unverified,
+         call_chain, change_desc, impact, verify, gates(JSON G1–G12), unverified,
          rollback, conclusion, author, created_at)
                    # 执行器每条 bug 收尾必写的分析结论；commit 会校验其存在
 svn_revisions(id, bug_id, revision, branch, message, author, files, created_at)
@@ -305,6 +321,7 @@ meta(key, value)          # 最近同步时间等杂项
 7. **SVN 相关任何不通** → 先跑 `python -m app.cli svn-check --all`（或页面「SVN 记录 → 全部仓库自检」），
    它只跑 `svn --version` / `svn info`，逐仓库告诉你：客户端版本、仓库地址是否可达、
    认证是否通过、`/trunk` 是否存在、`/branches` 是否要自动建、工作副本状态、
+   正式 SVN 工作副本（多语言通道用）是否已配且归属正确、
    以及 `SVN_ALLOW_TRUNK_WRITE` 是否仍为 false。
    注意本机 svn 是 **1.6.16-SlikSvn**：若仓库工作副本是 1.7+ 格式（`.svn/wc.db`），
    1.6 客户端读不了，自检会直接 FAIL 提示，需要升级客户端并把 `SVN_BIN` 指向新的 `svn.exe`。
@@ -326,10 +343,10 @@ app/svn_client.py    svn 命令封装（按产品解析仓库、分支、提交�
 app/sync.py          同步、批量抓详情、回写编排
 app/web.py           Flask 页面与接口
 app/cli.py           AI 执行器命令行（全部输出单条 JSON）
-app/templates/       看板/同步/需方案/审查/SVN/产品仓库/配置 页面
-app/static/          style.css + app.js（展开卡片、确认框）
+app/templates/       看板/下达任务/同步/需方案/审查/SVN/产品仓库/配置 页面
+app/static/          style.css + app.js（弹窗与后退返回、三类行块折叠、确认框、一键复制）
 AGENTS.md            AI 批量执行规则（Trae 读它干活）
-AUTO_LOOP.md         自动连跑下达手册（提交闸门 G1–G11 + 可复制的主循环/子任务指令）
+AUTO_LOOP.md         自动连跑下达手册（提交闸门 G1–G12 + 多语言直连通道 + 可复制的主循环/子任务指令）
 README.md            本文档（使用与运维）
 CAPABILITIES.md      能力清单与接口协议（CLI/Web/DB 三张表）
 ```

@@ -25,8 +25,12 @@ python -m app.cli tasks --limit 5      # 取本轮待处理队列
 python -m app.cli detail <禅道ID>       # 抓单条 bug 的截图、备注、附件（下载到 attachments/）
 python -m app.cli status <禅道ID>       # 读 bug 全文 + 历史 SVN + owner_reply + 所属产品
 python -m app.cli repos                # 看每个产品实际用哪个仓库、工作副本在哪
-python -m app.cli bind-repo <产品ID> <仓库地址> --name "产品名" --working-copy "<镜像目录>" --build "编译命令" --test "测试命令"
+python -m app.cli bind-repo <产品ID> <仓库地址> --name "产品名" --working-copy "<镜像目录>" --svn-working-copy "<正式SVN工作副本>" --build "编译命令" --test "测试命令"
 python -m app.cli claim <禅道ID>          # 占住任务（置 fixing），防止重复领
+python -m app.cli i18n-up <禅道ID> [--files a.po,b.mo]
+                                          # 改多语言文件前先 svn update（G12：只碰白名单词条文件）
+python -m app.cli i18n-commit <禅道ID> --files a.po,b.mo --message "补充 xx 词条"
+                                          # 多语言文件单独、立即提交 SVN（G12），真实 r 号自动登记；不改 bug 状态
 python -m app.cli branch <禅道ID>          # 【托管 svn 方式】在该产品仓库里建/切分支；默认不用（见「职责边界」）
 python -m app.cli note <禅道ID> --summary "修复说明" --verify "验证步骤" --files a.py,b.py
 python -m app.cli analyze <禅道ID> --kind commit --analysis-file a.json
@@ -50,7 +54,7 @@ python -m app.cli doctor                   # 禅道通道分步诊断
 1. 同步禅道：调用禅道 API，拉取指派给我的待修复 bug，写入 bugs 表（status=pending）
 2. 从数据库读取 status in (pending, replied) 的 bug，按优先级排序（pri 升序、severity 降序）
 3. 每批最多处理 5 个，处理完自动取下一批
-4. 下达方式、可复制的主循环与子任务指令、**提交闸门 G1–G11** 见 `AUTO_LOOP.md`
+4. 下达方式、可复制的主循环与子任务指令、**提交闸门 G1–G12** 见 `AUTO_LOOP.md`
 
 ## 职责边界（先读这条）
 
@@ -59,9 +63,15 @@ python -m app.cli doctor                   # 禅道通道分步诊断
   包括走不走 SSH、要不要取得同意、真实修订号从哪来。本系统不复制也不解释那些细则。
 - **远端写入只属于主人**：`git svn dcommit` / `git push` / `svn ci` / merge 到 trunk 一律由主人执行，
   执行器连「代跑一次」都不许做，即使 `.env` 里已经有 SVN 账号密码。
+- **唯一例外是多语言通道（闸门 G12）**：词条文件（`I18N_FILE_PATTERNS` 白名单，如 `.po/.mo`）
+  攒着不提交必然冲突，而新增词条对版本没有影响，所以它不进审查流、单独提交：
+  改前 `python -m app.cli i18n-up <禅道ID> --files ...`（系统代跑 `svn update`），
+  改完 `python -m app.cli i18n-commit <禅道ID> --files ... --message ...`（系统代跑 `svn ci`，只提这几个文件）。
+  除这两条命令外执行器仍然不许碰任何 svn 子命令；`i18n-commit` 夹带非词条文件会被命令直接拒绝。
 - 因此**默认不执行 svn**：改动完成后只做登记
   `python -m app.cli commit <禅道ID> --no-svn --revision <git哈希或真实修订号> ...`；
   只有当该仓库明确允许本系统代跑 svn（无门禁、独立工作副本）时，才用 `branch` + 不带 `--no-svn` 的 `commit`。
+  除此之外系统只会代跑两种 svn 动作：`i18n-up` 的 `svn update` 与 `i18n-commit` 的 `svn commit`（仅白名单词条文件）。
 - 拿不到修订号时可以用 `--revision PENDING` 先登记为待审，但必须在 `--extra` 里写明「未提交，待主人提交」，
   禁止把 PENDING 当已完成。
 - 本系统同时是**分析结论的存放处**：子任务结束（= 这条 bug 结束）必须把根因、定位依据、影响面、
@@ -77,6 +87,8 @@ python -m app.cli doctor                   # 禅道通道分步诊断
   `git diff`、`git log`、`git status`。
 - 禁止：`git svn dcommit`、`git push`、`git svn fetch/clone`（同步 SVN→git 由主人跑）、
   `svn ci`、`svn copy`、在正式工作副本里改码。
+  例外只有一处：**词条文件**只能在 `svn_working_copy`（正式 SVN 工作副本）里改，
+  且只能用 `i18n-up` / `i18n-commit` 两条命令让系统代跑 `svn update/ci`（闸门 G12）。
 - 开工前必须验就绪：`git -C <镜像> rev-parse --verify refs/remotes/origin/trunk` 失败或 ref 为空
   → 不改码、不转去动正式副本 → `block` 写明「镜像未就绪」，继续下一条。
 - 登记形态区分两种，审查页靠它辨认改动到哪一步了：
@@ -101,17 +113,22 @@ python -m app.cli doctor                   # 禅道通道分步诊断
 6. 如果能高置信度确认修改点（空指针、参数错误、配置缺失、明显逻辑错误），直接修改
 7. 运行该库规定的编译 / 测试（可参考 `repos` 里的 `build_command` / `test_command`；本工程必须走 SSH 编译服务器），
    连续 2 次不过就转需方案
-8. **逐条核对提交闸门**（`AUTO_LOOP.md` §2 的 G1–G11：详情与截图看过、根因明确、改动范围与产品仓库一致、
+8. **改了词条就先单独收口（G12）**：`python -m app.cli i18n-up <禅道ID> --files <词条>`（改前 up，
+   报冲突就转 `block`）→ 在 `svn_working_copy` 那份正式副本里只改这些词条文件 →
+   `python -m app.cli i18n-commit <禅道ID> --files <同一批文件> --message "<说明>"` 立即单独提交。
+   词条不进镜像、不跟代码混进同一次 `git commit` / `svn ci`，也不允许攒到这条 bug 收尾之后
+9. **逐条核对提交闸门**（`AUTO_LOOP.md` §2 的 G1–G12：详情与截图看过、根因明确、改动范围与产品仓库一致、
    构建通过、状态矩阵自审、文案与 i18n 同步、目标是 bugfix 分支非 trunk、message 规范无敏感串、
-   未验证路径已标注、所需授权已取得、**远端写入留给主人**）
-9. 闸门全过 → **只在镜像里 `git commit`**（本地），取 `git rev-parse --short HEAD` 当登记的修订号；
-   任一条不过 → 不提交，走 `block` 说明卡在哪。**绝不 `git svn dcommit` / `git push` / `svn ci`**
-10. **写分析结论**（这是 bug 完成的必交付物，`REQUIRE_ANALYSIS=true` 时没分析 commit 会被直接拒绝）：
+   未验证路径已标注、所需授权已取得、**远端写入留给主人**、**多语言词条走直连通道**）
+10. 闸门全过 → **只在镜像里 `git commit`**（本地），取 `git rev-parse --short HEAD` 当登记的修订号；
+    任一条不过 → 不提交，走 `block` 说明卡在哪。**绝不 `git svn dcommit` / `git push` / `svn ci`**
+    （G12 的 `i18n-commit` 是唯一被系统代跑 svn 的入口，且只能提白名单词条文件）
+11. **写分析结论**（这是 bug 完成的必交付物，`REQUIRE_ANALYSIS=true` 时没分析 commit 会被直接拒绝）：
     把结果写成 JSON 文件（字段：`symptom` 现象、`root_cause` 根因、`evidence` 真实读过的文件:行/日志、
     `call_chain` 链路、`change_desc` 改动、`impact` 影响面与同构路径自审、`verify` 验证方式与实际结果、
-    `unverified` 未验证项、`rollback` 回退、`conclusion` 一句话结论、`gates` G1–G11 逐条结论），
-    规范见 `AUTO_LOOP.md` §2.1
-11. 回到本系统登记（一条命令同时写入分析与修订号：存 `analyses` → 写 `svn_revisions` →
+    `unverified` 未验证项、`rollback` 回退、`conclusion` 一句话结论、`gates` G1–G12 逐条结论），
+    词条那次 `r<号>` 要写进 `change_desc`，规范见 `AUTO_LOOP.md` §2.2
+12. 回到本系统登记（一条命令同时写入分析与修订号：存 `analyses` → 写 `svn_revisions` →
     置 `await_review` → 回写禅道评论）
 
 ```
@@ -175,19 +192,27 @@ python -m app.cli block <禅道ID> --question "..." --options "..." --advice "..
 
 6. 禁止调用任何禅道 resolve / close 接口，只允许写评论
 7. 禁止把 `.env` 里的账号密码写进代码、日志或提交说明
-8. 禁止 `svn commit` 到 trunk：`SVN_ALLOW_TRUNK_WRITE` 必须保持 `false`
+8. 禁止 `svn commit` 到 trunk：`SVN_ALLOW_TRUNK_WRITE` 必须保持 `false`（G12 的词条提交是代码层白名单例外，
+   只放行 `I18N_FILE_PATTERNS` 命中的文件，这个开关本身不许改）
 9. 一次只处理一个 bug 的代码改动，改动文件必须通过 `--files` 登记，供人工审查
 10. 禁止把 bug 提交到不属于它所在产品的仓库；仓库没绑定就问主人要地址，不要拿别的产品的工作副本凑
 11. 禁止绕过目标代码库自己的提交细则执行 svn（包括它规定的 SSH 通道、只读白名单、需显式同意的写操作）
-12. 禁止在提交闸门 G1–G11 未逐条核对通过的情况下提交；不过就 `block`，不「先提交再说」
+12. 禁止在提交闸门 G1–G12 未逐条核对通过的情况下提交；不过就 `block`，不「先提交再说」
 13. 禁止把 `--revision PENDING` 当已完成：它只是待人工提交的占位，必须在 `--extra` 与回报里写明
 14. 禁止没有分析结论就 `commit`（`REQUIRE_ANALYSIS=true` 时系统直接拒绝）；分析里禁止写没真正读过的文件路径
 15. **禁止任何远端写入**：`git svn dcommit`、`git push`、`svn ci`、`svn copy`、merge 到 trunk 一律由主人做。
-    即使 `.env` 里已有 SVN 账号密码也不许代跑；密码只给主人的回灌动作用
+    即使 `.env` 里已有 SVN 账号密码也不许代跑；密码只给主人的回灌动作用。
+    唯一例外：闸门 G12 的词条提交，且只能通过 `i18n-up` / `i18n-commit` 两条命令，不许手写 svn 命令
 16. 禁止在正式 SVN 工作副本里改码（执行器只在 `repos` 给出的镜像 `working_copy` 里改），
-    也禁止代主人跑 `git svn clone/fetch`
+    也禁止代主人跑 `git svn clone/fetch`；**例外只有白名单词条文件**，它们只能改在 `svn_working_copy` 里
 17. 禁止在镜像未就绪（`refs/remotes/origin/trunk` 不存在或为空）时开始改码或提交；如实 `block`
 18. 禁止把 `git:<哈希>` 与 `r<号>` 混为一谈或在回报里声称已进正式库：`git:<哈希>` 只代表本地草稿
+19. 禁止把多语言词条攒在镜像分支里等审查/回灌：词条必须「改前 `i18n-up`、改完立刻 `i18n-commit`」，
+    攒着必然与他人冲突，而这条通道本来就是为此开的
+20. 禁止用 `i18n-commit` 提交任何非白名单文件（代码、配置、脚本）：命令会直接拒绝，
+    也不许为了过校验去改 `.env` 的 `I18N_FILE_PATTERNS`
+21. 禁止把 `i18n-commit` 登记的 `r<号>` 当成「这条 bug 已完成」：它只是词条留痕，
+    bug 状态与代码草稿仍要走 §「单个 bug 处理流程」的第 10~12 步
 
 ## 停止条件
 
