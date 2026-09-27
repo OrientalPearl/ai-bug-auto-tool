@@ -648,6 +648,11 @@ def _dispatch_checklist(queues: list[dict[str, Any]]) -> list[dict[str, str]]:
         'ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git -c core.ignorecase=false ls-files --error-unmatch AGENTS.md"')
     add("info", "index 缺失只在 SSH（Linux）侧修：Windows 侧 ignorecase 遇上 109 组只差大小写的路径修不出完整工作树；"
                 "清单里排掉 .trae/，否则会写穿符号链接覆盖主人知识库。")
+    add("info", "两条线的 SSH 侧不是一套环境（实测）：3.0 那台 git 2.33.0 认 -c / -C；"
+                "2.3 那台是 git 1.7.1（RHEL6），两个都不认 —— 改用 cd <镜像> + git --git-dir=.git，"
+                "覆盖配置用 GIT_CONFIG=<写着 core.ignorecase=false 的文件>；"
+                "它的 OpenSSH 5.3 只认 RSA 密钥，ssh 要带 -i <identity_file> -o IdentitiesOnly=yes "
+                "-o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa（值见该库 CLAUDE.local.yaml）。")
     if settings.require_analysis:
         add("ok", "REQUIRE_ANALYSIS=true：没写分析结论的 commit 会被命令直接拒掉。")
     else:

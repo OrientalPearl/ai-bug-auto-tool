@@ -158,10 +158,12 @@
   另外 2.3 那台的 OpenSSH 是 5.3：只认 RSA 密钥，必须带
   `-i <identity_file> -o IdentitiesOnly=yes -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa`
   （`identity_file` 也在该库 `CLAUDE.local.yaml` 的 `ssh.*` 里，不在 `.ssh` 目录、不在网络盘上）。
-- 两条线**各有一份常驻层**（2026-09-27 实测：3.0 与 2.3 的镜像根都有 `CLAUDE.md` + `CLAUDE.local.yaml`，
-  `.trae` 都是指向各自知识根的符号链接：`.trae -> ../../.trae_local_3.0` / `../../.trae_local_2.3`）；
-  两族事实**禁止互相套用**（数据面 3.0=VPP、2.3=kernelModule；PHP 扩展面 3.0=5.6.26、2.3=5.5.20），
-  在 2.3 上别拿 3.0 的 registry 结论当依据，反之也一样。
+- 两条线**各有一份常驻层，也各有一个知识根，禁止跨族套用结论**（2026-09-27 实测：3.0 与 2.3 的镜像根都有
+  `CLAUDE.md` + `CLAUDE.local.yaml`，`.trae` 都是符号链接 —— `.trae -> ../../.trae_local_3.0` /
+  `../../.trae_local_2.3`；2.3 知识根实测 `registry/` 23 个文件、`doc/` 含 `ARCHITECTURE.md` 与
+  `CAPABILITY_MAP.md`、`agents/` 下 11 个 `AGENT.md`，覆盖面比 3.0 的 25 个小，别拿 3.0 的条目当 2.3 的事实）；
+  两族各自的差异：数据面 3.0=VPP、2.3=kernelModule；PHP 扩展面 3.0=`php-5.6.26/ext`、2.3=`php-5.5.20/ext`；
+  SSH 侧环境也不同（见上一条）。
 - 知识库根本体（实测 3.0 是镜像旁边的 `.trae_local_3.0`，**自己是一个独立 git 仓、当前在 `main` 上
   有 100+ 条未提交改动**）由主人维护：执行器只允许**通过镜像内的 `.trae/` 这条路径**读写它，
   不许绕到镜像外面去找那个目录、更不许在那个仓里 `git add/commit/push/checkout`。
