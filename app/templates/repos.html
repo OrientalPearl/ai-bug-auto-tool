@@ -19,8 +19,10 @@
     1. 先查 <code>product_repos</code> 表：该 bug 的 <b>产品</b> 有绑定且 enabled=1 → 用产品仓库；<br>
     2. 没有绑定 → 回落到 <code>.env</code> 的全局 <code>SVN_REPO_URL / SVN_TRUNK_PATH / SVN_BRANCH_ROOT</code>；<br>
     3. 全局也没配 → <code>branch</code> / <code>commit</code> 直接报错并给出 <code>bind-repo</code> 命令；<br>
-    4. 每个已绑定产品使用<b>独立工作副本</b>（留空时自动分配
-    <code>{{ global_repo.working_copy }}\p&lt;产品ID&gt;-&lt;仓库哈希&gt;</code>），避免多产品互相切库；<br>
+    4. 工作副本<b>默认</b>按产品独立（留空时自动分配
+    <code>{{ global_repo.working_copy }}\p&lt;产品ID&gt;-&lt;仓库哈希&gt;</code>）；但它是手工填的，
+    <b>两个产品填同一个目录（共用一份 git 镜像）时不再互相隔离</b>，必须并入同一条串行队列
+    —— 串行按<b>目录</b>划分，不按产品（见 <code>AUTO_LOOP.md</code> §5）；<br>
     5. 主干始终只读：AI 只能提交到 <code>&lt;仓库&gt;/&lt;分支根&gt;/{{ forms.new.branch_prefix }}&lt;禅道ID&gt;</code>。
   </p>
 </div>

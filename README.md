@@ -113,7 +113,9 @@ BRANCH_PREFIX=bugfix/zentao-               # 分支名 = 前缀 + 禅道ID（产
 1. 同步时把每条 bug 的 `product_id / product_name` 一起落库（禅道列表接口的 `product` 字段）；
 2. 「产品仓库」页（`/repos`）或 `bind-repo` 命令把 **产品 ID → 仓库根地址** 绑定，存 `product_repos` 表；
 3. `branch` / `commit` 只要给禅道 ID，就自动解析出该 bug 产品的仓库；
-4. 每个绑定产品有**独立工作副本**（默认 `svn_workspace/p<产品ID>-<仓库哈希>`），多产品切换不会互相污染；
+4. 工作副本**默认**按产品独立（留空 `working_copy` 时为 `svn_workspace/p<产品ID>-<仓库哈希>`），多产品切换不会互相污染；
+   但 `working_copy` 可以手工指定，**两个产品填同一个目录（例如共用一份 git-svn 镜像）时它们就不再隔离**，
+   必须并入同一条串行队列 —— 串行队列的划分单位是镜像目录，不是产品 ID（见 `AUTO_LOOP.md` §5）；
 5. 产品没绑定 → 回落 `.env` 的 `SVN_REPO_URL`；连它也为空 → 命令直接报错并打印该执行的 `bind-repo` 命令，
    **绝不猜仓库**。
 

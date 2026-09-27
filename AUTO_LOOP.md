@@ -21,7 +21,8 @@
 ```
 读 AGENTS.md 与 AUTO_LOOP.md，无人值守处理禅道 bug，按 AUTO_LOOP.md 的【提交闸门 G1–G11】判定可否提交：
 1) python -m app.cli sync --details -1     （同步 + 全量抓截图/备注/附件）
-2) python -m app.cli tasks --limit 5       （按 product_id 分组，组内严格串行、组间可并行）
+2) python -m app.cli tasks --limit 5       （按镜像 working_copy 分组：共用同一镜像的产品并入同一条串行队列，
+   只有镜像互不相同的组之间才并行）
 3) 每条 bug 起一个独立子任务，用 AUTO_LOOP.md §3.2 模板，只替换禅道ID
 4) 落码位置是 git-svn 镜像（AUTO_LOOP.md §1.5）；镜像未就绪就不许改码，也不许动正式 SVN 工作副本
 5) 子任务只做：验镜像就绪 → status(看图看备注) → claim → 镜像里开 bugfix/zentao-<ID> 定位改码
@@ -76,7 +77,8 @@
 - 镜像与正式工作副本是**两份独立副本**，改一份不会同步到另一份；最终回灌靠主人 `git svn dcommit`
   或 `git diff` 出 patch 打到正式副本，本系统不代做。
 - 两边共用同一个 `.git` 目录（跨 Samba）时**只能有一个操作方**，git 的文件锁在 SMB 上不可靠；
-  所以同产品串行处理是硬约束（见 §5），且 Windows 侧与编译服务器侧不得同时动镜像。
+  所以「同一镜像串行」是硬约束，且划分单位是镜像而不是产品 —— 两个产品绑定到同一个镜像时，
+  它们必须共用一条串行队列（见 §5）。Windows 侧与编译服务器侧同样不得同时动镜像。
 - 编译与实测仍只能在 SSH 编译服务器上做（闸门 G4 不变），镜像目录在 Windows 本地编译不了。
 - 绑定关系仍要落进本系统，G3 才有判据（真实地址与镜像路径存 `product_repos`，不写进文档）：
   `python -m app.cli bind-repo <产品ID> "<SVN仓库地址>" --name "<产品名>" --working-copy <镜像目录>`
@@ -152,7 +154,8 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
 角色：你是调度器，不亲自改代码。工作目录 <项目目录>。
 循环直到退出条件满足：
   a. python -m app.cli tasks --limit 5；返回 0 条则跳到「收工」
-  b. 按 product_id 分组；同一产品严格串行，不同产品可以并行开子任务
+  b. 按镜像分组（python -m app.cli repos 看每个产品的 working_copy）：共用同一 working_copy 的产品
+     合并成一条串行队列，严格做完一条才动下一条；只有 working_copy 互不相同的组之间才并行开子任务
   c. 每条 bug 起一个子任务，用 §3.2 模板，只替换 <禅道ID>
   d. 收集子任务返回的 JSON，按 zentao_id 记账；一条失败不影响下一条
   e. 回到 a，不等待我确认
@@ -235,19 +238,38 @@ python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.
 ## 5. 并行的唯一硬约束
 
 ```
-同产品：并发度 = 1（同一份工作副本/同一个 git 镜像，一条提交完才能下一条动分支）
-跨产品：可以并行（各产品独立仓库与工作副本，互不影响）
+同一镜像 / 工作副本：并发度 = 1（不管它挂了几个产品，一条提交完才能下一条动分支）
+不同镜像 / 工作副本：可以并行（每个镜像各自一条串行队列）
 ```
 
-用 §1.5 的 git 镜像时这条约束更硬，原因有两个：一份工作树同一时刻只能 checkout 一个分支；
-镜像的 `.git` 跨 Samba 共享时 git 的文件锁不可靠，**Windows 侧与编译服务器侧绝不能同时操作同一个镜像**。
-所以：动镜像前先确认没有另一侧在跑 `git` / `git svn fetch`。
+串行队列的划分单位是 **`working_copy`（镜像目录），不是产品 ID**。两个产品只要共用同一份镜像，
+就必须并入同一条串行队列：一份工作树同一时刻只能 checkout 一个分支，前一条 bug 的
+`git checkout -b` 会把另一条正在改的工作树一起切走，两个产品的改动会互相污染、
+`git add` 也会串味。判定方法：`python -m app.cli repos`，看 `working_copy` 是否相同。
 
-想加速：按产品开多个主对话，都用 §3.1 但加一句「只处理 product_id=<X> 的 bug」，取队列后自行过滤：
+用 §1.5 的 git 镜像时这条约束还要往外扩一层：镜像的 `.git` 跨 Samba 共享时 git 的文件锁不可靠，
+**Windows 侧与编译服务器侧绝不能同时操作同一个镜像**。所以：动镜像前先确认没有另一侧在跑
+`git` / `git svn fetch`。
+
+想加速，先按镜像归组，再决定开几个主对话：
 
 ```
-python -m app.cli tasks --limit 20      # 只挑 product_id 等于本产品的那几条
+python -m app.cli repos          # 逐产品看实际生效的 working_copy
 ```
+
+- `working_copy` **相同**的那组产品 → 只能交给**一个**主对话串行做，下达语里写
+  「只处理 product_id ∈ {<该组全部产品ID>} 的 bug」，取队列后自行过滤：
+
+  ```
+  python -m app.cli tasks --limit 20      # 只挑 product_id 属于该组的那几条
+  ```
+
+- `working_copy` **不同**的产品 → 每个镜像各开一个主对话，都用 §3.1，但都要写死自己那组产品 ID，
+  不允许跨组接手（否则又会撞到同一镜像上的另一条队列）。
+
+要让共用的两个产品真正并行，只有一个办法：给其中一个单独 clone 一份镜像，再
+`bind-repo <产品ID> <仓库根地址> --working-copy <新镜像目录>` 把它挪过去。在此之前，
+「跨产品可并行」只对**镜像不同**的产品成立。
 
 ## 6. 可选方式（托管 svn）的额外前置
 
@@ -283,6 +305,7 @@ Web /repos    各产品用哪个仓库、工作副本在哪、build/test 命令
 | `commit` 报「提交前必须把分析结果写入系统」 | 子任务没交分析结论。补 `analyze <ID> --kind commit --analysis-file a.json`（字段见 §2.1）再 commit；确实写不出来就该转 `block` |
 | 镜像 `refs/remotes/origin/trunk` 不存在或为空（clone/fetch 未完成） | 执行器**不许改码**，也不许转去动正式工作副本；`block` 写明「镜像未就绪」，等主人把 `git svn clone/fetch` 跑完 |
 | 本地 git 分支攒了一堆 commit 没进正式库 | 正常状态（G11 设计如此）。由主人 `git -C <镜像> diff origin/trunk..<分支>` 审，通过后自行 `git svn dcommit` 或出 patch 打到正式副本，再回填真实修订号 |
+| 工作树/分支基线莫名变化，或 `git status` 里冒出**别的产品/别的禅道 ID** 的文件 | 两个产品共用了同一份镜像却被并行处理（违反 §5）：立刻停掉其中一条队列，`git -C <镜像> status` 核对，被串味的分支 `git reset --hard <基线>` 重做；要让它们真并行只能给其中一个另开一份镜像 |
 | 某条被 AI 反复处理不满意 | `/review` 填原因「打回」→ `rejected`，自动回队列且优先级提升 |
 | 某条想先搁置 | 让它 `need_solution`，或直接在库里改状态，它就不在队列里 |
 | PENDING 一直没人提交 | 它已在 `await_review`，`report` 与 `/review` 都能看到；不提交就不会变 `merged` |
