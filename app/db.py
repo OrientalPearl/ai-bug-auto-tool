@@ -746,19 +746,42 @@ REPO_COLUMNS = {
 }
 
 
+def _repo_enabled(value: Any) -> int:
+    """Normalize the enabled flag coming from CLI ints or HTML form strings."""
+    return 0 if str(value).strip().lower() in ("", "0", "false", "off", "none") else 1
+
+
 def bind_product_repo(product_id: int, fields: dict[str, Any]) -> dict:
-    """Create or update the repository bound to a Zentao product."""
-    if not str(fields.get("repo_url") or "").strip():
-        raise ValueError("绑定产品代码库必须提供 repo_url")
+    """Create or update the repository bound to a Zentao product.
+
+    Only the keys present in `fields` are written. A partial dict must never blank the
+    columns the caller omitted: that used to wipe product_name and silently flip
+    enabled to 0, because every missing key defaulted to "".
+    """
+    unknown = sorted(set(fields) - REPO_COLUMNS)
+    if unknown:
+        raise ValueError(f"未知字段：{', '.join(unknown)}")
+    if "repo_url" in fields and not str(fields.get("repo_url") or "").strip():
+        raise ValueError("绑定产品代码库必须提供非空 repo_url")
+
     ts = now_str()
-    payload = {key: fields.get(key, "") for key in REPO_COLUMNS}
-    payload["enabled"] = 1 if payload.get("enabled", 1) in (1, True, "1", "true", "on", None) else 0
-    payload["product_id"] = int(product_id)
+    pid = int(product_id)
+    # A None value means "not provided": writing it would hit a NOT NULL column, and a
+    # caller copying an existing row may well carry None for columns it does not know.
+    updates = {key: fields[key] for key in REPO_COLUMNS
+               if key in fields and fields[key] is not None}
+    if "enabled" in updates:
+        updates["enabled"] = _repo_enabled(updates["enabled"])
+
     with tx() as conn:
         exists = conn.execute(
-            "SELECT product_id FROM product_repos WHERE product_id = :product_id", payload
+            "SELECT product_id FROM product_repos WHERE product_id = ?", (pid,)
         ).fetchone()
         if exists is None:
+            if not str(updates.get("repo_url") or "").strip():
+                raise ValueError("新建绑定必须提供 repo_url")
+            row = {key: updates.get(key, "") for key in REPO_COLUMNS}
+            row["enabled"] = updates.get("enabled", 1)
             conn.execute(
                 """
                 INSERT INTO product_repos (product_id, product_name, repo_url, trunk_path,
@@ -769,15 +792,15 @@ def bind_product_repo(product_id: int, fields: dict[str, Any]) -> dict:
                         :working_copy, :branch_prefix, :build_command, :test_command,
                         :note, :enabled, :ts, :ts)
                 """,
-                {**payload, "ts": ts},
+                {**row, "product_id": pid, "ts": ts},
             )
-        else:
-            sets = ", ".join(f"{key} = :{key}" for key in REPO_COLUMNS)
+        elif updates:
+            sets = ", ".join(f"{key} = :{key}" for key in updates)
             conn.execute(
-                f"UPDATE product_repos SET {sets}, updated_at = :ts WHERE product_id = :product_id",
-                {**payload, "ts": ts},
+                f"UPDATE product_repos SET {sets}, updated_at = :ts WHERE product_id = :pid",
+                {**updates, "ts": ts, "pid": pid},
             )
-    return get_product_repo(product_id) or {}
+    return get_product_repo(pid) or {}
 
 
 def get_product_repo(product_id: int | None) -> dict | None:

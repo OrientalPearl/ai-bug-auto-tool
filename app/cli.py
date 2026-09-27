@@ -396,25 +396,49 @@ def cmd_bind_repo(args: argparse.Namespace) -> None:
         _out({"ok": True, "action": "bind-repo", "unbind": args.product_id,
               "note": "该产品将回落到全局 SVN_REPO_URL（若为空则 branch/commit 会被拒绝）"})
         return
-    name = args.name
+    current = db.get_product_repo(args.product_id) or {}
+    # column -> parser dest; an omitted flag keeps the stored value instead of blanking it.
+    fields_arg = (("trunk_path", "trunk_path"), ("branch_root", "branch_root"),
+                  ("working_copy", "working_copy"), ("branch_prefix", "branch_prefix"),
+                  ("build_command", "build"), ("test_command", "test"),
+                  ("note", "note"), ("product_name", "name"))
+
+    name = args.name if args.name is not None else current.get("product_name", "")
     if not name:
         row = db.query_one("SELECT product_name FROM bugs WHERE product_id = ? "
                            "AND product_name IS NOT NULL AND product_name != '' LIMIT 1",
                            (args.product_id,))
         name = (row or {}).get("product_name", "")
-    repo = db.bind_product_repo(args.product_id, {
+    if args.disabled:
+        enabled = 0
+    elif args.enable:
+        enabled = 1
+    else:
+        # Keep the stored flag: 0 is a valid state and must not collapse to 1.
+        stored = current.get("enabled")
+        enabled = 1 if stored is None or stored == "" else int(stored)
+
+    payload: dict[str, Any] = {
         "product_name": name or "",
-        "repo_url": args.repo_url or "",
-        "trunk_path": args.trunk_path,
-        "branch_root": args.branch_root,
-        "working_copy": args.working_copy,
-        "branch_prefix": args.branch_prefix,
-        "build_command": args.build,
-        "test_command": args.test,
-        "note": args.note,
-        "enabled": 0 if args.disabled else 1,
-    })
+        "repo_url": args.repo_url or current.get("repo_url") or "",
+        "enabled": enabled,
+    }
+    kept: list[str] = []
+    settings = get_settings()
+    new_defaults = {"trunk_path": settings.svn_trunk_path,
+                    "branch_root": settings.svn_branch_root}
+    for column, dest in fields_arg:
+        value = getattr(args, dest)
+        if value is None:
+            # Omitted: keep what is stored, or fall back to the global default for a
+            # brand-new binding (otherwise trunk_path would land as "").
+            value = current.get(column) or new_defaults.get(column, "")
+            kept.append(column)
+        payload[column] = value
+
+    repo = db.bind_product_repo(args.product_id, payload)
     _out({"ok": True, "action": "bind-repo", "repo": repo,
+          "kept_columns": kept,
           "trunk": svn_client.resolve_target(product_id=args.product_id).trunk_url()})
 
 
@@ -642,15 +666,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("bind-repo", help="把一个禅道产品绑定到它自己的 SVN 仓库")
     p.add_argument("product_id", type=int)
     p.add_argument("repo_url", nargs="?", default="", help="仓库根地址（不含 /trunk）")
-    p.add_argument("--name", default="", help="产品名，留空则自动从库里取")
-    p.add_argument("--trunk-path", default="/trunk")
-    p.add_argument("--branch-root", default="/branches")
-    p.add_argument("--working-copy", default="", help="留空则自动用 svn_workspace/p<产品ID>-<仓库哈希>")
-    p.add_argument("--branch-prefix", default="", help="留空则用 BRANCH_PREFIX")
-    p.add_argument("--build", default="", help="该库的编译命令，供 AI 修复后执行")
-    p.add_argument("--test", default="", help="该库的测试命令，供 AI 修复后执行")
-    p.add_argument("--note", default="", help="备注：代码结构、注意事项等，AI 会读")
+    p.add_argument("--name", default=None, help="产品名，留空则沿用已存值或从库里取")
+    p.add_argument("--trunk-path", default=None, help="留空则沿用已存值（新绑定为 /trunk）")
+    p.add_argument("--branch-root", default=None, help="留空则沿用已存值（新绑定为 /branches）")
+    p.add_argument("--working-copy", default=None,
+                   help="留空则沿用已存值；新绑定自动用 svn_workspace/p<产品ID>-<仓库哈希>")
+    p.add_argument("--branch-prefix", default=None, help="留空则沿用已存值")
+    p.add_argument("--build", default=None, help="该库的编译命令，供 AI 修复后执行")
+    p.add_argument("--test", default=None, help="该库的测试命令，供 AI 修复后执行")
+    p.add_argument("--note", default=None, help="备注：代码结构、注意事项等，AI 会读")
     p.add_argument("--disabled", action="store_true", help="登记但先停用该绑定")
+    p.add_argument("--enable", action="store_true", help="显式启用该绑定（不带则保持现状）")
     p.add_argument("--unbind", action="store_true", help="删除该产品的绑定")
     p.set_defaults(func=cmd_bind_repo)
 
