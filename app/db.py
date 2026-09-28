@@ -517,7 +517,8 @@ def fetch_task_queue(limit: int = 5) -> list[dict]:
       3. plain pending bugs
       4. stale ``fixing`` claims (a run killed by a model rate limit would
          otherwise strand them forever) -- see ``STALE_CLAIM_MINUTES``
-    Sorted by pri asc then severity desc.
+    Sorted by pri asc then severity desc. A bug that already reached a terminal
+    state is never queued again just because some old blocker got an answer.
     """
     stale = int(get_settings().stale_claim_minutes)
     stale_sql = ""
@@ -543,8 +544,9 @@ def fetch_task_queue(limit: int = 5) -> list[dict]:
                  ELSE 2 END AS queue_rank
           FROM bugs b
          WHERE b.status IN ('pending', 'rejected')
-            OR EXISTS (SELECT 1 FROM need_solution n
-                        WHERE n.bug_id = b.id AND n.status = 'replied')
+            OR (b.status NOT IN ('closed', 'merged', 'await_review')
+                AND EXISTS (SELECT 1 FROM need_solution n
+                            WHERE n.bug_id = b.id AND n.status = 'replied'))
 {stale_sql}         ORDER BY queue_rank ASC, b.pri ASC, b.severity DESC, b.id ASC
          LIMIT ?
     """
@@ -640,6 +642,23 @@ def close_need(need_id: int) -> dict | None:
     ts = now_str()
     execute("UPDATE need_solution SET status = 'done', done_at = ? WHERE id = ?", (ts, need_id))
     return query_one("SELECT * FROM need_solution WHERE id = ?", (need_id,))
+
+
+def close_open_needs(bug_id: int) -> int:
+    """Settle every unanswered/replied blocker of one bug; returns how many.
+
+    Called when a bug is closed by hand: the owner's verdict was "不修了", so the
+    question must not keep sitting on the 需方案 page, and a ``replied`` blocker is
+    itself a queue entry point (see ``fetch_task_queue``).
+    """
+    ts = now_str()
+    with tx() as conn:
+        cur = conn.execute(
+            "UPDATE need_solution SET status = 'done', done_at = ?"
+            " WHERE bug_id = ? AND status IN ('awaiting', 'replied')",
+            (ts, int(bug_id)),
+        )
+        return int(cur.rowcount or 0)
 
 
 # ---------------------------------------------------------------------------

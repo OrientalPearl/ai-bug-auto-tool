@@ -193,12 +193,32 @@
         </form>`;
     }
 
-    if (b.status === "merged") {
-      html += `
+    // Closing is the owner's call, and the answer to a blocker is allowed to be
+    // "不修了" -- 无法重现 / 不是缺陷 / 重复单 / 禅道已关闭. A close never touches
+    // trunk and never deletes a draft branch; 重开入队列 stays available after it.
+    const CLOSEABLE = ["merged", "need_solution", "pending"];
+    const CLOSE_RESOLUTIONS = ["无法重现", "不是缺陷", "重复单", "禅道已关闭", "其他"];
+    if (CLOSEABLE.indexOf(b.status) >= 0) {
+      if (b.status === "merged") {
+        html += `
         <form method="post" action="/bug/${b.id}/close" class="row-actions">
           <button class="btn" type="submit">标记已结案</button>
           <span class="hint">仅更新本地状态并在禅道留言，禅道结案状态由主人手动确认。</span>
         </form>`;
+      } else {
+        const opts = CLOSE_RESOLUTIONS.map(r => `<option value="${esc(r)}">${esc(r)}</option>`).join("");
+        html += `
+        <h4>这条不修了？直接结案</h4>
+        <form method="post" action="/bug/${b.id}/close">
+          <div class="row-actions">
+            <select name="resolution" style="width:auto">${opts}</select>
+            <input type="text" name="reason" placeholder="补充说明（可空，进留痕与禅道评论）" style="flex:1">
+            <button class="btn btn-reject" type="submit"
+              data-ask="确认结案？这条不再下发给 AI，未答复的阻塞项会一并标记为已处理${b.branch ? `；分支 ${esc(b.branch)} 上的草稿提交保留不动` : ""}。trunk 不受影响，禅道状态由你手动改；之后想修还能「重开补修」。">结案（不修了）</button>
+          </div>
+          <span class="hint">常见情形：复现不出来、根本不是缺陷、跟别的单子重复、禅道那边已经关掉。</span>
+        </form>`;
+      }
     }
     if (b.status === "merged" || b.status === "closed") {
       const real = (b.revisions || []).map(r => r.revision).filter(v => /^\d+$/.test(String(v)));

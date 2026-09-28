@@ -62,6 +62,23 @@
       <div class="row-actions"><button class="btn" type="submit">标记已处理完成</button></div>
     </form>
     {% endif %}
+
+    {# The answer to a blocker is allowed to be "不修了": the owner decides it is
+       not reproducible, not a defect, or already closed upstream. Closing never
+       touches trunk and never deletes a draft branch. #}
+    {% if n.status != 'done' and n.bug_status in closeable_statuses %}
+    <form method="post" action="{{ url_for('bug_close', bug_id=n.bug_id) }}"
+          data-confirm="确认结案？这条不再下发给 AI，本阻塞项会标记为已处理{% if n.branch %}；分支 {{ n.branch }} 上的草稿提交保留不动{% endif %}。trunk 不受影响，禅道状态由你手动改；之后想修还能「重开补修」。">
+      <div class="row-actions">
+        <select name="resolution" style="width:auto">
+          {% for r in close_resolutions %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+        </select>
+        <input type="text" name="reason" placeholder="补充说明（可空，进留痕与禅道评论）" style="flex:1">
+        <button class="btn btn-reject" type="submit">结案（不修了）</button>
+        <span class="hint">答复不必是方案：复现不出来、不是缺陷、禅道那边已关闭，都算一个结论。</span>
+      </div>
+    </form>
+    {% endif %}
   </div>
   {% endfor %}
 </div>

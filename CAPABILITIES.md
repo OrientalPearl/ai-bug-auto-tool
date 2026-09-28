@@ -15,7 +15,8 @@
 | 交接文件自回收 | 执行器把长文本写进 JSON 交给 `--analysis-file` / `--block-file`，命令**入库成功后由本系统删掉那份文件**（返回 `handoff_removed`），跑完再统一 `tmp-clean` 清场。删除动作是无人值守最常弹授权、最容易冻住整轮的一步，这条把它从执行器的动作表里去掉；分析没入库的那份 `a_<ID>.json` 一律留着只报告 | `--keep-handoff` / `tmp-clean` / `report` 的 `handoff_leftovers` |
 | 禅道回填 | 提交后自动评论（分支 + 修订号 + 待审查）、阻塞时评论「AI 阻塞」；**不提供** resolve/close | `commit` / `block` / `comment` |
 | 分析结论落库 | 每条 bug 收尾必须写回结构化分析（现象/根因/定位依据/链路/改动/影响面/验证/未验证/回退/结论 + 闸门逐条），`REQUIRE_ANALYSIS` 让无分析的 commit 直接失败 | `analyze` / `commit --analysis-file` / `/review` |
-| 任务编排 | SQLite 队列 + 7 态状态机；优先级 = 已答复 > 已打回 > 待处理，再 pri 升序 / severity 降序 | `tasks` / `claim` / 看板 |
+| 任务编排 | SQLite 队列 + 7 态状态机；优先级 = 已答复 > 已打回 > 待处理，再 pri 升序 / severity 降序；已是终态（`closed`/`merged`）或待审查的条目不会因历史阻塞项有答复而被重新排队 | `tasks` / `claim` / 看板 |
+| 结论式结案（人工） | 需方案的答复允许**不是方案**：`/need` 或详情弹窗选「无法重现 / 不是缺陷 / 重复单 / 禅道已关闭」直接结案，条目停止下发、阻塞项一并收口、留一条 `author=owner` 的人工分析；不删草稿分支、不动 trunk，之后仍可重开补修。执行器无此能力（G11） | `/bug/<id>/close` |
 | 无人值守连跑 | 一条 bug 跑完自动取下一条、卡点回填后不阻塞、断线可续跑；下达「提交闸门 G1–G12」清单 | `AUTO_LOOP.md` |
 | 代码库知识体系优先 | 目标库把 `AGENTS.md` + `.trae/`（`agents/` 目录级知识、`doc/ARCHITECTURE.md`、`skills/` 流程）提交在 SVN 里，随 git-svn 镜像一起落下来；执行器定位前必须按其入口下钻，得出可复用结论时按同规则追加回目录级 `AGENT.md` | `AUTO_LOOP.md` §1.6 |
 | 一键下达 | Web 页现场从 `AUTO_LOOP.md` 抽取提示词（永不与规则分叉）+ 开跑前检查清单 + 按落码目录归组的串行队列；可勾选产品生成已填好产品 ID / 目录 / 串行要求的下达语，每段一个复制按钮 | `/dispatch` |
@@ -92,7 +93,7 @@
 | POST | `/bug/<bug_id>/reopen` | **重开已合入/已结案的条目**：状态回到 `rejected` 重新入队，上一轮的结论、改动文件与修订号作为 `prior_fix` 随任务下发给 AI；已登记的 r 号与草稿分支都保留，trunk 不回退 | `reject_reason`（必填，写清哪里不完全） |
 | POST | `/bug/<bug_id>/reject-rollback` | 拒绝该修改：删除这条的草稿分支（提交先存进 `refs/rejected/<分支>` 以便取回）→ `closed` + 留痕 + 禅道评论；镜像 HEAD 正停在该分支时拒绝执行且不改状态 | `reject_reason`（必填） |
 | POST | `/bug/<bug_id>/svn-push` | 主人一键把该条的 git 草稿正式推入 SVN（`mode=dry` 只预检不写入）；成功登记真实 r 号 → `merged`，失败只追加人工留痕、状态与 `git:<哈希>` 记录不动。trunk 已被他人改动时预检会给出「谁改的 r 号」与可无损对齐的文件清单，`align=1`（弹窗勾选）对这些文件做三方合并后再推，重叠或增删仍整笔拒绝 | `message`（正式 svn log）、`mode`（`push`/`dry`）、`align`（可选 `1`） |
-| POST | `/bug/<bug_id>/close` | 人工结案 → `closed` + 禅道评论 | — |
+| POST | `/bug/<bug_id>/close` | 人工结案 → `closed`。两种收尾：`merged` 是入 trunk 后的登记；`need_solution` / `pending` 是**答复=结论**（无法重现 / 不是缺陷 / 重复单 / 禅道已关闭 / 其他），这条不再下发给 AI、未答复的阻塞项一并标记已处理、追加一条 `author=owner` 的人工留痕（写明「未验证：主人判定不修」）、禅道留言。不删草稿分支、不动 trunk，事后仍可「重开补修」；`fixing` / `await_review` / `rejected` 拒绝直接结案并提示该走哪条 | `resolution`、`reason`（可空） |
 | POST | `/bug/<bug_id>/detail` | 抓单条截图/备注/附件 | — |
 | GET | `/files/<zentao_id>/<filename>` | 输出已下载的禅道附件（图片/文件） | — |
 | GET | `/svn` | 按 bug 分组的提交记录 | — |
@@ -135,6 +136,8 @@ pending ──claim/branch──> fixing ──commit──> await_review ──
    │                        block                 reject
    └────────────────────────┴──── need_solution ──┘（打回后重回队列）
                        need_solution ──人工答复──> replied ──> 优先处理
+       pending / need_solution ──人工判定「不修了」（无法重现/不是缺陷/重复单/禅道已关闭）──> closed
+                       # 这条边不产生代码改动：草稿分支与已有提交原样保留，仍可重开补修
 ```
 
 `bugs.status` 枚举：`pending / fixing / need_solution / await_review / rejected / merged / closed`。

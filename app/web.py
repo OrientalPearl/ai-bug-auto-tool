@@ -37,6 +37,15 @@ KANBAN_BANDS = (
     ("done", "已收尾", "已合入 / 已结案，只作回溯", ("merged", "closed")),
 )
 
+# Human-only closing. An answer to a blocker is allowed to be "不修了": the owner
+# decides it cannot be reproduced, was never a defect, or has already been closed
+# upstream. Closing only records that verdict -- it never rolls anything back and
+# never touches a draft branch, so there is still a way back (重开补修).
+CLOSE_RESOLUTIONS = ("无法重现", "不是缺陷", "重复单", "禅道已关闭", "其他")
+CLOSEABLE_STATUSES = ("pending", "need_solution", "merged")
+# A merged bug is closed after the trunk merge; that is its own verdict.
+CLOSE_MERGED_RESOLUTION = "已修复合入"
+
 # AUTO_LOOP.md sections the dispatch page can build a scoped prompt from.
 DISPATCH_BASES = {
     "0": "§0 最短下达语",
@@ -65,6 +74,8 @@ def create_app() -> Flask:
         counts = db.counts_by_status()
         return {
             "status_labels": STATUS_LABELS,
+            "close_resolutions": CLOSE_RESOLUTIONS,
+            "closeable_statuses": CLOSEABLE_STATUSES,
             "settings_view": settings.describe(),
             "zentao_ready": settings.zentao_ready,
             "svn_ready": settings.svn_ready,
@@ -496,17 +507,60 @@ def create_app() -> Flask:
 
     @app.route("/bug/<int:bug_id>/close", methods=["POST"])
     def bug_close(bug_id: int):
-        """Human-only step: mark locally closed after the trunk merge."""
+        """Human-only step: end this bug locally, with or without a fix.
+
+        Two reasons to be here. A ``merged`` bug is closed after the trunk merge,
+        which is what the button used to mean. A bug parked in ``need_solution``
+        (or not started yet) is closed because the owner answered the blocker with
+        a verdict instead of a plan -- 无法重现 / 不是缺陷 / 重复单 / 禅道已关闭.
+        Nothing is undone: whatever the AI already did stays on the draft branch,
+        and 重开补修 remains available afterwards.
+        """
         bug = db.get_bug(bug_id)
         if bug is None:
             abort(404)
-        db.set_bug_status(bug_id, "closed")
-        result = sync.push_comment(
-            bug["zentao_id"],
-            "已合入 trunk 并完成人工确认，本地系统标记为已结案（禅道状态请主人手动更新）。",
-        )
+        if bug["status"] not in CLOSEABLE_STATUSES:
+            flash(
+                f"bug #{bug['zentao_id']} 当前是「{STATUS_LABELS.get(bug['status'], bug['status'])}」，"
+                "不能直接结案：待审查/已打回请走「拒绝并回滚」（它会留痕并删掉草稿分支），"
+                "修复中请等这一轮跑完。",
+                "error",
+            )
+            return redirect(request.referrer or url_for("kanban"))
+
+        form = _form()
+        resolution = form.get("resolution", "")
+        if resolution not in CLOSE_RESOLUTIONS:
+            resolution = ""
+        reason = form.get("reason", "")
+        was_merged = bug["status"] == "merged"
+        if not resolution:
+            resolution = CLOSE_MERGED_RESOLUTION if was_merged else CLOSE_RESOLUTIONS[-1]
+
+        db.set_bug_status(bug["id"], "closed")
+        # A blocker nobody has to answer any more: sweep the open questions so the
+        # 需方案 page and the AI queue stop treating a closed bug as work in progress.
+        closed_needs = db.close_open_needs(bug["id"])
+        if not was_merged:
+            db.add_analysis(
+                bug["id"],
+                {
+                    "conclusion": f"人工结案（{resolution}）：{reason}".rstrip("："),
+                    "unverified": "未验证：本轮由主人直接判定不修，未改代码，也未做复现或回归。",
+                },
+                kind="manual",
+                author="owner",
+            )
+        if was_merged:
+            text = "已合入 trunk 并完成人工确认，本地系统标记为已结案（禅道状态请主人手动更新）。"
+        else:
+            text = f"本地结案：{resolution}" + (f" —— {reason}" if reason else "")
+            text += "。未修改代码，AI 不再处理这条；禅道状态请主人手动更新。"
+        result = sync.push_comment(bug["zentao_id"], text)
         flash(
-            f"bug #{bug['zentao_id']} 已标记为已结案。"
+            f"bug #{bug['zentao_id']} 已标记为已结案（{resolution}）"
+            + (f"，同时关闭 {closed_needs} 条待答复的阻塞项" if closed_needs else "")
+            + ("。" if was_merged or not bug["branch"] else f"；分支 {bug['branch']} 上的草稿提交保留不动。")
             + ("" if result["ok"] else f" 禅道评论未写入：{result['detail'][:120]}"),
             "ok",
         )
