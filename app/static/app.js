@@ -156,9 +156,13 @@
           <textarea name="message" rows="3" style="width:100%">${esc(pushMessage(b))}</textarea>
           <div class="row-actions">
             <button class="btn" type="submit" name="mode" value="dry"
-              data-ask="预检：核对镜像、草稿基线，并逐个比对 trunk 上这些文件是否已被别人改动。不写入任何东西。">预检（不写入）</button>
+              data-ask="预检：核对镜像、草稿基线，并逐个比对 trunk 上这些文件是否已被别人改动；被改过时会算能否无损对齐。不写入任何东西。">预检（不写入）</button>
             <button class="btn btn-pass" type="submit" name="mode" value="push"
               data-ask="确认正式推入 SVN？上方文字会原样作为 svn ci 的提交说明进入 trunk；只有真进了库才记为已合入。失败只留人工记录，状态仍是待审查，git 草稿记录不动。">正式推入 SVN</button>
+            <label class="hint" style="margin-left:8px">
+              <input type="checkbox" name="align" value="1">
+              自动按 trunk 对齐（trunk 已变动的文件与本改动不重叠时，以 trunk 现内容为底合并后再推）
+            </label>
             <span class="hint">分支 <code>${esc(b.branch || "-")}</code> 上相对 trunk 的<b>全部</b>草稿提交会合并成一次 svn 提交；trunk 已被他人改动的文件不会被覆盖。</span>
           </div>
         </form>`;
@@ -405,7 +409,14 @@
     if (drafts.length) {
       text += `\n一起推入的草稿提交（${drafts.length} 个）：` + drafts.join(", ");
     }
-    return text.slice(0, 1200);
+    const aligned = Array.isArray(data.aligned) ? data.aligned : [];
+    if (aligned.length) {
+      text += `\n已按 trunk 对齐后再推的文件（${aligned.length} 个）：` + aligned.join(", ");
+    }
+    if (data.ok === false && data.alignable) {
+      text += "\n这些文件与 trunk 上的改动不重叠：勾上「自动按 trunk 对齐」再推即可，他人改动会原样保留。";
+    }
+    return text.slice(0, 1600);
   }
 
   document.addEventListener("submit", function (event) {

@@ -258,6 +258,9 @@ def create_app() -> Flask:
         payload = _form()
         message = str(payload.get("message") or "").strip()
         dry = str(payload.get("mode") or "push") == "dry"
+        # Only the owner's tick turns trunk alignment on; without it a moved trunk
+        # keeps refusing the push outright.
+        align = str(payload.get("align") or "") in ("1", "on", "true")
         inline = request.headers.get("X-Requested-With") == "fetch-dialog"
 
         def reply(data: dict[str, Any], level: str, text: str):
@@ -273,7 +276,7 @@ def create_app() -> Flask:
             return reply({"ok": False, "summary": text, "detail": text}, "error", text)
 
         try:
-            prom = svn_promote.promote(bug, message, dry_run=dry)
+            prom = svn_promote.promote(bug, message, dry_run=dry, merge_trunk=align)
         except svn_promote.PromoteError as exc:
             text = f"bug #{bug['zentao_id']} 推送被拒绝：{exc}"
             return reply({"ok": False, "summary": text, "detail": text}, "error", text)
@@ -282,14 +285,22 @@ def create_app() -> Flask:
         # Several draft commits travel as one push: the diff is taken against the
         # merge base with origin/trunk, so the owner sees the whole set here.
         travelling = {"drafts": prom.drafts, "base": prom.base, "commit": prom.commit}
+        # What trunk did under the draft, and whether it can be aligned for free --
+        # the dialog offers the tick box on the strength of these.
+        clash = {
+            "conflicts": prom.conflicts, "culprits": prom.culprits,
+            "mergeable": prom.mergeable, "overlaps": prom.overlaps,
+            "blocked": prom.blocked, "alignable": bool(prom.mergeable) and not prom.overlaps,
+            "aligned": prom.merged_files, "auto_merged": prom.auto_merged,
+        }
         if dry:
             clean = bool(prom.ready) and not prom.conflicts
             text = prom.detail()
             return reply({
                 "ok": clean, "dry_run": True, "summary": prom.summary(), "detail": text,
-                "conflicts": prom.conflicts, "files": files, "url": prom.url,
+                "files": files, "url": prom.url,
                 "commit": prom.commit, "base": prom.base, "wc": prom.wc,
-                **travelling,
+                **clash, **travelling,
             }, "ok" if clean else "error", text)
 
         if prom.ok:
@@ -298,26 +309,32 @@ def create_app() -> Flask:
                             author=get_settings().svn_username or "owner", files=files)
             db.record_review(bug["id"], "pass", merged_revision=prom.revision)
             note = (f"已由主人从审查页正式推入 SVN：{prom.url} r{prom.revision}"
-                    f"（{len(files)} 个文件）。提交说明：{message}")
+                    f"（{len(files)} 个文件）"
+                    + (f"，其中 {len(prom.merged_files)} 个推送前已对齐到 trunk 现内容"
+                       f"（{('、'.join(prom.merged_files))[:200]}）" if prom.merged_files else "")
+                    + f"。提交说明：{message}")
             result = sync.push_comment(bug["zentao_id"], note)
             text = (f"bug #{bug['zentao_id']} 已推入 SVN r{prom.revision}，"
                     f"状态改为已合入。"
                     + ("" if result["ok"] else f" 禅道评论未写入：{result['detail'][:120]}"))
             return reply({"ok": True, "summary": text, "detail": prom.detail(),
                           "revision": prom.revision, "status": "merged",
-                          "files": files, **travelling}, "ok", text)
+                          "files": files, **clash, **travelling}, "ok", text)
 
         # Nothing landed. That is a push failure, not a verdict on the fix: the bug
         # stays exactly where it was (await_review), the git:<hash> draft record
         # stays untouched, and only a trail is written. Re-trying, or deliberately
         # sending it back to the AI, remains the owner's call.
         reason = prom.detail()
+        evidence = (prom.raw or "")[-1200:]
+        if prom.culprits:
+            evidence = ("trunk 上最近一笔：" + "；".join(prom.culprits) + "\n" + evidence)
         db.add_analysis(
             bug["id"],
             {
                 "conclusion": "推入 SVN 未成功（留痕）：改动与状态都未变动",
                 "symptom": f"点击「推 SVN」失败：{prom.error or '未知原因'}",
-                "evidence": (prom.raw or "")[-1200:],
+                "evidence": evidence,
                 "impact": "trunk 未被改动（远端写入未发生或已回退）；镜像草稿分支未动",
                 "verify": "推送清单：" + ("、".join(files) if files else "无"),
                 "unverified": "失败原因见 evidence 原始输出；修好原因后可直接重推",
@@ -330,11 +347,15 @@ def create_app() -> Flask:
             f"人工推入 SVN 未成功（仅留痕，状态仍是待审查，AI 草稿未变）：{reason[:300]}",
         )
         text = (f"bug #{bug['zentao_id']} 推送失败：已留痕，状态仍是"
-                f"「{STATUS_LABELS.get(bug['status'], bug['status'])}」，git 草稿记录未删。"
-                f"可直接重试，或你判定后手工打回。")
+                f"「{STATUS_LABELS.get(bug['status'], bug['status'])}」，git 草稿记录未删。")
+        if prom.mergeable and not prom.overlaps and not align:
+            text += (f" {len(prom.mergeable)} 个文件与 trunk 改动不重叠，"
+                     f"勾上「自动按 trunk 对齐」再推即可（他人改动会保留）。")
+        else:
+            text += "可直接重试，或你判定后手工打回。"
         return reply({"ok": False, "summary": text, "detail": reason,
-                      "conflicts": prom.conflicts, "status": bug["status"],
-                      "unchanged": True}, "error", text)
+                      "status": bug["status"], "unchanged": True,
+                      **clash}, "error", text)
 
     @app.route("/bug/<int:bug_id>/reject-rollback", methods=["POST"])
     def bug_reject_rollback(bug_id: int):

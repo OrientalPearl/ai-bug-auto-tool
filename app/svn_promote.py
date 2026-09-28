@@ -78,6 +78,7 @@ class Promotion:
 
     ok: bool = False
     dry_run: bool = False
+    merge_trunk: bool = False
     ref: str = ""
     url: str = ""
     commit: str = ""
@@ -85,6 +86,13 @@ class Promotion:
     drafts: list[str] = field(default_factory=list)
     want: list[str] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)
+    culprits: list[str] = field(default_factory=list)
+    mergeable: list[str] = field(default_factory=list)
+    overlaps: list[str] = field(default_factory=list)
+    blocked: list[str] = field(default_factory=list)
+    auto_merged: str = ""
+    merged_files: list[str] = field(default_factory=list)
+    hint: str = ""
     pending: list[str] = field(default_factory=list)
     revision: str = ""
     log: list[str] = field(default_factory=list)
@@ -98,9 +106,11 @@ class Promotion:
 
     def summary(self) -> str:
         if self.ok:
-            return f"已推入 SVN：r{self.revision}（{len(self.want)} 个文件）"
+            tail = f"，其中 {len(self.merged_files)} 个已按 trunk 对齐" if self.merged_files else ""
+            return f"已推入 SVN：r{self.revision}（{len(self.want)} 个文件{tail}）"
         if self.ready:
-            return f"预检通过：{self.ready}（没有写入任何东西）"
+            extra = "，含自动对齐" if self.auto_merged else ""
+            return f"预检通过：{self.ready}（没有写入任何东西{extra}）"
         return self.error or f"推送未完成（exit {self.exit_code}）"
 
     def detail(self) -> str:
@@ -108,6 +118,15 @@ class Promotion:
         bits = [self.summary()]
         if self.conflicts:
             bits.append("trunk 已变动的文件：" + "；".join(self.conflicts[:6]))
+        # A refusal should name the revision that moved, not just the md5 pair.
+        if self.culprits:
+            bits.append("trunk 上最近一笔：" + "；".join(self.culprits[:4]))
+        if self.auto_merged:
+            bits.append("自动对齐：" + self.auto_merged)
+        elif self.mergeable:
+            bits.append("可无损自动对齐（勾选后重推）：" + "、".join(self.mergeable[:6]))
+        if self.overlaps:
+            bits.append("改到同一行区间，必须人工对齐：" + "、".join(self.overlaps[:6]))
         if self.ready and self.pending:
             bits.append("待提交：" + "；".join(self.pending[:6]))
         elif self.want and (self.error or self.ready):
@@ -192,7 +211,7 @@ _SCRIPT = r"""
 # Every decision is reported as "PV|<tag>|<value>" for app/svn_promote.py.
 export LC_ALL=C LANG=C
 set -f
-MIRROR=$1; REF=$2; WCPATH=$3; MSG_B64=$4; DRY=$5
+MIRROR=$1; REF=$2; WCPATH=$3; MSG_B64=$4; DRY=$5; MERGE=$6
 TAB=$(printf '\t')
 P() { printf 'PV|%s|%s\n' "$1" "$2"; }
 TMPN=$(mktemp) || { P err "mktemp 失败"; exit 1; }
@@ -200,7 +219,10 @@ TMPW=$(mktemp) || { P err "mktemp 失败"; exit 1; }
 TMPC=$(mktemp) || { P err "mktemp 失败"; exit 1; }
 TMPT=$(mktemp) || { P err "mktemp 失败"; exit 1; }
 TMPP=$(mktemp) || { P err "mktemp 失败"; exit 1; }
-trap 'rm -f "$TMPN" "$TMPW" "$TMPC" "$TMPT" "$TMPP" 2>/dev/null' EXIT
+TMPM=$(mktemp) || { P err "mktemp 失败"; exit 1; }
+TMPX=$(mktemp) || { P err "mktemp 失败"; exit 1; }
+MDIR=$(mktemp -d) || { P err "mktemp -d 失败"; exit 1; }
+trap 'rm -rf "$TMPN" "$TMPW" "$TMPC" "$TMPT" "$TMPP" "$TMPM" "$TMPX" "$MDIR" 2>/dev/null' EXIT
 abort() {
   P err "$1"
   if [ "$2" = dirty ]; then
@@ -249,7 +271,7 @@ fetch_file() {
   return 0
 }
 
-for t in svn git base64 md5sum timeout; do
+for t in svn git base64 md5sum timeout awk cp; do
   command -v "$t" >/dev/null 2>&1 || abort "该服务器缺少 $t"
 done
 cd "$MIRROR" 2>/dev/null || abort "镜像目录不存在: $MIRROR"
@@ -302,26 +324,79 @@ while IFS="$TAB" read ST RP; do
 done < "$TMPW"
 sort -u "$TMPP" -o "$TMPP"
 
-# Guard 1: the draft's base must still be what trunk holds, or somebody else
-# touched the same file after the draft was cut. Never overwrite that silently.
+# Guard 1: the draft's base must still be what trunk holds, or somebody else has
+# landed on the same file after the draft was cut. By default that refuses the
+# push outright. With MERGE=1 (the owner ticked "自动按 trunk 对齐") a file whose
+# trunk-side change touches no line the draft changed is merged three-way with
+# `git merge-file` and the merged result -- theirs plus ours, nothing stomped --
+# is what gets committed. Everything that cannot be proven non-overlapping (a
+# real overlap, an add/delete clash, a file trunk no longer has) blocks the push.
+: > "$TMPM"
+: > "$TMPX"
 while IFS="$TAB" read ST RP; do
   SMD5=$(timeout 90 svn cat --non-interactive "$URL/$RP" 2>/dev/null | md5sum | cut -d' ' -f1)
   GMD5=$(git show "$BASE:$RP" 2>/dev/null | md5sum | cut -d' ' -f1)
+  STOMP=
   case "$ST" in
     A) if [ -n "$SMD5" ]; then
-         if [ "$SMD5" = "$GMD5" ]; then WHY=same; else WHY=diff; fi
+         if [ "$SMD5" = "$GMD5" ]; then WHY=same; else WHY=diff; STOMP=1; fi
          printf '%s\n' "A $RP trunk 上已存在同名文件（内容 $WHY）" >> "$TMPC"
        fi ;;
     *) if [ -z "$SMD5" ]; then
          printf '%s\n' "$ST $RP trunk 上已找不到该文件（可能已被别人删除）" >> "$TMPC"
+         printf '%s\n' "$RP|trunk 上文件已不存在，不能自动合并" >> "$TMPX"
+         STOMP=1
        elif [ "$SMD5" != "$GMD5" ]; then
          printf '%s\n' "$ST $RP trunk 内容已变动 svn=$SMD5 base=$GMD5" >> "$TMPC"
+         STOMP=1
        fi ;;
   esac
+  [ -n "$STOMP" ] || continue
+
+  # Name the revision that moved under the draft, so a refusal explains itself
+  # instead of leaving the owner to run the svn log by hand.
+  WHO=$(timeout 60 svn log --non-interactive -l 1 "$URL/$RP" 2>/dev/null |
+        sed -n '2p' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [ -n "$WHO" ] && P culprit "$RP <= $WHO"
+
+  case "$ST" in
+    M*|T*) : ;;
+    *) printf '%s\n' "$RP|状态 $ST（新增或删除）需要人工判断" >> "$TMPX"
+       continue ;;
+  esac
+  _slug=$(printf '%s' "$RP" | tr '/ ' '__')
+  git show "$COMMIT:$RP" > "$MDIR/$_slug.mine" 2>/dev/null || \
+    { printf '%s\n' "$RP|取草稿内容失败" >> "$TMPX"; continue; }
+  git show "$BASE:$RP" > "$MDIR/$_slug.base" 2>/dev/null || \
+    { printf '%s\n' "$RP|取草稿基线失败" >> "$TMPX"; continue; }
+  timeout 90 svn cat --non-interactive "$URL/$RP" > "$MDIR/$_slug.trunk" 2>/dev/null || \
+    { printf '%s\n' "$RP|取 trunk 内容失败" >> "$TMPX"; continue; }
+  cp "$MDIR/$_slug.mine" "$MDIR/$_slug.out" 2>/dev/null || \
+    { printf '%s\n' "$RP|准备合并目标失败" >> "$TMPX"; continue; }
+  if git merge-file "$MDIR/$_slug.out" "$MDIR/$_slug.base" "$MDIR/$_slug.trunk" 2>/dev/null; then
+    P mergeable "$RP"
+    printf '%s\t%s\n' "$RP" "$MDIR/$_slug.out" >> "$TMPM"
+  else
+    rm -f "$MDIR/$_slug.out"
+    printf '%s\n' "$RP|trunk 与草稿改到了同一行区间" >> "$TMPX"
+    P overlap "$RP trunk 与草稿改到了同一行区间"
+  fi
 done < "$TMPW"
 if [ -s "$TMPC" ]; then
   while read L; do P conflict "$L"; done < "$TMPC"
-  abort "trunk 相对草稿基线已有他人改动，拒绝覆盖；先把草稿对齐到当前 trunk 再推"
+  NM=$(wc -l < "$TMPM" | tr -d ' ')
+  NX=$(wc -l < "$TMPX" | tr -d ' ')
+  if [ "$MERGE" = 1 ] && [ "$NX" = 0 ] && [ "$NM" -gt 0 ]; then
+    P auto "$NM 个文件已与 trunk 现内容三方合并（他人改动全部保留，且与本草稿改动不重叠）"
+  elif [ "$MERGE" = 1 ]; then
+    while IFS="$TAB" read L; do P blocked "$L"; done < "$TMPX"
+    abort "无法全部无损对齐（重叠或增删 $NX 处），整笔拒绝；trunk 未被改动，草稿未被改动"
+  elif [ "$NM" -gt 0 ]; then
+    P hint "$NM 个文件可无损自动对齐（勾选「自动按 trunk 对齐」后重推）"
+    abort "trunk 相对草稿基线已有他人改动，拒绝覆盖；$NM 个文件其实与本草稿改在不同行区间，可勾选「自动按 trunk 对齐」直接重推"
+  else
+    abort "trunk 相对草稿基线已有他人改动，拒绝覆盖；先把草稿对齐到当前 trunk 再推"
+  fi
 fi
 
 # Guard 2: the dirs we are about to use must start clean. That checkout is owned by
@@ -369,6 +444,7 @@ ensure_dir() {
 
 while IFS="$TAB" read ST RP; do
   ensure_dir "$RP" || abort "准备目录失败: $RP" dirty
+  SRC=$(awk -F'\t' -v f="$RP" '$1==f{print $2}' "$TMPM" 2>/dev/null | head -1)
   case "$ST" in
     A) git show "$COMMIT:$RP" > "$WCPATH/$RP" 2>/dev/null \
          || abort "导出草稿内容失败（新增）: $RP" dirty
@@ -378,8 +454,13 @@ while IFS="$TAB" read ST RP; do
        timeout 90 svn delete --non-interactive "$WCPATH/$RP" >/dev/null 2>&1 \
          || abort "svn delete 失败: $RP" dirty ;;
     *) fetch_file "$RP" || abort "取 trunk 版本失败: $RP" dirty
-       git show "$COMMIT:$RP" > "$WCPATH/$RP" 2>/dev/null \
-         || abort "导出草稿内容失败: $RP" dirty ;;
+       if [ -n "$SRC" ]; then
+         cp "$SRC" "$WCPATH/$RP" 2>/dev/null || abort "写入对齐后的内容失败: $RP" dirty
+         P merged "$RP"
+       else
+         git show "$COMMIT:$RP" > "$WCPATH/$RP" 2>/dev/null \
+           || abort "导出草稿内容失败: $RP" dirty
+       fi ;;
   esac
 done < "$TMPW"
 
@@ -397,6 +478,15 @@ fi
 MSGF=$(mktemp)
 printf '%s' "$MSG_B64" | base64 -d > "$MSGF" 2>/dev/null || abort "提交说明解码失败" dirty
 [ -s "$MSGF" ] || abort "提交说明为空" dirty
+
+# Say so in the log itself: without this line a reader comparing the commit with
+# the draft branch would wonder where the extra trunk context came from.
+if [ "$MERGE" = 1 ] && [ -s "$TMPM" ]; then
+  ALIGNED=$(awk -F'\t' '{printf "%s ", $1}' "$TMPM" | sed 's/ $//')
+  printf '\n（推送前已将以下文件对齐到 trunk 现内容，本次提交只含本草稿的改动：%s）\n' \
+    "$ALIGNED" >> "$MSGF"
+  P annotated "$ALIGNED"
+fi
 
 set --
 while read T; do
@@ -438,13 +528,15 @@ def _decode(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def _run_script(target: RemoteTarget, ref: str, message: str, dry_run: bool) -> tuple[int, str]:
+def _run_script(target: RemoteTarget, ref: str, message: str, dry_run: bool,
+                merge_trunk: bool = False) -> tuple[int, str]:
     args = [
         target.mirror,
         ref,
         target.wc,
         base64.b64encode(message.encode("utf-8")).decode("ascii"),
         "1" if dry_run else "0",
+        "1" if merge_trunk else "0",
     ]
     quoted = " ".join("'" + str(a).replace("'", "'\\''") + "'" for a in args)
     cmd = target.ssh_command(f"sh -s {quoted}")
@@ -485,6 +577,20 @@ def _parse(text: str, carrier: Promotion) -> Promotion:
             carrier.want.append(value)
         elif tag == "conflict":
             carrier.conflicts.append(value)
+        elif tag == "culprit":
+            carrier.culprits.append(value)
+        elif tag == "mergeable":
+            carrier.mergeable.append(value)
+        elif tag == "overlap":
+            carrier.overlaps.append(value)
+        elif tag == "blocked":
+            carrier.blocked.append(value)
+        elif tag == "merged":
+            carrier.merged_files.append(value)
+        elif tag == "auto":
+            carrier.auto_merged = value
+        elif tag == "hint":
+            carrier.hint = value
         elif tag == "pend":
             carrier.pending.append(value)
         elif tag == "rev":
@@ -504,11 +610,17 @@ def _parse(text: str, carrier: Promotion) -> Promotion:
     return carrier
 
 
-def promote(bug: dict, message: str, *, dry_run: bool = False) -> Promotion:
+def promote(bug: dict, message: str, *, dry_run: bool = False,
+            merge_trunk: bool = False) -> Promotion:
     """Push one draft into SVN; with ``dry_run`` only the preflight runs.
 
     The reference is the bug's branch when it is registered (so several draft
     commits travel together), otherwise the newest ``git:<hash>``.
+
+    ``merge_trunk`` is the owner's explicit tick: when trunk moved under the
+    draft, files whose trunk-side change does not overlap this draft's lines are
+    aligned three-way and the merged content is committed. Without it a moved
+    trunk always refuses the push.
     """
     text = str(message or "").strip()
     if not text:
@@ -534,8 +646,10 @@ def promote(bug: dict, message: str, *, dry_run: bool = False) -> Promotion:
     mirror_dir = svn_client.resolve_target(bug=bug).working_copy
     target = remote_target(mirror_dir)
 
-    carrier = Promotion(dry_run=dry_run, ref=candidates[0], wc=target.wc)
-    carrier.exit_code, output = _run_script(target, carrier.ref, text, dry_run)
+    carrier = Promotion(dry_run=dry_run, ref=candidates[0], wc=target.wc,
+                        merge_trunk=bool(merge_trunk))
+    carrier.exit_code, output = _run_script(target, carrier.ref, text, dry_run,
+                                            bool(merge_trunk))
     prom = _parse(output, carrier)
     if not prom.ok and not prom.error and not prom.ready:
         prom.error = f"远端执行未完成（exit {prom.exit_code}）"
