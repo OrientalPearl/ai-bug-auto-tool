@@ -158,6 +158,9 @@ python -m app.cli doctor                   # 禅道通道分步诊断
    **镜像未就绪（SSH 侧三条判据任一失败，`AUTO_LOOP.md` §1.5）时不许开工**，直接 `block` 写明「镜像未就绪」
 5. 在镜像里为这条 bug 开本地分支（**git 全部走 SSH 侧**，Windows 映射盘那一份不跑 git）：
    `ssh <SSH用户>@<SSH主机> "cd <镜像> && git -c core.ignorecase=false checkout -b bugfix/zentao-<禅道ID> refs/remotes/origin/trunk"`；
+   **`queue_kind=rejected` 的重做不许另开分支、不许 `reset --hard` 丢掉上一轮**：上一轮的草稿分支还在
+   （打回只改状态，不回滚改动），直接切回它继续追加提交 —— 主人推送时取的是分支相对 `origin/trunk`
+   的合并差异，几轮改动会合成一次 svn 提交；分支已被主人「拒绝并回滚」删掉的，这条应是 `closed` 不会进队列
    然后**先读该库自带的知识体系**（镜像根 `CLAUDE.md` 选入口 → 命中指针读 `.trae/` 下的 `registry|doc|playbooks` →
    跨层看 `.trae/doc/ARCHITECTURE.md` → 落点目录的 `.trae/agents/<相对路径>/AGENT.md` → 流程按 `.trae/skills/`），
    再定位修改点，只改与这条 bug 直接相关的文件；改之前用 `git ls-files <路径>` 在 Linux 侧核对大小写拼名
@@ -293,10 +296,10 @@ python -m app.cli block <禅道ID> --question "..." --options "..." --advice "..
     `git -c core.ignorecase=false status --porcelain -- <文件>` + `diff --ignore-cr-at-eol -- <文件>` 取证；
     差异只剩 CRLF / `$Id$` / 大小写对偶 / `.trae/**` → 按 §「落码位置」的结构性噪音照常做；
     是别人写的真实改动 → 不覆盖、不 `stash`、不 `revert`、不 `checkout` 复原，`block` 写明摘要
-28. **禁止执行器碰「推 SVN」通道**：`/bug/<id>/svn-push`（`app/svn_promote.py`）是主人点审查弹窗
-    才走的正式进库动作，它会把草稿真实 `svn ci` 进 trunk。执行器既不许调用该接口，也不许自己
-    复刻它的命令序列（那等于违反 11/26 里的 G11）；你只负责把草稿提交成 `git:<哈希>` 并登记，
-    推不推、用什么提交说明，是主人的决定
+28. **禁止执行器碰「推 SVN」与「拒绝并回滚」通道**：`/bug/<id>/svn-push`（`app/svn_promote.py`）是主人点审查弹窗
+    才走的正式进库动作，它会把草稿真实 `svn ci` 进 trunk；`/bug/<id>/reject-rollback` 同理，它会删掉这条的草稿分支
+    并把这条关掉。执行器既不许调用这两个接口，也不许自己复刻它们的命令序列（那等于违反 11/26 里的 G11）；
+    你只负责把草稿提交成 `git:<哈希>` 并登记，推不推、回不回滚、用什么提交说明，都是主人的决定
 
 ## 停止条件
 

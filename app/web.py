@@ -227,6 +227,9 @@ def create_app() -> Flask:
 
     @app.route("/review/<int:bug_id>/reject", methods=["POST"])
     def review_reject(bug_id: int):
+        """Send the bug back for another round. The draft branch stays where it is:
+        the next run continues on top of it and the eventual push carries every
+        round's changes as one SVN commit."""
         bug = db.get_bug(bug_id)
         if bug is None:
             abort(404)
@@ -236,7 +239,8 @@ def create_app() -> Flask:
             return redirect(url_for("review_page"))
         db.record_review(bug_id, "reject", reject_reason=reason)
         sync.push_comment(bug["zentao_id"], f"人工审查打回，原因：{reason}")
-        flash(f"bug #{bug['zentao_id']} 已打回，AI 下次运行会重新处理。", "ok")
+        flash(f"bug #{bug['zentao_id']} 已打回，AI 下次运行会在原分支 {bug.get('branch') or '（未建分支）'} "
+              f"上继续修改（改动未回滚），最终推送时几轮改动会合成一次 svn 提交。", "ok")
         return redirect(url_for("review_page"))
 
     @app.route("/bug/<int:bug_id>/svn-push", methods=["POST"])
@@ -275,6 +279,9 @@ def create_app() -> Flask:
             return reply({"ok": False, "summary": text, "detail": text}, "error", text)
 
         files = [item.split("|", 1)[1] for item in prom.want if "|" in item]
+        # Several draft commits travel as one push: the diff is taken against the
+        # merge base with origin/trunk, so the owner sees the whole set here.
+        travelling = {"drafts": prom.drafts, "base": prom.base, "commit": prom.commit}
         if dry:
             clean = bool(prom.ready) and not prom.conflicts
             text = prom.detail()
@@ -282,6 +289,7 @@ def create_app() -> Flask:
                 "ok": clean, "dry_run": True, "summary": prom.summary(), "detail": text,
                 "conflicts": prom.conflicts, "files": files, "url": prom.url,
                 "commit": prom.commit, "base": prom.base, "wc": prom.wc,
+                **travelling,
             }, "ok" if clean else "error", text)
 
         if prom.ok:
@@ -297,7 +305,7 @@ def create_app() -> Flask:
                     + ("" if result["ok"] else f" 禅道评论未写入：{result['detail'][:120]}"))
             return reply({"ok": True, "summary": text, "detail": prom.detail(),
                           "revision": prom.revision, "status": "merged",
-                          "files": files}, "ok", text)
+                          "files": files, **travelling}, "ok", text)
 
         # Nothing landed. That is a push failure, not a verdict on the fix: the bug
         # stays exactly where it was (await_review), the git:<hash> draft record
@@ -327,6 +335,72 @@ def create_app() -> Flask:
         return reply({"ok": False, "summary": text, "detail": reason,
                       "conflicts": prom.conflicts, "status": bug["status"],
                       "unchanged": True}, "error", text)
+
+    @app.route("/bug/<int:bug_id>/reject-rollback", methods=["POST"])
+    def bug_reject_rollback(bug_id: int):
+        """Refuse the fix: roll the draft branch back and close the bug.
+
+        The opposite of the promotion button. It is only allowed to delete this
+        bug's own ``bugfix/*`` draft branch (the commit is parked under
+        ``refs/rejected/`` first, so the owner can get it back); if the mirror
+        refuses -- typically because another session has HEAD on that branch --
+        nothing is changed on the bug either.
+        """
+        bug = db.get_bug(bug_id)
+        if bug is None:
+            abort(404)
+        payload = _form()
+        reason = str(payload.get("reject_reason") or "").strip()
+        inline = request.headers.get("X-Requested-With") == "fetch-dialog"
+
+        def reply(data: dict[str, Any], level: str, text: str):
+            if inline:
+                return jsonify(data)
+            flash(text, level)
+            return redirect(url_for("review_page"))
+
+        if bug["status"] not in ("await_review", "rejected"):
+            text = (f"bug #{bug['zentao_id']} 当前状态是"
+                    f"「{STATUS_LABELS.get(bug['status'], bug['status'])}」，"
+                    "不是待审查/已打回，未回滚。")
+            return reply({"ok": False, "summary": text, "detail": text}, "error", text)
+        if not reason:
+            text = f"bug #{bug['zentao_id']} 回滚必须写清原因（这是不可逆动作的留痕）。"
+            return reply({"ok": False, "summary": text, "detail": text}, "error", text)
+
+        done = svn_promote.rollback_draft(bug)
+        if not done.ok:
+            text = f"bug #{bug['zentao_id']} 回滚失败：{done.summary()}"
+            return reply({"ok": False, "summary": text, "detail": done.raw[-600:],
+                          "status": bug["status"], "unchanged": True}, "error", text)
+
+        db.record_review(bug["id"], "reject", reject_reason=f"拒绝并回滚：{reason}"[:500],
+                         change_status=False)
+        db.add_analysis(
+            bug["id"],
+            {
+                "conclusion": "主人拒绝本次修改，草稿已回滚，这条按已完结收口",
+                "symptom": f"拒绝原因：{reason}",
+                "evidence": (f"分支 {done.branch} 已删除；提交 {done.tip} 保留在 "
+                             f"{done.shadow}（需要时可取回）" if done.tip
+                             else "没有草稿分支需要删除"),
+                "impact": "trunk 未被改动（从未推入过正式库）",
+                "verify": "镜像里 refs/heads/<分支> 已不存在，影子引用仍在",
+                "unverified": "拒绝判定由主人作出，执行器不再重做这条",
+                "rollback": f"如需恢复草稿：git branch {done.branch} {done.shadow}",
+            },
+            kind="manual", author="owner",
+        )
+        db.set_bug_status(bug["id"], "closed")
+        note = (f"人工审查拒绝该修改，已回滚草稿分支 {done.branch}"
+                f"{'（提交 ' + done.tip[:10] + ' 保留在影子引用里）' if done.tip else ''}，"
+                f"本地系统记为已结案。原因：{reason}")
+        result = sync.push_comment(bug["zentao_id"], note)
+        text = (f"bug #{bug['zentao_id']} 已拒绝并回滚草稿，状态改为已结案。"
+                + ("" if result["ok"] else f" 禅道评论未写入：{result['detail'][:120]}"))
+        return reply({"ok": True, "summary": text, "detail": done.summary(),
+                      "status": "closed", "branch": done.branch,
+                      "shadow": done.shadow, "tip": done.tip}, "ok", text)
 
     @app.route("/bug/<int:bug_id>/close", methods=["POST"])
     def bug_close(bug_id: int):

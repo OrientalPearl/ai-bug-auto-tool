@@ -159,7 +159,25 @@
               data-ask="预检：核对镜像、草稿基线，并逐个比对 trunk 上这些文件是否已被别人改动。不写入任何东西。">预检（不写入）</button>
             <button class="btn btn-pass" type="submit" name="mode" value="push"
               data-ask="确认正式推入 SVN？上方文字会原样作为 svn ci 的提交说明进入 trunk；只有真进了库才记为已合入。失败只留人工记录，状态仍是待审查，git 草稿记录不动。">正式推入 SVN</button>
-            <span class="hint">分支 <code>${esc(b.branch || "-")}</code> 的草稿将按文件落到稀疏工作副本再提交；trunk 已被他人改动的文件不会被覆盖。</span>
+            <span class="hint">分支 <code>${esc(b.branch || "-")}</code> 上相对 trunk 的<b>全部</b>草稿提交会合并成一次 svn 提交；trunk 已被他人改动的文件不会被覆盖。</span>
+          </div>
+        </form>`;
+    }
+    if (b.status === "await_review" || b.status === "rejected") {
+      html += `
+        <h4>拒绝这次修改（两种处置，都不会碰 trunk）</h4>
+        <form method="post" action="/review/${esc(b.id)}/reject"
+              data-confirm="确认打回？改动不回滚：AI 下一轮在原分支 ${esc(b.branch || '（未建分支）')} 上继续改，最终几轮改动一起推入 SVN。">
+          <div class="row-actions">
+            <input type="text" name="reject_reason" placeholder="错在哪里（必填，AI 会照着改）" style="flex:1">
+            <button class="btn btn-reject" type="submit">打回重做（保留草稿）</button>
+          </div>
+        </form>
+        <form method="post" action="/bug/${esc(b.id)}/reject-rollback" data-json="1">
+          <div class="row-actions">
+            <input type="text" name="reject_reason" placeholder="拒绝原因（必填，会进留痕与禅道）" style="flex:1">
+            <button class="btn btn-reject" type="submit"
+              data-ask="确认拒绝并回滚？这会删除镜像里的草稿分支 ${esc(b.branch || '（无分支）')}（提交先存进 refs/rejected 以便取回），并把这条置为已结案（已完结）。trunk 不受影响。">拒绝并回滚 → 已结案</button>
           </div>
         </form>`;
     }
@@ -381,8 +399,13 @@
   function noteOf(data) {
     const summary = String(data.summary || "");
     const detail = String(data.detail || "");
-    const text = detail && detail !== summary ? `${summary}\n${detail}` : summary;
-    return text.slice(0, 900);
+    let text = detail && detail !== summary ? `${summary}\n${detail}` : summary;
+    // A push carries every draft commit on the branch, so say how many travel.
+    const drafts = Array.isArray(data.drafts) ? data.drafts : [];
+    if (drafts.length) {
+      text += `\n一起推入的草稿提交（${drafts.length} 个）：` + drafts.join(", ");
+    }
+    return text.slice(0, 1200);
   }
 
   document.addEventListener("submit", function (event) {

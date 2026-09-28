@@ -542,3 +542,122 @@ def promote(bug: dict, message: str, *, dry_run: bool = False) -> Promotion:
     if prom.error:
         prom.error = f"{prom.error}（{target.host} · {target.mirror}）"
     return prom
+
+
+# ---------------------------------------------------------------------------
+# rolling a draft back (the owner refused the fix)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DraftRollback:
+    """Outcome of discarding one bug's draft branch."""
+
+    ok: bool = False
+    branch: str = ""
+    tip: str = ""
+    shadow: str = ""
+    absent: bool = False          # nothing to roll back: the branch was already gone
+    error: str = ""
+    raw: str = ""
+
+    def summary(self) -> str:
+        if self.absent:
+            return "没有草稿分支需要回滚（可能已被清理）"
+        if self.ok:
+            return (f"已回滚草稿分支 {self.branch}；提交 {self.tip[:10]} "
+                    f"保留在 {self.shadow}，需要时可取回")
+        return self.error or "回滚未完成"
+
+
+_ROLLBACK_SCRIPT = r"""
+# Drop one bug's draft branch without moving HEAD and without touching the work
+# tree, keeping the commit reachable through a shadow ref so the owner can get it
+# back. POSIX sh, runs on the build server.
+export LC_ALL=C LANG=C
+set -f
+MIRROR=$1; BR=$2
+P() { printf 'PV|%s|%s\n' "$1" "$2"; }
+cd "$MIRROR" 2>/dev/null || { P err "镜像目录不存在: $MIRROR"; exit 1; }
+case "$BR" in
+  bugfix/*) : ;;
+  *) P err "只允许回滚 bugfix/* 草稿分支，收到: $BR"; exit 1 ;;
+esac
+if ! git rev-parse --verify "refs/heads/$BR" >/dev/null 2>&1; then
+  P absent "$BR"
+  exit 0
+fi
+CUR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+if [ "$CUR" = "$BR" ]; then
+  P err "镜像的 HEAD 正停在 $BR（大概率有会话在它上面改代码），不动别人的工作区：先让那条会话切走再回滚"
+  exit 1
+fi
+TIP=$(git rev-parse "refs/heads/$BR")
+P tip "$TIP"
+git update-ref "refs/rejected/$BR" "$TIP" || { P err "写影子引用 refs/rejected/$BR 失败"; exit 1; }
+P shadow "refs/rejected/$BR"
+git branch -D "$BR" >/dev/null 2>&1 || { P err "删除分支失败: $BR"; exit 1; }
+git rev-parse --verify "refs/heads/$BR" >/dev/null 2>&1 && { P err "分支仍然存在: $BR"; exit 1; }
+P done "$TIP"
+"""
+
+
+def rollback_draft(bug: dict) -> DraftRollback:
+    """Delete the bug's draft branch after parking its commit under ``refs/rejected``.
+
+    Deliberately conservative: it never checks a branch out, never touches the
+    working tree, and refuses to run while HEAD sits on that branch, so a parallel
+    session's uncommitted work cannot be disturbed. The commit stays reachable, so
+    a rollback is recoverable while the object survives in the mirror.
+    """
+    branch = str(bug.get("branch") or "").strip()
+    if not branch:
+        return DraftRollback(ok=True, absent=True)
+
+    from . import svn_client
+
+    mirror_dir = svn_client.resolve_target(bug=bug).working_copy
+    target = remote_target(mirror_dir)
+    args = [target.mirror, branch]
+    quoted = " ".join("'" + str(a).replace("'", "'\\''") + "'" for a in args)
+    cmd = target.ssh_command(f"sh -s {quoted}")
+    proc = subprocess.run(
+        cmd,
+        input=_ROLLBACK_SCRIPT.strip().replace("\r\n", "\n").encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=_SSH_TIMEOUT,
+    )
+    text = _decode(proc.stdout or b"")
+    err = _decode(proc.stderr or b"")
+    out = DraftRollback(branch=branch)
+    for line in text.splitlines():
+        if not line.startswith("PV|"):
+            continue
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            continue
+        tag, value = parts[1], parts[2]
+        if tag == "tip":
+            out.tip = value
+        elif tag == "shadow":
+            out.shadow = value
+        elif tag == "absent":
+            out.absent = True
+            out.ok = True
+        elif tag == "done":
+            out.ok = True
+            out.tip = out.tip or value
+        elif tag == "err":
+            out.error = out.error or value
+
+    # The build servers print a login banner on stderr even for a clean run, so
+    # stderr counts as a failure only when the script itself did not report one
+    # and exited non-zero.
+    if not out.ok and not out.error and err.strip():
+        out.error = err.strip().splitlines()[-1]
+    if not out.ok and not out.error and proc.returncode != 0:
+        out.error = f"回滚未完成（exit {proc.returncode}）"
+    out.raw = text if not err.strip() else text + "\n[stderr] " + err.strip()
+    if out.error:
+        out.error = f"{out.error}（{target.host} · {target.mirror}）"
+    return out

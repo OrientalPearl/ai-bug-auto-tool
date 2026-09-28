@@ -80,7 +80,8 @@
 | POST | `/need/<id>/done` | 关闭阻塞项 | — |
 | GET | `/review` | 审查队列（每条含 AI 写回的分析结论与闸门逐条着色） | — |
 | POST | `/review/<bug_id>/pass` | 审查通过 → `merged` + 禅道评论 | `merged_revision` |
-| POST | `/review/<bug_id>/reject` | 打回 → `rejected` 重回队列 + 禅道评论 | `reject_reason`（必填） |
+| POST | `/review/<bug_id>/reject` | 打回 → `rejected` 重回队列 + 禅道评论；**不回滚改动**，AI 在同一草稿分支上继续改 | `reject_reason`（必填） |
+| POST | `/bug/<bug_id>/reject-rollback` | 拒绝该修改：删除这条的草稿分支（提交先存进 `refs/rejected/<分支>` 以便取回）→ `closed` + 留痕 + 禅道评论；镜像 HEAD 正停在该分支时拒绝执行且不改状态 | `reject_reason`（必填） |
 | POST | `/bug/<bug_id>/svn-push` | 主人一键把该条的 git 草稿正式推入 SVN（`mode=dry` 只预检不写入）；成功登记真实 r 号 → `merged`，失败只追加人工留痕、状态与 `git:<哈希>` 记录不动 | `message`（正式 svn log）、`mode`（`push`/`dry`） |
 | POST | `/bug/<bug_id>/close` | 人工结案 → `closed` + 禅道评论 | — |
 | POST | `/bug/<bug_id>/detail` | 抓单条截图/备注/附件 | — |

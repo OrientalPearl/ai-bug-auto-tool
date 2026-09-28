@@ -75,10 +75,18 @@
     </form>
 
     <form method="post" action="{{ url_for('review_reject', bug_id=bug.id) }}"
-          data-confirm="确认打回？该 bug 会重新进入 AI 处理队列。">
+          data-confirm="确认打回？改动不回滚：AI 下一轮在原分支上继续改，最终几轮改动一起推入 SVN。">
       <div class="row-actions">
         <input type="text" name="reject_reason" placeholder="打回原因（必填）" style="flex:1">
         <button class="btn btn-reject" type="submit">打回</button>
+      </div>
+    </form>
+
+    <form method="post" action="{{ url_for('bug_reject_rollback', bug_id=bug.id) }}"
+          data-confirm="确认拒绝并回滚？这会删除镜像里的草稿分支 {{ bug.branch or '（无分支）' }}（提交先存进 refs/rejected 以便取回），并把这条置为已结案。trunk 不受影响。">
+      <div class="row-actions">
+        <input type="text" name="reject_reason" placeholder="拒绝原因（必填）" style="flex:1">
+        <button class="btn btn-reject" type="submit">拒绝并回滚 → 已完结</button>
       </div>
     </form>
   </div>

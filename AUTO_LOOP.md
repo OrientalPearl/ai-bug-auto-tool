@@ -606,7 +606,8 @@ Web /repos    各产品用哪个仓库、镜像在哪、正式 SVN 工作副本�
 | `git status` 里整棵 `.trae/**` 是 ` D`、`openvpn-2.4.8/INSTALL` 是 ` D` | 结构性噪音（`.trae` 是指向主人知识库根的符号链接 + 仓库里文件与盘上目录同名），**不是这次 bug 造成的**：不许 `checkout` 它们（会写穿符号链接覆盖知识库）、不许写进 `--files`、不许为此 `block` |
 | 在 Windows 侧改了 `xt_dscp.c`，结果 `xt_DSCP.c` 变了 / `git status` 说另一半被删 | Windows 的 `ignorecase` 把大小写对偶混成一个（实测两个拼名 md5 相同）。立刻 `git -c core.ignorecase=false checkout -- <被误改的那个>` 回退，改到 SSH 侧重做；这类事故只有 Linux 侧能看出来 |
 | 工作树/分支基线莫名变化，或 `git status` 里冒出**别的产品/别的禅道 ID** 的文件 | 两个产品共用了同一份镜像却被并行处理（违反 §5）：立刻停掉其中一条队列，在 SSH 侧 `git -c core.ignorecase=false status` 核对，被串味的分支 `git reset --hard <基线>` 重做；要让它们真并行只能给其中一个另开一份镜像 |
-| 某条被 AI 反复处理不满意 | `/review` 填原因「打回」→ `rejected`，自动回队列且优先级提升 |
+| 某条被 AI 反复处理不满意 | 两种处置别混：「打回」→ `rejected`，**改动与草稿分支都不回滚**，AI 在同一分支上追加提交，最终一次推入 SVN；「拒绝并回滚」→ 删掉该草稿分支（提交先存进 `refs/rejected/<分支>` 可取回），这条直接置 `closed`，AI 不再重做 |
+| 推入 SVN 失败（编码、护栏拦下、远端不可达） | **不改状态**：只追加一条 `kind=manual` 人工留痕 + 禅道留言，`git:<哈希>` 草稿记录不动；修好原因后重推即可，多次草稿提交会合并成一次 svn 提交 |
 | 模型或接口报限流（`rate limit` / `429` / `overloaded` / `quota` / 「稍后再试」/ 502、503） | **不许中止整轮**：等 5 分钟重试同一步，总共 3 次（`.env` 的 `RETRY_WAIT` / `RETRY_MAX`；本系统读禅道那侧已内置，会打印 `[retry] …等 N 秒后重试`）。3 次用完才 `block` 写「上游限流未恢复（已等 X 分钟重试 N 次）」，然后继续下一条。写类动作（评论、`i18n-commit`）不重试，失败就如实登记 |
 | 某一步需要授权（SSH 要密码、IDE 命令审批、沙箱越权、`sudo`、yes/no 交互、要人点「继续」） | **禁止出现，也禁止等**：本系统 svn 已 `--non-interactive`、SSH 只走免密 key（参数见该库 `CLAUDE.local.yaml`）。真绕不开就 `block` 写清「要主人做什么授权 / 为什么 / 影响面 / 怎么回滚」，立刻做下一条；不许调 `AskUserQuestion` 之类的提问工具 |
 | 提示「本地文件比仓库新，是否比较」 | 执行器自己按 §3.4 第三步取证（SSH 侧 `status` + `diff --ignore-cr-at-eol`）：只剩 CRLF / `$Id$` / 大小写对偶 / `.trae/**` 就当已知噪音照常做；是别人写的真实改动就**不覆盖不 stash 不 revert**，`block` 写「<文件> 有一份不是我改的改动：<摘要>」；都不许停下来问人 |

@@ -690,7 +690,14 @@ def record_review(
     reject_reason: str = "",
     merged_revision: str = "",
     reviewer: str = "owner",
+    change_status: bool = True,
 ) -> dict:
+    """Insert one review verdict.
+
+    ``change_status=False`` keeps a ledger entry without moving the bug -- used by
+    "reject and roll back", where the owner closes the bug instead of sending it
+    back to the queue.
+    """
     if result not in REVIEW_RESULTS:
         raise ValueError(f"unknown review result: {result}")
     ts = now_str()
@@ -701,8 +708,9 @@ def record_review(
         """,
         (bug_id, result, reject_reason, merged_revision, reviewer, ts),
     )
-    new_status = "merged" if result == "pass" else "rejected"
-    execute("UPDATE bugs SET status = ?, updated_at = ? WHERE id = ?", (new_status, ts, bug_id))
+    if change_status:
+        new_status = "merged" if result == "pass" else "rejected"
+        execute("UPDATE bugs SET status = ?, updated_at = ? WHERE id = ?", (new_status, ts, bug_id))
     return query_one("SELECT * FROM reviews WHERE id = ?", (review_id,))
 
 
