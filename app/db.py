@@ -237,6 +237,10 @@ EXTRA_COLUMNS = (
     ("bugs", "assigned_to_name", "TEXT"),
     ("bugs", "detail_synced_at", "TEXT"),
     ("svn_revisions", "files", "TEXT"),
+    # Which draft commit an SVN revision was actually made from. Round two of a
+    # reopened bug must diff against that commit, not against a stale mirror
+    # trunk, or the first round's already-landed change looks like a conflict.
+    ("svn_revisions", "git_commit", "TEXT NOT NULL DEFAULT ''"),
     ("need_solution", "done_at", "TEXT"),
     ("product_repos", "svn_working_copy", "TEXT NOT NULL DEFAULT ''"),
 )
@@ -390,7 +394,8 @@ def decorate_bug(row: dict) -> dict:
     row["docs"] = [a for a in row["attachments"] if a not in row["images"]]
     row["latest_revision"] = None
     revs = query_all(
-        "SELECT revision, branch, message, created_at FROM svn_revisions WHERE bug_id = ? ORDER BY id DESC",
+        "SELECT revision, branch, message, author, git_commit, created_at"
+        " FROM svn_revisions WHERE bug_id = ? ORDER BY id DESC",
         (row["id"],),
     )
     row["revisions"] = revs
@@ -502,7 +507,8 @@ def fetch_task_queue(limit: int = 5) -> list[dict]:
 
     Priority order:
       1. bugs whose need_solution got an owner reply (``replied``)
-      2. rejected bugs (review failed, redo)
+      2. rejected bugs (review failed, redo) -- a bug that was already accepted
+         once comes back as ``queue_kind='reopened'`` with ``prior_fix`` attached
       3. plain pending bugs
       4. stale ``fixing`` claims (a run killed by a model rate limit would
          otherwise strand them forever) -- see ``STALE_CLAIM_MINUTES``
@@ -551,7 +557,10 @@ def fetch_task_queue(limit: int = 5) -> list[dict]:
                 "SELECT * FROM reviews WHERE bug_id = ? ORDER BY id DESC", (row["id"],)
             )
             row["reject_reason"] = (last_review or {}).get("reject_reason")
-            row["queue_kind"] = "rejected"
+            # A bug that was already accepted once is a reopen, not a plain reject:
+            # the executor must inherit the previous round instead of re-deriving it.
+            row["prior_fix"] = prior_fix(row["id"])
+            row["queue_kind"] = "reopened" if row["prior_fix"]["was_merged"] else "rejected"
         elif row["status"] == "fixing":
             # Reclaimed: some earlier run claimed it and died before reporting.
             row["queue_kind"] = "stale"
@@ -639,13 +648,21 @@ def add_revision(
     message: str = "",
     author: str = "",
     files: list[str] | None = None,
+    git_commit: str = "",
 ) -> dict:
+    """Register one revision.
+
+    ``git_commit`` records the draft commit the revision was made from; the next
+    round of a reopened bug diffs against it instead of against the mirror trunk.
+    """
     rev_id = execute(
         """
-        INSERT INTO svn_revisions (bug_id, revision, branch, message, author, files, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO svn_revisions (bug_id, revision, branch, message, author, files,
+                                  git_commit, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (bug_id, str(revision), branch, message, author, _json_dump(files or []), now_str()),
+        (bug_id, str(revision), branch, message, author, _json_dump(files or []),
+         str(git_commit or ""), now_str()),
     )
     execute("UPDATE bugs SET updated_at = ? WHERE id = ?", (now_str(), bug_id))
     return query_one("SELECT * FROM svn_revisions WHERE id = ?", (rev_id,))
@@ -712,6 +729,78 @@ def record_review(
         new_status = "merged" if result == "pass" else "rejected"
         execute("UPDATE bugs SET status = ?, updated_at = ? WHERE id = ?", (new_status, ts, bug_id))
     return query_one("SELECT * FROM reviews WHERE id = ?", (review_id,))
+
+
+def prior_fix(bug_id: int) -> dict:
+    """Everything the previous round(s) of this bug produced, for the next round.
+
+    A reopened bug must not start from scratch: the executor gets the earlier
+    conclusion, the files that were touched, and the revision each round landed
+    in (``git:<哈希>`` draft commits and real SVN numbers alike).
+    """
+    bug = query_one("SELECT * FROM bugs WHERE id = ?", (int(bug_id),))
+    if bug is None:
+        return {}
+    revisions = query_all(
+        """
+        SELECT revision, branch, message, author, files, git_commit, created_at
+          FROM svn_revisions WHERE bug_id = ? ORDER BY id ASC
+        """,
+        (int(bug_id),),
+    )
+    for row in revisions:
+        row["files"] = _json_load(row.get("files")) or []
+    analyses = query_all(
+        """
+        SELECT kind, conclusion, root_cause, change_desc, impact, verify, unverified, created_at
+          FROM analyses WHERE bug_id = ? AND kind != 'manual' ORDER BY id DESC
+        """,
+        (int(bug_id),),
+    )
+    last = analyses[0] if analyses else None
+    reviews = query_all(
+        "SELECT result, reject_reason, merged_revision, created_at FROM reviews"
+        " WHERE bug_id = ? ORDER BY id ASC",
+        (int(bug_id),),
+    )
+    passes = [r for r in reviews if r["result"] == "pass"]
+    rejects = [r for r in reviews if r["result"] == "reject"]
+    promoted = [r for r in revisions if str(r["revision"]).isdigit()]
+    return {
+        "rounds": len(analyses),
+        "branch": bug.get("branch") or "",
+        "fix_summary": bug.get("fix_summary") or "",
+        "verify_steps": bug.get("verify_steps") or "",
+        "files_changed": _json_load(bug.get("files_changed")) or [],
+        "revisions": revisions,
+        "svn_revisions": [r["revision"] for r in promoted],
+        "promoted_commit": (promoted[-1].get("git_commit") or "") if promoted else "",
+        "promoted_at": promoted[-1]["created_at"] if promoted else "",
+        "last_analysis": last,
+        "was_merged": bool(passes),
+        "merged_revision": (passes[-1].get("merged_revision") or "") if passes else "",
+        "reject_reason": (rejects[-1].get("reject_reason") or "") if rejects else "",
+    }
+
+
+def reopen_bug(bug_id: int, reason: str, reviewer: str = "owner") -> dict:
+    """Send an already merged (or closed) bug back into the queue.
+
+    Nothing is undone: the real revision stays registered, the draft branch stays
+    where it is, and the review ledger keeps both verdicts -- pass first, reject
+    now -- so the next round can see what was accepted and what was found lacking.
+    """
+    bug = query_one("SELECT * FROM bugs WHERE id = ?", (int(bug_id),))
+    if bug is None:
+        raise ValueError(f"unknown bug id: {bug_id}")
+    if bug["status"] not in ("merged", "closed"):
+        raise ValueError(f"只有已合入或已结案的条目才能重开，当前是 {bug['status']}")
+    text = str(reason or "").strip()
+    if not text:
+        raise ValueError("重开必须写清哪里不完全")
+    record_review(int(bug_id), "reject", reject_reason=f"重开补修：{text}"[:500],
+                  reviewer=reviewer)
+    return query_one("SELECT * FROM bugs WHERE id = ?", (int(bug_id),)) or {}
 
 
 def list_review_queue() -> list[dict]:

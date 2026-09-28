@@ -193,6 +193,20 @@
           <span class="hint">仅更新本地状态并在禅道留言，禅道结案状态由主人手动确认。</span>
         </form>`;
     }
+    if (b.status === "merged" || b.status === "closed") {
+      const real = (b.revisions || []).map(r => r.revision).filter(v => /^\d+$/.test(String(v)));
+      const landedText = real.length ? esc("已入库 r" + real.join("/r")) : esc("只有本地草稿，未进正式库");
+      html += `
+        <h4>修得不完全？重开入队列</h4>
+        <form method="post" action="/bug/${esc(b.id)}/reopen" data-json="1">
+          <div class="row-actions">
+            <input type="text" name="reject_reason" placeholder="哪里不完全（必填，会和上一轮的结论一起下发给 AI）" style="flex:1">
+            <button class="btn btn-reject" type="submit"
+              data-ask="确认重开？这条回到 AI 队列（状态已打回）：${landedText}都保留、trunk 不回退，AI 在分支 ${esc(b.branch || "（无分支）")} 上接着补修，下一轮推送只带新的改动。">重开补修（入队列）</button>
+            <span class="hint">上一轮的分析结论、改动文件与修订号会作为 <code>prior_fix</code> 随任务发出，AI 不用从零再查一遍。</span>
+          </div>
+        </form>`;
+    }
     return html;
   }
 
@@ -413,10 +427,20 @@
     if (aligned.length) {
       text += `\n已按 trunk 对齐后再推的文件（${aligned.length} 个）：` + aligned.join(", ");
     }
+    const landed = Array.isArray(data.landed) ? data.landed : [];
+    if (landed.length) {
+      text += `\n上一轮已入库、本次不重复提交的文件（${landed.length} 个）：` + landed.join(", ");
+    }
+    if (data.round_note) {
+      text += `\n${data.round_note}`;
+    }
+    if (data.round) {
+      text += `\n这条已回到队列，是第 ${data.round} 轮：上一轮的结论、改动文件与修订号已随任务下发。`;
+    }
     if (data.ok === false && data.alignable) {
       text += "\n这些文件与 trunk 上的改动不重叠：勾上「自动按 trunk 对齐」再推即可，他人改动会原样保留。";
     }
-    return text.slice(0, 1600);
+    return text.slice(0, 2000);
   }
 
   document.addEventListener("submit", function (event) {

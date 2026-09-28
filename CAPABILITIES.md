@@ -81,6 +81,7 @@
 | GET | `/review` | 审查队列（每条含 AI 写回的分析结论与闸门逐条着色） | — |
 | POST | `/review/<bug_id>/pass` | 审查通过 → `merged` + 禅道评论 | `merged_revision` |
 | POST | `/review/<bug_id>/reject` | 打回 → `rejected` 重回队列 + 禅道评论；**不回滚改动**，AI 在同一草稿分支上继续改 | `reject_reason`（必填） |
+| POST | `/bug/<bug_id>/reopen` | **重开已合入/已结案的条目**：状态回到 `rejected` 重新入队，上一轮的结论、改动文件与修订号作为 `prior_fix` 随任务下发给 AI；已登记的 r 号与草稿分支都保留，trunk 不回退 | `reject_reason`（必填，写清哪里不完全） |
 | POST | `/bug/<bug_id>/reject-rollback` | 拒绝该修改：删除这条的草稿分支（提交先存进 `refs/rejected/<分支>` 以便取回）→ `closed` + 留痕 + 禅道评论；镜像 HEAD 正停在该分支时拒绝执行且不改状态 | `reject_reason`（必填） |
 | POST | `/bug/<bug_id>/svn-push` | 主人一键把该条的 git 草稿正式推入 SVN（`mode=dry` 只预检不写入）；成功登记真实 r 号 → `merged`，失败只追加人工留痕、状态与 `git:<哈希>` 记录不动。trunk 已被他人改动时预检会给出「谁改的 r 号」与可无损对齐的文件清单，`align=1`（弹窗勾选）对这些文件做三方合并后再推，重叠或增删仍整笔拒绝 | `message`（正式 svn log）、`mode`（`push`/`dry`）、`align`（可选 `1`） |
 | POST | `/bug/<bug_id>/close` | 人工结案 → `closed` + 禅道评论 | — |

@@ -281,10 +281,13 @@ def create_app() -> Flask:
             text = f"bug #{bug['zentao_id']} 推送被拒绝：{exc}"
             return reply({"ok": False, "summary": text, "detail": text}, "error", text)
 
-        files = [item.split("|", 1)[1] for item in prom.want if "|" in item]
+        files = prom.files_to_commit()
         # Several draft commits travel as one push: the diff is taken against the
-        # merge base with origin/trunk, so the owner sees the whole set here.
-        travelling = {"drafts": prom.drafts, "base": prom.base, "commit": prom.commit}
+        # merge base with origin/trunk, or against the commit that already landed
+        # when this bug was reopened after a first merge.
+        travelling = {"drafts": prom.drafts, "base": prom.base, "commit": prom.commit,
+                      "base_source": prom.base_source, "base_ref": prom.base_ref,
+                      "round_note": prom.round_note}
         # What trunk did under the draft, and whether it can be aligned for free --
         # the dialog offers the tick box on the strength of these.
         clash = {
@@ -292,6 +295,7 @@ def create_app() -> Flask:
             "mergeable": prom.mergeable, "overlaps": prom.overlaps,
             "blocked": prom.blocked, "alignable": bool(prom.mergeable) and not prom.overlaps,
             "aligned": prom.merged_files, "auto_merged": prom.auto_merged,
+            "landed": prom.landed,
         }
         if dry:
             clean = bool(prom.ready) and not prom.conflicts
@@ -306,12 +310,15 @@ def create_app() -> Flask:
         if prom.ok:
             db.add_revision(bug["id"], prom.revision, branch=bug.get("branch") or "",
                             message=message,
-                            author=get_settings().svn_username or "owner", files=files)
+                            author=get_settings().svn_username or "owner", files=files,
+                            git_commit=prom.commit)
             db.record_review(bug["id"], "pass", merged_revision=prom.revision)
             note = (f"已由主人从审查页正式推入 SVN：{prom.url} r{prom.revision}"
                     f"（{len(files)} 个文件）"
                     + (f"，其中 {len(prom.merged_files)} 个推送前已对齐到 trunk 现内容"
                        f"（{('、'.join(prom.merged_files))[:200]}）" if prom.merged_files else "")
+                    + (f"，{len(prom.landed)} 个文件上一轮已入库不再重复"
+                       f"（{('、'.join(prom.landed))[:200]}）" if prom.landed else "")
                     + f"。提交说明：{message}")
             result = sync.push_comment(bug["zentao_id"], note)
             text = (f"bug #{bug['zentao_id']} 已推入 SVN r{prom.revision}，"
@@ -422,6 +429,70 @@ def create_app() -> Flask:
         return reply({"ok": True, "summary": text, "detail": done.summary(),
                       "status": "closed", "branch": done.branch,
                       "shadow": done.shadow, "tip": done.tip}, "ok", text)
+
+    @app.route("/bug/<int:bug_id>/reopen", methods=["POST"])
+    def bug_reopen(bug_id: int):
+        """Reopen a merged (or closed) bug: the fix was not complete.
+
+        Nothing is undone -- the real revision stays, the draft branch stays, and
+        the review ledger keeps the earlier pass next to this reject, so the next
+        round inherits ``prior_fix`` (previous conclusion, files, revisions) instead
+        of starting from zero. The executor continues on the same branch and the
+        following push only carries the new commits.
+        """
+        bug = db.get_bug(bug_id)
+        if bug is None:
+            abort(404)
+        reason = str(_form().get("reject_reason") or "").strip()
+        inline = request.headers.get("X-Requested-With") == "fetch-dialog"
+
+        def reply(data: dict[str, Any], level: str, text: str):
+            if inline:
+                return jsonify(data)
+            flash(text, level)
+            return redirect(request.referrer or url_for("kanban"))
+
+        if bug["status"] not in ("merged", "closed"):
+            text = (f"bug #{bug['zentao_id']} 当前状态是"
+                    f"「{STATUS_LABELS.get(bug['status'], bug['status'])}」，"
+                    "只有已合入或已结案的条目才需要重开。")
+            return reply({"ok": False, "summary": text, "detail": text}, "error", text)
+        if not reason:
+            text = f"bug #{bug['zentao_id']} 重开必须写清哪里不完全。"
+            return reply({"ok": False, "summary": text, "detail": text}, "error", text)
+
+        prior = db.prior_fix(bug["id"])
+        landed = prior["svn_revisions"]
+        trail = "、".join(f"r{r}" for r in landed) if landed else "只有本地草稿，未进正式库"
+        try:
+            db.reopen_bug(bug["id"], reason)
+        except ValueError as exc:
+            text = f"bug #{bug['zentao_id']} 重开失败：{exc}"
+            return reply({"ok": False, "summary": text, "detail": text}, "error", text)
+        db.add_analysis(
+            bug["id"],
+            {
+                "conclusion": f"主人判定上一轮修得不完全，已重开入队列（第 {prior['rounds'] + 1} 轮）",
+                "symptom": f"重开原因：{reason}",
+                "evidence": f"上一轮登记：{trail}；改动文件："
+                            + ("、".join(prior["files_changed"][:8]) or "未登记"),
+                "impact": "trunk 已有上一轮的改动，本轮是增量补修，不许推翻已入库内容",
+                "verify": "先读 prior_fix.last_analysis 与 prior_fix.files_changed，再在原分支上续改",
+                "unverified": "本轮尚未开始，未验证",
+                "rollback": "无远端写入；要撤回这次重开只能重新审查",
+            },
+            kind="manual", author="owner",
+        )
+        note = (f"人工审查后重开（第 {prior['rounds'] + 1} 轮）：上一轮{trail}，但仍不完全。"
+                f"不完全的地方：{reason}。"
+                "已把上一轮的结论、改动文件与修订号一并交回 AI，AI 会在原分支上续修。")
+        result = sync.push_comment(bug["zentao_id"], note)
+        text = (f"bug #{bug['zentao_id']} 已重开入队列（状态已打回），"
+                f"上一轮的修复与结论已随任务下发。"
+                + ("" if result["ok"] else f" 禅道评论未写入：{result['detail'][:120]}"))
+        return reply({"ok": True, "summary": text, "detail": note,
+                      "status": "rejected", "round": prior["rounds"] + 1,
+                      "prior_revisions": landed}, "ok", text)
 
     @app.route("/bug/<int:bug_id>/close", methods=["POST"])
     def bug_close(bug_id: int):

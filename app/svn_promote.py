@@ -92,6 +92,12 @@ class Promotion:
     blocked: list[str] = field(default_factory=list)
     auto_merged: str = ""
     merged_files: list[str] = field(default_factory=list)
+    landed: list[str] = field(default_factory=list)
+    landed_summary: str = ""
+    todo: list[str] = field(default_factory=list)
+    base_source: str = ""
+    base_ref: str = ""
+    base_fall: str = ""
     hint: str = ""
     pending: list[str] = field(default_factory=list)
     revision: str = ""
@@ -104,18 +110,43 @@ class Promotion:
     markers: list[tuple[str, str]] = field(default_factory=list)
     raw: str = ""
 
+    def files_to_commit(self) -> list[str]:
+        """The relative paths this push actually writes (draft list minus landed)."""
+        source = self.todo or self.want
+        return [item.split("|", 1)[1] for item in source if "|" in item]
+
     def summary(self) -> str:
+        count = len(self.files_to_commit())
         if self.ok:
             tail = f"，其中 {len(self.merged_files)} 个已按 trunk 对齐" if self.merged_files else ""
-            return f"已推入 SVN：r{self.revision}（{len(self.want)} 个文件{tail}）"
+            if self.landed:
+                tail += f"，{len(self.landed)} 个上一轮已入库的不再重复提交"
+            return f"已推入 SVN：r{self.revision}（{count} 个文件{tail}）"
         if self.ready:
             extra = "，含自动对齐" if self.auto_merged else ""
+            if self.landed:
+                extra += f"，跳过 {len(self.landed)} 个已入库文件"
             return f"预检通过：{self.ready}（没有写入任何东西{extra}）"
         return self.error or f"推送未完成（exit {self.exit_code}）"
+
+    @property
+    def round_note(self) -> str:
+        """How this push is based: fresh from trunk, or on top of a landed round."""
+        if self.base_source == "promoted":
+            return f"本轮是补修：增量基准取上一轮推入的草稿提交 {self.base_ref[:10]}"
+        if self.base_fall:
+            return f"本轮增量基准不可用，已退回 origin/trunk：{self.base_fall}"
+        return ""
 
     def detail(self) -> str:
         """Human-readable evidence for the dialog note and the failure record."""
         bits = [self.summary()]
+        if self.round_note:
+            bits.append(self.round_note)
+        if self.landed_summary:
+            bits.append("已入库跳过：" + self.landed_summary)
+        elif self.landed:
+            bits.append("trunk 上已是草稿内容的文件：" + "、".join(self.landed[:6]))
         if self.conflicts:
             bits.append("trunk 已变动的文件：" + "；".join(self.conflicts[:6]))
         # A refusal should name the revision that moved, not just the md5 pair.
@@ -211,7 +242,7 @@ _SCRIPT = r"""
 # Every decision is reported as "PV|<tag>|<value>" for app/svn_promote.py.
 export LC_ALL=C LANG=C
 set -f
-MIRROR=$1; REF=$2; WCPATH=$3; MSG_B64=$4; DRY=$5; MERGE=$6
+MIRROR=$1; REF=$2; WCPATH=$3; MSG_B64=$4; DRY=$5; MERGE=$6; BASE_REF=$7
 TAB=$(printf '\t')
 P() { printf 'PV|%s|%s\n' "$1" "$2"; }
 TMPN=$(mktemp) || { P err "mktemp 失败"; exit 1; }
@@ -221,8 +252,11 @@ TMPT=$(mktemp) || { P err "mktemp 失败"; exit 1; }
 TMPP=$(mktemp) || { P err "mktemp 失败"; exit 1; }
 TMPM=$(mktemp) || { P err "mktemp 失败"; exit 1; }
 TMPX=$(mktemp) || { P err "mktemp 失败"; exit 1; }
+TMPL=$(mktemp) || { P err "mktemp 失败"; exit 1; }
+TMPA=$(mktemp) || { P err "mktemp 失败"; exit 1; }
+TMPQ=$(mktemp) || { P err "mktemp 失败"; exit 1; }
 MDIR=$(mktemp -d) || { P err "mktemp -d 失败"; exit 1; }
-trap 'rm -rf "$TMPN" "$TMPW" "$TMPC" "$TMPT" "$TMPP" "$TMPM" "$TMPX" "$MDIR" 2>/dev/null' EXIT
+trap 'rm -rf "$TMPN" "$TMPW" "$TMPC" "$TMPT" "$TMPP" "$TMPM" "$TMPX" "$TMPL" "$TMPA" "$TMPQ" "$MDIR" 2>/dev/null' EXIT
 abort() {
   P err "$1"
   if [ "$2" = dirty ]; then
@@ -280,19 +314,31 @@ URL=$(git config --get svn-remote.svn.url 2>/dev/null)
 [ -n "$URL" ] || abort "镜像里没有 svn-remote.svn.url，无法确定正式库地址"
 P url "$URL"
 
-git rev-parse --verify refs/remotes/origin/trunk >/dev/null 2>&1 \
-  || abort "镜像缺 refs/remotes/origin/trunk（就绪判据没过），先按 §1.5 修镜像"
 COMMIT=$(git rev-parse --verify "$REF^{commit}" 2>/dev/null)
 [ -n "$COMMIT" ] || abort "草稿提交在镜像里找不到: $REF"
-BASE=$(git merge-base refs/remotes/origin/trunk "$COMMIT" 2>/dev/null)
-[ -n "$BASE" ] || abort "找不到 $COMMIT 与 origin/trunk 的共同祖先"
+if [ -n "$BASE_REF" ] && git rev-parse --verify "$BASE_REF^{commit}" >/dev/null 2>&1 \
+   && git merge-base --is-ancestor "$BASE_REF" "$COMMIT" 2>/dev/null; then
+  # Round two of a reopened bug: the previous round is already in trunk, so the
+  # increment has to be measured from the commit that was pushed, not from the
+  # (usually stale) mirror trunk. Otherwise the first round's own change reads
+  # as "somebody else edited this file" and the bug can never be finished.
+  BASE=$(git rev-parse "$BASE_REF^{commit}")
+  P base_source promoted
+else
+  [ -n "$BASE_REF" ] && P basefall "$BASE_REF 不是 $COMMIT 的祖先（分支被改写或重开过），改用 origin/trunk 作基准"
+  git rev-parse --verify refs/remotes/origin/trunk >/dev/null 2>&1 \
+    || abort "镜像缺 refs/remotes/origin/trunk（就绪判据没过），先按 §1.5 修镜像"
+  BASE=$(git merge-base refs/remotes/origin/trunk "$COMMIT" 2>/dev/null)
+  [ -n "$BASE" ] || abort "找不到 $COMMIT 与 origin/trunk 的共同祖先"
+  P base_source trunk
+fi
 P commit "$COMMIT"
 P base "$BASE"
 git rev-list --abbrev-commit "$BASE..$COMMIT" 2>/dev/null |
   sed '/^$/d' | while read C; do P draft "$C"; done
 
 git diff --name-status "$BASE" "$COMMIT" > "$TMPN" 2>/dev/null
-[ -s "$TMPN" ] || abort "草稿相对 origin/trunk 没有任何改动: $COMMIT"
+[ -s "$TMPN" ] || abort "草稿相对基准 $(printf '%.10s' "$BASE") 没有任何改动"
 while IFS="$TAB" read ST P1 P2; do
   [ -n "$ST" ] || continue
   case "$ST" in
@@ -307,23 +353,6 @@ done < "$TMPN"
 [ -s "$TMPW" ] || abort "草稿 diff 解析不出文件清单"
 while IFS="$TAB" read ST RP; do P want "$ST|$RP"; done < "$TMPW"
 
-# Absolute commit targets plus the working-copy dirs that own them. svn 1.6 keeps
-# every depth-empty checkout as a *nested* working copy, so neither `svn status`
-# nor `svn ci` on the root sees what lives under it -- all later steps therefore
-# work off these explicit target lists.
-: > "$TMPT"
-: > "$TMPP"
-while IFS="$TAB" read ST RP; do
-  _dir=$(dirname "$RP")
-  if [ "$_dir" = "." ]; then
-    printf '%s\n' "$WCPATH" >> "$TMPP"
-  else
-    printf '%s\n' "$WCPATH/$_dir" >> "$TMPP"
-  fi
-  printf '%s\n' "$WCPATH/$RP" >> "$TMPT"
-done < "$TMPW"
-sort -u "$TMPP" -o "$TMPP"
-
 # Guard 1: the draft's base must still be what trunk holds, or somebody else has
 # landed on the same file after the draft was cut. By default that refuses the
 # push outright. With MERGE=1 (the owner ticked "自动按 trunk 对齐") a file whose
@@ -333,18 +362,66 @@ sort -u "$TMPP" -o "$TMPP"
 # real overlap, an add/delete clash, a file trunk no longer has) blocks the push.
 : > "$TMPM"
 : > "$TMPX"
+: > "$TMPA"
 while IFS="$TAB" read ST RP; do
-  SMD5=$(timeout 90 svn cat --non-interactive "$URL/$RP" 2>/dev/null | md5sum | cut -d' ' -f1)
-  GMD5=$(git show "$BASE:$RP" 2>/dev/null | md5sum | cut -d' ' -f1)
+  [ -n "$RP" ] || continue
+  _pre=$(printf '%s' "$RP" | tr '/ ' '__')
+  # Existence has to come from the command's exit status: `svn cat` on a missing
+  # path yields empty output, and md5sum of empty output is a perfectly good hash
+  # (d41d8cd...), which used to make "trunk does not have this file" look like a
+  # content difference and refuse clean additions.
+  if timeout 90 svn cat --non-interactive "$URL/$RP" > "$MDIR/$_pre.trunk" 2>/dev/null; then
+    SMD5=$(md5sum < "$MDIR/$_pre.trunk" | cut -d' ' -f1); HAVE_T=1
+  else
+    SMD5=""; HAVE_T=0
+  fi
+  if git show "$BASE:$RP" > "$MDIR/$_pre.base" 2>/dev/null; then
+    GMD5=$(md5sum < "$MDIR/$_pre.base" | cut -d' ' -f1); HAVE_B=1
+  else
+    GMD5=""; HAVE_B=0
+  fi
+  if git show "$COMMIT:$RP" > "$MDIR/$_pre.mine" 2>/dev/null; then
+    DMD5=$(md5sum < "$MDIR/$_pre.mine" | cut -d' ' -f1); HAVE_D=1
+  else
+    DMD5=""; HAVE_D=0
+  fi
+
+  if [ "$HAVE_T" = 1 ] && [ "$HAVE_D" = 1 ] && [ "$SMD5" = "$DMD5" ]; then
+    # trunk already holds exactly what this draft would write: an earlier round of
+    # the same bug that landed (typically pushed by hand before the bug was
+    # reopened). Not a conflict, and committing it again would be an empty revision.
+    P already "$ST $RP"
+    printf '%s\n' "$RP" >> "$TMPA"
+    continue
+  fi
   STOMP=
-  case "$ST" in
-    A) if [ -n "$SMD5" ]; then
-         if [ "$SMD5" = "$GMD5" ]; then WHY=same; else WHY=diff; STOMP=1; fi
-         printf '%s\n' "A $RP trunk 上已存在同名文件（内容 $WHY）" >> "$TMPC"
-       fi ;;
-    *) if [ -z "$SMD5" ]; then
+   case "$ST" in
+     A) if [ "$HAVE_T" = 1 ]; then
+          printf '%s\n' "A $RP trunk 上已存在同名文件（内容 $([ "$SMD5" = "$GMD5" ] && echo same || echo diff)）" >> "$TMPC"
+          STOMP=1
+        fi ;;
+    D*) if [ "$HAVE_T" = 0 ]; then
+          # The file this draft deletes is already gone from trunk: the intended
+          # end state holds, so there is nothing left to commit for it.
+          P already "D $RP"
+          printf '%s\n' "$RP" >> "$TMPA"
+          continue
+        fi
+        if [ "$HAVE_B" = 0 ]; then
+          printf '%s\n' "D $RP 草稿基线里没有该文件，无法比对" >> "$TMPC"
+          printf '%s\n' "$RP|草稿基线里也没有这个文件，无法判断谁删的" >> "$TMPX"
+          STOMP=1
+        elif [ "$SMD5" != "$GMD5" ]; then
+          printf '%s\n' "D $RP trunk 内容已变动 svn=$SMD5 base=$GMD5（删除要先对齐）" >> "$TMPC"
+          STOMP=1
+        fi ;;
+    *) if [ "$HAVE_T" = 0 ]; then
          printf '%s\n' "$ST $RP trunk 上已找不到该文件（可能已被别人删除）" >> "$TMPC"
          printf '%s\n' "$RP|trunk 上文件已不存在，不能自动合并" >> "$TMPX"
+         STOMP=1
+       elif [ "$HAVE_B" = 0 ]; then
+         printf '%s\n' "$ST $RP 草稿基线里没有该文件，无法比对" >> "$TMPC"
+         printf '%s\n' "$RP|草稿基线里也没有这个文件，无法判断谁改的" >> "$TMPX"
          STOMP=1
        elif [ "$SMD5" != "$GMD5" ]; then
          printf '%s\n' "$ST $RP trunk 内容已变动 svn=$SMD5 base=$GMD5" >> "$TMPC"
@@ -364,20 +441,17 @@ while IFS="$TAB" read ST RP; do
     *) printf '%s\n' "$RP|状态 $ST（新增或删除）需要人工判断" >> "$TMPX"
        continue ;;
   esac
-  _slug=$(printf '%s' "$RP" | tr '/ ' '__')
-  git show "$COMMIT:$RP" > "$MDIR/$_slug.mine" 2>/dev/null || \
-    { printf '%s\n' "$RP|取草稿内容失败" >> "$TMPX"; continue; }
-  git show "$BASE:$RP" > "$MDIR/$_slug.base" 2>/dev/null || \
-    { printf '%s\n' "$RP|取草稿基线失败" >> "$TMPX"; continue; }
-  timeout 90 svn cat --non-interactive "$URL/$RP" > "$MDIR/$_slug.trunk" 2>/dev/null || \
-    { printf '%s\n' "$RP|取 trunk 内容失败" >> "$TMPX"; continue; }
-  cp "$MDIR/$_slug.mine" "$MDIR/$_slug.out" 2>/dev/null || \
+  cp "$MDIR/$_pre.mine" "$MDIR/$_pre.out" 2>/dev/null || \
     { printf '%s\n' "$RP|准备合并目标失败" >> "$TMPX"; continue; }
-  if git merge-file "$MDIR/$_slug.out" "$MDIR/$_slug.base" "$MDIR/$_slug.trunk" 2>/dev/null; then
+  if [ "$HAVE_B" = 0 ] || [ "$HAVE_D" = 0 ]; then
+    printf '%s\n' "$RP|草稿侧内容取不到，无法三方合并" >> "$TMPX"
+    continue
+  fi
+  if git merge-file "$MDIR/$_pre.out" "$MDIR/$_pre.base" "$MDIR/$_pre.trunk" 2>/dev/null; then
     P mergeable "$RP"
-    printf '%s\t%s\n' "$RP" "$MDIR/$_slug.out" >> "$TMPM"
+    printf '%s\t%s\n' "$RP" "$MDIR/$_pre.out" >> "$TMPM"
   else
-    rm -f "$MDIR/$_slug.out"
+    rm -f "$MDIR/$_pre.out"
     printf '%s\n' "$RP|trunk 与草稿改到了同一行区间" >> "$TMPX"
     P overlap "$RP trunk 与草稿改到了同一行区间"
   fi
@@ -399,6 +473,36 @@ if [ -s "$TMPC" ]; then
   fi
 fi
 
+# What is actually left to commit: the draft's file list minus the files trunk
+# already holds. Absolute commit targets plus the working-copy dirs that own them
+# are built from that, because svn 1.6 keeps every depth-empty checkout as a
+# *nested* working copy -- neither `svn status` nor `svn ci` on the root sees what
+# lives under it, so all later steps work off these explicit target lists.
+: > "$TMPQ"
+while IFS="$TAB" read ST RP; do
+  [ -n "$RP" ] || continue
+  grep -qxF "$RP" "$TMPA" && continue
+  printf '%s\t%s\n' "$ST" "$RP" >> "$TMPQ"
+done < "$TMPW"
+NA=$(wc -l < "$TMPA" | tr -d ' ')
+NQ=$(wc -l < "$TMPQ" | tr -d ' ')
+[ "$NA" -gt 0 ] && P summary_landed "$NA 个文件 trunk 上已是草稿内容（上一轮已入库），本次跳过"
+[ "$NQ" -gt 0 ] || abort "草稿内容与 trunk 已经一致，没有需要提交的东西（本条大概已经推入过了）"
+
+: > "$TMPT"
+: > "$TMPP"
+while IFS="$TAB" read ST RP; do
+  [ -n "$RP" ] || continue
+  _dir=$(dirname "$RP")
+  if [ "$_dir" = "." ]; then
+    printf '%s\n' "$WCPATH" >> "$TMPP"
+  else
+    printf '%s\n' "$WCPATH/$_dir" >> "$TMPP"
+  fi
+  printf '%s\n' "$WCPATH/$RP" >> "$TMPT"
+done < "$TMPQ"
+sort -u "$TMPP" -o "$TMPP"
+
 # Guard 2: the dirs we are about to use must start clean. That checkout is owned by
 # this script alone and is never edited by hand, so anything found in it is the
 # debris of an earlier interrupted push: it is reverted and dropped automatically
@@ -412,7 +516,7 @@ if [ -n "$(wc_status)" ]; then
 fi
 
 if [ "$DRY" = 1 ]; then
-  P ready "$(wc -l < "$TMPW") 个文件待写入 $WCPATH 并提交进 $URL"
+  P ready "$NQ 个文件待写入 $WCPATH 并提交进 $URL"
   exit 0
 fi
 
@@ -462,36 +566,78 @@ while IFS="$TAB" read ST RP; do
            || abort "导出草稿内容失败: $RP" dirty
        fi ;;
   esac
-done < "$TMPW"
+done < "$TMPQ"
 
-# Guard 3: what svn is about to send must be exactly the draft's file list.
+# Guard 3: svn must be about to send exactly the planned list. A planned file that
+# shows no local change is skipped only when the content sitting in the working
+# copy is byte for byte what trunk holds -- after an aligned merge that happens
+# whenever the other person's change already covers our hunk. Any other mismatch
+# means plan and repository disagree, and it stops the push before a byte lands.
 PENDING=$(wc_status | grep -v '^?')
 printf '%s\n' "$PENDING" | sed 's|^[^/]*||' | sed '/^$/d' | sort > "$TMPN"
 sort "$TMPT" > "$TMPC"
 EXTRA=$(comm -23 "$TMPN" "$TMPC" | sed '/^$/d')
-MISSING=$(comm -13 "$TMPN" "$TMPC" | sed '/^$/d')
-printf '%s\n' "$PENDING" | sed '/^$/d' | while read L; do P pend "$L"; done
-if [ -n "$EXTRA" ] || [ -n "$MISSING" ]; then
-  abort "待提交清单与草稿不一致 extra=[$(printf '%s' "$EXTRA" | tr '\n' ';' | cut -c1-300)] missing=[$(printf '%s' "$MISSING" | tr '\n' ';' | cut -c1-300)]" dirty
+if [ -n "$EXTRA" ]; then
+  abort "待提交清单里有草稿之外的文件 extra=[$(printf '%s' "$EXTRA" | tr '\n' ';' | cut -c1-300)]" dirty
 fi
+printf '%s\n' "$PENDING" | sed '/^$/d' | while read L; do P pend "$L"; done
+: > "$TMPL"
+while IFS="$TAB" read ST RP; do
+  [ -n "$RP" ] || continue
+  ABS="$WCPATH/$RP"
+  if grep -qxF "$ABS" "$TMPN"; then
+    printf '%s\n' "$ABS" >> "$TMPL"
+    continue
+  fi
+  SM=$(timeout 90 svn cat --non-interactive "$URL/$RP" 2>/dev/null | md5sum | cut -d' ' -f1)
+  LM=$(md5sum < "$ABS" 2>/dev/null | cut -d' ' -f1)
+  case "$ST" in
+    D*) if [ -z "$SM" ]; then
+          P landed "D $RP（trunk 上已经没有这个文件）"
+          printf '%s\n' "$RP" >> "$TMPA"
+          continue
+        fi ;;
+    *) if [ -n "$SM" ] && [ "$SM" = "$LM" ]; then
+         P landed "$ST $RP（trunk 上已是这个内容，本次不重复提交）"
+         printf '%s\n' "$RP" >> "$TMPA"
+         continue
+       fi ;;
+  esac
+  abort "待提交清单与草稿不一致：$RP 既不在待提交里，内容也和 trunk 对不上 svn=$SM local=$LM" dirty
+done < "$TMPQ"
+sort -u "$TMPL" -o "$TMPL"
+[ -s "$TMPL" ] || abort "草稿内容与 trunk 已经一致，没有需要提交的东西（本条大概已经推入过了）"
+# Final numbers: landed may have grown inside guard 3, and the owner must see the
+# list svn is really about to commit, not the list the draft touched.
+NA=$(wc -l < "$TMPA" | tr -d ' ')
+while IFS="$TAB" read ST RP; do
+  [ -n "$RP" ] || continue
+  grep -qxF "$WCPATH/$RP" "$TMPL" && P todo "$ST|$RP"
+done < "$TMPQ"
 
 MSGF=$(mktemp)
 printf '%s' "$MSG_B64" | base64 -d > "$MSGF" 2>/dev/null || abort "提交说明解码失败" dirty
 [ -s "$MSGF" ] || abort "提交说明为空" dirty
 
 # Say so in the log itself: without this line a reader comparing the commit with
-# the draft branch would wonder where the extra trunk context came from.
+# the draft branch would wonder where the extra trunk context came from, or why a
+# file the draft touched is missing from the revision.
 if [ "$MERGE" = 1 ] && [ -s "$TMPM" ]; then
   ALIGNED=$(awk -F'\t' '{printf "%s ", $1}' "$TMPM" | sed 's/ $//')
   printf '\n（推送前已将以下文件对齐到 trunk 现内容，本次提交只含本草稿的改动：%s）\n' \
     "$ALIGNED" >> "$MSGF"
   P annotated "$ALIGNED"
 fi
+if [ "$NA" -gt 0 ]; then
+  SKIPPED=$(tr '\n' ' ' < "$TMPA" | sed 's/ $//' | cut -c1-300)
+  printf '\n（以下文件上一轮已进过 trunk，本次不重复提交：%s）\n' "$SKIPPED" >> "$MSGF"
+  P annotated_landed "$SKIPPED"
+fi
 
 set --
 while read T; do
   [ -n "$T" ] && set -- "$@" "$T"
-done < "$TMPT"
+done < "$TMPL"
 [ $# -gt 0 ] || abort "提交目标为空" dirty
 P target "$1"
 P targets "$#"
@@ -529,7 +675,7 @@ def _decode(raw: bytes) -> str:
 
 
 def _run_script(target: RemoteTarget, ref: str, message: str, dry_run: bool,
-                merge_trunk: bool = False) -> tuple[int, str]:
+                merge_trunk: bool = False, base_ref: str = "") -> tuple[int, str]:
     args = [
         target.mirror,
         ref,
@@ -537,6 +683,7 @@ def _run_script(target: RemoteTarget, ref: str, message: str, dry_run: bool,
         base64.b64encode(message.encode("utf-8")).decode("ascii"),
         "1" if dry_run else "0",
         "1" if merge_trunk else "0",
+        base_ref or "",
     ]
     quoted = " ".join("'" + str(a).replace("'", "'\\''") + "'" for a in args)
     cmd = target.ssh_command(f"sh -s {quoted}")
@@ -587,6 +734,16 @@ def _parse(text: str, carrier: Promotion) -> Promotion:
             carrier.blocked.append(value)
         elif tag == "merged":
             carrier.merged_files.append(value)
+        elif tag == "already":
+            carrier.landed.append(value)
+        elif tag == "summary_landed":
+            carrier.landed_summary = value
+        elif tag == "todo":
+            carrier.todo.append(value)
+        elif tag == "basefall":
+            carrier.base_fall = value
+        elif tag == "base_source":
+            carrier.base_source = value
         elif tag == "auto":
             carrier.auto_merged = value
         elif tag == "hint":
@@ -610,8 +767,20 @@ def _parse(text: str, carrier: Promotion) -> Promotion:
     return carrier
 
 
-def promote(bug: dict, message: str, *, dry_run: bool = False,
-            merge_trunk: bool = False) -> Promotion:
+def promoted_commit(bug: dict) -> str:
+    """The draft commit this bug last really landed in SVN, if the system pushed it.
+
+    Round two of a reopened bug must measure its increment from that commit; the
+    mirror's ``origin/trunk`` is normally older than the push itself.
+    """
+    for rev in bug.get("revisions") or []:
+        if str(rev.get("revision") or "").isdigit() and str(rev.get("git_commit") or "").strip():
+            return str(rev["git_commit"]).strip()
+    return ""
+
+
+def promote(bug: dict, message: str, *, dry_run: bool = False, merge_trunk: bool = False,
+            base_ref: str | None = None) -> Promotion:
     """Push one draft into SVN; with ``dry_run`` only the preflight runs.
 
     The reference is the bug's branch when it is registered (so several draft
@@ -648,8 +817,11 @@ def promote(bug: dict, message: str, *, dry_run: bool = False,
 
     carrier = Promotion(dry_run=dry_run, ref=candidates[0], wc=target.wc,
                         merge_trunk=bool(merge_trunk))
+    if base_ref is None:
+        base_ref = promoted_commit(bug)
+    carrier.base_ref = str(base_ref or "")
     carrier.exit_code, output = _run_script(target, carrier.ref, text, dry_run,
-                                            bool(merge_trunk))
+                                            bool(merge_trunk), carrier.base_ref)
     prom = _parse(output, carrier)
     if not prom.ok and not prom.error and not prom.ready:
         prom.error = f"远端执行未完成（exit {prom.exit_code}）"

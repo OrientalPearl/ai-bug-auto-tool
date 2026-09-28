@@ -160,7 +160,10 @@ python -m app.cli doctor                   # 禅道通道分步诊断
    `ssh <SSH用户>@<SSH主机> "cd <镜像> && git -c core.ignorecase=false checkout -b bugfix/zentao-<禅道ID> refs/remotes/origin/trunk"`；
    **`queue_kind=rejected` 的重做不许另开分支、不许 `reset --hard` 丢掉上一轮**：上一轮的草稿分支还在
    （打回只改状态，不回滚改动），直接切回它继续追加提交 —— 主人推送时取的是分支相对 `origin/trunk`
-   的合并差异，几轮改动会合成一次 svn 提交；分支已被主人「拒绝并回滚」删掉的，这条应是 `closed` 不会进队列
+   的合并差异，几轮改动会合成一次 svn 提交；分支已被主人「拒绝并回滚」删掉的，这条应是 `closed` 不会进队列；
+   **`queue_kind=reopened` 是「已合入过但仍不完全」**：先读任务里的 `prior_fix`（`last_analysis` 的结论/根因/改动、
+   `files_changed`、`svn_revisions` 已入库的 r 号、`reject_reason` 主人写的不完全之处），在同一个 `prior_fix.branch`
+   上继续追加提交；上一轮改动已在 trunk 里，**不许推翻或改写已入库的内容**，只补差异
    然后**先读该库自带的知识体系**（镜像根 `CLAUDE.md` 选入口 → 命中指针读 `.trae/` 下的 `registry|doc|playbooks` →
    跨层看 `.trae/doc/ARCHITECTURE.md` → 落点目录的 `.trae/agents/<相对路径>/AGENT.md` → 流程按 `.trae/skills/`），
    再定位修改点，只改与这条 bug 直接相关的文件；改之前用 `git ls-files <路径>` 在 Linux 侧核对大小写拼名
@@ -296,11 +299,12 @@ python -m app.cli block <禅道ID> --question "..." --options "..." --advice "..
     `git -c core.ignorecase=false status --porcelain -- <文件>` + `diff --ignore-cr-at-eol -- <文件>` 取证；
     差异只剩 CRLF / `$Id$` / 大小写对偶 / `.trae/**` → 按 §「落码位置」的结构性噪音照常做；
     是别人写的真实改动 → 不覆盖、不 `stash`、不 `revert`、不 `checkout` 复原，`block` 写明摘要
-28. **禁止执行器碰「推 SVN」与「拒绝并回滚」通道**：`/bug/<id>/svn-push`（`app/svn_promote.py`）是主人点审查弹窗
-    才走的正式进库动作，它会把草稿真实 `svn ci` 进 trunk；`/bug/<id>/reject-rollback` 同理，它会删掉这条的草稿分支
-    并把这条关掉。执行器既不许调用这两个接口，也不许自己复刻它们的命令序列（那等于违反 11/26 里的 G11），
-    **更不许为了推得动去放宽 `app/svn_promote.py` 的护栏或自己勾「自动按 trunk 对齐」**（`align=1` 是主人的决定）；
-    你只负责把草稿提交成 `git:<哈希>` 并登记，推不推、回不回滚、对齐不对齐、用什么提交说明，都是主人的决定
+28. **禁止执行器碰「推 SVN」「拒绝并回滚」「重开」三个通道**：`/bug/<id>/svn-push`（`app/svn_promote.py`）是主人点审查弹窗
+    才走的正式进库动作，它会把草稿真实 `svn ci` 进 trunk；`/bug/<id>/reject-rollback` 会删掉这条的草稿分支
+    并把这条关掉；`/bug/<id>/reopen` 会把已合入的条目重新放回队列。执行器既不许调用这三个接口，也不许自己复刻它们的命令序列
+    （那等于违反 11/26 里的 G11），**更不许为了推得动去放宽 `app/svn_promote.py` 的护栏或自己勾「自动按 trunk 对齐」**
+    （`align=1` 是主人的决定）；你只负责把草稿提交成 `git:<哈希>` 并登记，推不推、回不回滚、重不重开、对齐不对齐、
+    用什么提交说明，都是主人的决定
 29. **草稿基线比 trunk 旧不是你重做的理由**：镜像 `refs/remotes/origin/trunk` 落后于真实 trunk 时，
     推送会被护栏拦下（`trunk 相对草稿基线已有他人改动`），这是主人的事——他勾「自动按 trunk 对齐」或先 fetch 镜像。
     你若在镜像里看到同一文件已被别人改了（`svn log`/`git log` 取证），就在 `block` 或分析里写清「第 N 行区间已被 rXXXXX 改过」，

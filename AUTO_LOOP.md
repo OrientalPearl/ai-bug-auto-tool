@@ -449,6 +449,18 @@ ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git -c core.ignorecase=false d
 python -m app.cli status <禅道ID>       # 推完再看一眼：r<号> 与 git:<哈希> 会同时挂在这条名下
 ```
 
+推完发现修得不完全，就在详情弹窗点「重开补修（入队列）」（`/bug/<id>/reopen`，必填哪里不完全）：
+这条回到 `rejected` 重新入队，`queue_kind=reopened`，上一轮的结论/改动文件/r 号作为 `prior_fix`
+一起下发；登记的 r 号与草稿分支都不删，**trunk 不回退**（要回退是你自己的 svn 动作）。
+下一轮推送会自动以「上一轮推入的那个草稿提交」为增量基准（推送成功时 `svn_revisions.git_commit`
+记下了它），只提交新改动；trunk 上已经是草稿内容的文件直接跳过并在提交说明里注明，
+整批都一致时整笔拒——不会造空修订。拿不到那个提交（历史条目手工合入的）时会退回
+`origin/trunk` 口径并靠「已落地」识别跳过，必要时勾「自动按 trunk 对齐」。
+
+```
+python -m app.cli tasks --limit 5       # 队列里 queue_kind=reopened 的行会带 prior_fix
+```
+
 想手工做也可以，顺序与按钮一致（`--non-interactive` 保证不会弹密码）：
 
 ```
@@ -613,7 +625,8 @@ Web /repos    各产品用哪个仓库、镜像在哪、正式 SVN 工作副本�
 | `git status` 里整棵 `.trae/**` 是 ` D`、`openvpn-2.4.8/INSTALL` 是 ` D` | 结构性噪音（`.trae` 是指向主人知识库根的符号链接 + 仓库里文件与盘上目录同名），**不是这次 bug 造成的**：不许 `checkout` 它们（会写穿符号链接覆盖知识库）、不许写进 `--files`、不许为此 `block` |
 | 在 Windows 侧改了 `xt_dscp.c`，结果 `xt_DSCP.c` 变了 / `git status` 说另一半被删 | Windows 的 `ignorecase` 把大小写对偶混成一个（实测两个拼名 md5 相同）。立刻 `git -c core.ignorecase=false checkout -- <被误改的那个>` 回退，改到 SSH 侧重做；这类事故只有 Linux 侧能看出来 |
 | 工作树/分支基线莫名变化，或 `git status` 里冒出**别的产品/别的禅道 ID** 的文件 | 两个产品共用了同一份镜像却被并行处理（违反 §5）：立刻停掉其中一条队列，在 SSH 侧 `git -c core.ignorecase=false status` 核对，被串味的分支 `git reset --hard <基线>` 重做；要让它们真并行只能给其中一个另开一份镜像 |
-| 某条被 AI 反复处理不满意 | 两种处置别混：「打回」→ `rejected`，**改动与草稿分支都不回滚**，AI 在同一分支上追加提交，最终一次推入 SVN；「拒绝并回滚」→ 删掉该草稿分支（提交先存进 `refs/rejected/<分支>` 可取回），这条直接置 `closed`，AI 不再重做 |
+| 某条被 AI 反复处理不满意 | 三种处置别混：「打回」→ `rejected`，**改动与草稿分支都不回滚**，AI 在同一分支上追加提交，最终一次推入 SVN；「拒绝并回滚」→ 删掉该草稿分支（提交先存进 `refs/rejected/<分支>` 可取回），这条直接置 `closed`，AI 不再重做；「重开补修」（限 `merged`/`closed`）→ 已入过库但仍不完全，回到 `rejected` 重新入队，`queue_kind=reopened` |
+| 已合入的条目发现修得不完全 | 弹窗点「重开补修（入队列）」。登记的 r 号与草稿分支都保留，**trunk 不回退**（回退 trunk 是主人自己的 svn 动作）；上一轮的结论、改动文件、r 号作为 `prior_fix` 随任务下发。AI 在原分支续做；推送时以「上一轮推入的那个草稿提交」为增量基准，只把新改动入库，trunk 上已有的文件自动跳过，全一致就拒（不许空修订） |
 | 推入 SVN 失败（编码、护栏拦下、远端不可达） | **不改状态**：只追加一条 `kind=manual` 人工留痕 + 禅道留言，`git:<哈希>` 草稿记录不动；修好原因后重推即可，多次草稿提交会合并成一次 svn 提交 |
 | 推送被护栏拦下：`trunk 相对草稿基线已有他人改动` | 根因几乎都是镜像 `origin/trunk` 落后。留痕里会带「trunk 上最近一笔 r 号」和可自动对齐的文件清单：改动不重叠就勾「自动按 trunk 对齐」重推（三方合并，他人改动保留）；撞在同一行区间或涉及增删文件时不许勾，先 fetch 镜像或把这条打回让 AI 在新基线上重做。执行器不许自己调这个接口，也不许放宽护栏 |
 | 模型或接口报限流（`rate limit` / `429` / `overloaded` / `quota` / 「稍后再试」/ 502、503） | **不许中止整轮**：等 5 分钟重试同一步，总共 3 次（`.env` 的 `RETRY_WAIT` / `RETRY_MAX`；本系统读禅道那侧已内置，会打印 `[retry] …等 N 秒后重试`）。3 次用完才 `block` 写「上游限流未恢复（已等 X 分钟重试 N 次）」，然后继续下一条。写类动作（评论、`i18n-commit`）不重试，失败就如实登记 |
