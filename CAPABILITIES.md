@@ -10,7 +10,8 @@
 | 领域 | 能力 | 入口 |
 | --- | --- | --- |
 | 禅道接入 | 会话登录（绕过被网关拦截的 `api.php`）、按 `assignedTo=我 + active` 分页拉 bug、拉产品列表与产品名 | `sync` / `/sync` |
-| 禅道详情 | 逐条抓 `/bug-view-{id}.json`：完整重现步骤（含图片）、备注/操作记录、附件；图片下载落盘并改写成本地路径 | `detail` / `/bug/<id>/detail` |
+| 禅道详情 | 逐条抓 `/bug-view-{id}.json`：完整重现步骤（含图片）、备注/操作记录、附件；图片下载落盘并改写成本地路径；**落盘时量像素尺寸**，1x1 之类的占位图标 `unreadable` 并移出「AI 必须看图」清单（喂给模型会 400 打断整轮） | `detail` / `img-gate` / `/bug/<id>/detail` |
+| 镜像草稿通道 | 执行器看镜像、开/切分支、落草稿提交、跑完对账全走本系统命令（内部是 SSH 侧带 `core.ignorecase=false` 的 git），不必自己拼裸 `ssh … git …`，也就少一处会冻住无人值守的授权弹窗 | `mirror` / `checkout` / `draft` / `reconcile`（`AUTO_LOOP.md` §1.8） |
 | 禅道回填 | 提交后自动评论（分支 + 修订号 + 待审查）、阻塞时评论「AI 阻塞」；**不提供** resolve/close | `commit` / `block` / `comment` |
 | 分析结论落库 | 每条 bug 收尾必须写回结构化分析（现象/根因/定位依据/链路/改动/影响面/验证/未验证/回退/结论 + 闸门逐条），`REQUIRE_ANALYSIS` 让无分析的 commit 直接失败 | `analyze` / `commit --analysis-file` / `/review` |
 | 任务编排 | SQLite 队列 + 7 态状态机；优先级 = 已答复 > 已打回 > 待处理，再 pri 升序 / severity 降序 | `tasks` / `claim` / 看板 |
@@ -41,10 +42,15 @@
 | --- | --- | --- | --- |
 | `init` | — | 建库建表 | `db`, `tables` |
 | `sync` | `--details N`（`-1`=全量） | 读禅道 + 写 `bugs`/`sync_log` | `created`, `updated`, `skipped`, `total`, `products`, `errors`, `details` |
-| `detail` | `<禅道ID>` \| `--limit N` \| `--all`，`--no-images` | 读禅道详情 + 下载附件 + 写库 | 单条：`steps_length`, `comments`, `images`, `images_saved`, `images_failed`, `module`, `product_name`, `bug`；批量：`target`, `done`, `failed`, `images_saved`, `comments`, `errors` |
+| `detail` | `<禅道ID>` \| `--limit N` \| `--all`，`--no-images` | 读禅道详情 + 下载附件（**落盘时量图片尺寸**，1x1 之类标 `unreadable`）+ 写库 | 单条：`steps_length`, `comments`, `images`, `images_saved`, `images_unreadable`, `images_failed`, `module`, `product_name`, `bug`；批量：`target`, `done`, `failed`, `images_saved`, `comments`, `errors` |
+| `img-gate` | `--check`（只报告） | 离线重量已下载附件的像素尺寸并回写 `attachments`，不连禅道 | `bugs_scanned`, `bugs_updated`, `pictures_flagged`, `applied` |
 | `tasks` | `--limit N`（默认 5） | 只读 | `count`, `tasks[]`（含 `queue_rank`、`open_need_id`） |
 | `claim` | `<ref>` | 状态 → `fixing` | `bug` |
 | `branch` | `<ref>`，`--dry-run` | 状态 → `fixing` 并记分支；真实执行时 `svn copy` + `switch` | `branch`, `product_id`, `product_name`, `repo`, `repo_source`, `trunk`, `working_copy`, `svn` |
+| `mirror` | `<ref>` | **只读**探测镜像上这条的草稿分支（SSH 侧，不 fetch 不 checkout） | `present`, `tip`, `subject`, `ahead`, `base`, `base_source`, `commits[]`, `files[]`, `mirror_head`, `trunk_head`, `mirror_ready`, `index_ok`, `worktree_clean`, `summary` |
+| `checkout` | `<ref>` `--base` | 在镜像里建/切这条的 `bugfix/zentao-<ID>`（默认基线 `refs/remotes/origin/trunk`）；状态 → `fixing` 并记分支。镜像未就绪或工作区脏 → 拒绝且不改状态 | `branch`, `mode`(created\|switched\|already), `base`, `tip`, `status`, `summary`, `error` |
+| `draft` | `<ref>` `--message`（必填，须以 `fix #<ID>` 开头） `--files`（必填，逗号分隔） | 在镜像的这条分支上 `git add` 清单内文件并 `git commit`（**只本地，不推任何远端**）。分支不存在 / HEAD 不在这条分支 / 路径越界 / 暂存为空 → 拒绝 | `commit`（短哈希，登记时写成 `--revision git:<哈希>`）, `staged[]`, `subject`, `nothing`, `summary`, `next` |
+| `reconcile` | `[禅道ID]` `--apply` | 对账「镜像上有草稿提交、库里没登记」；默认只报告，`--apply` 才登记 `git:<哈希>` + 写回分支与文件清单 + 状态 → `await_review` + 追加一条 `kind=manual` 分析 | `scanned`, `apply`, `unregistered[]`（`tip`/`subject`/`ahead`/`files`/`applied`）, `skipped[]` |
 | `analyze` | `<ref>` `--kind[commit\|block\|manual]` `--analysis-file <json>` `--analysis-stdin`，或单字段 `--symptom --root-cause --evidence --chain --change --impact --verify-result --unverified --rollback --conclusion --gates "G1=pass,G5=未验证:xxx"` | 写 `analyses`（一条 bug 可累积多份） | `analysis_id`, `kind`, `gates`, `analysis` |
 | `note` | `<ref>` `--summary` `--verify` `--files`（也可带全套分析参数） | 只写说明字段，不改状态；带分析则追加 `analyses` | `bug`, `analysis_id` |
 | `commit` | `<ref>` `--message` `--files` `--revision` `--summary` `--verify` `--author` `--extra` `--need-done <id>…` `--no-svn` + 全套分析参数 | 存 `analyses` + 写 `svn_revisions` + 状态 → `await_review` + 禅道评论；**不带 `--no-svn`/`--revision` 时才真的跑 `svn commit`**；`REQUIRE_ANALYSIS=true` 时无分析直接失败 | `revision`, `branch`, `repo`, `repo_source`, `working_copy`, `status`, `analysis_id`, `analysis_fields`, `zentao_comment`, `note` |

@@ -619,19 +619,16 @@ MSGF=$(mktemp)
 printf '%s' "$MSG_B64" | base64 -d > "$MSGF" 2>/dev/null || abort "提交说明解码失败" dirty
 [ -s "$MSGF" ] || abort "提交说明为空" dirty
 
-# Say so in the log itself: without this line a reader comparing the commit with
-# the draft branch would wonder where the extra trunk context came from, or why a
-# file the draft touched is missing from the revision.
+# The alignment and already-landed facts belong to the review trail, not to the
+# log of a trunk commit: svn is about to record what changed in the source, and a
+# reader of `svn log` has no idea what a draft branch or an alignment pass is.
+# Both are still reported through the markers below so the review page and the
+# Zentao comment can carry them.
 if [ "$MERGE" = 1 ] && [ -s "$TMPM" ]; then
-  ALIGNED=$(awk -F'\t' '{printf "%s ", $1}' "$TMPM" | sed 's/ $//')
-  printf '\n（推送前已将以下文件对齐到 trunk 现内容，本次提交只含本草稿的改动：%s）\n' \
-    "$ALIGNED" >> "$MSGF"
-  P annotated "$ALIGNED"
+  P annotated "$(awk -F'\t' '{printf "%s ", $1}' "$TMPM" | sed 's/ $//')"
 fi
 if [ "$NA" -gt 0 ]; then
-  SKIPPED=$(tr '\n' ' ' < "$TMPA" | sed 's/ $//' | cut -c1-300)
-  printf '\n（以下文件上一轮已进过 trunk，本次不重复提交：%s）\n' "$SKIPPED" >> "$MSGF"
-  P annotated_landed "$SKIPPED"
+  P annotated_landed "$(tr '\n' ' ' < "$TMPA" | sed 's/ $//' | cut -c1-300)"
 fi
 
 set --
@@ -943,6 +940,447 @@ def rollback_draft(bug: dict) -> DraftRollback:
         out.error = err.strip().splitlines()[-1]
     if not out.ok and not out.error and proc.returncode != 0:
         out.error = f"回滚未完成（exit {proc.returncode}）"
+    out.raw = text if not err.strip() else text + "\n[stderr] " + err.strip()
+    if out.error:
+        out.error = f"{out.error}（{target.host} · {target.mirror}）"
+    return out
+
+
+@dataclass
+class DraftCommit:
+    """Result of staging and committing a draft on the mirror."""
+
+    ok: bool = False
+    branch: str = ""
+    before: str = ""
+    tip: str = ""
+    subject: str = ""
+    staged: list[str] = field(default_factory=list)
+    nothing: bool = False
+    error: str = ""
+    raw: str = ""
+
+    @property
+    def short_tip(self) -> str:
+        return self.tip[:10]
+
+    def summary(self) -> str:
+        if self.error:
+            return self.error
+        if self.nothing:
+            return "暂存区是空的：列出来的文件没有实际改动，什么都没提交"
+        return f"已在 {self.branch} 提交 {self.short_tip}（{len(self.staged)} 个文件）"
+
+
+_DRAFT_COMMIT_SCRIPT = r"""
+# Stage exactly the listed files and commit them on the bug's own draft branch.
+# Local git only: no push, no dcommit, no svn. POSIX sh, runs on the build server.
+export LC_ALL=C LANG=C
+set -f
+MIRROR=$1; BR=$2; MSG_B64=$3; FILES_B64=$4
+P() { printf 'PV|%s|%s\n' "$1" "$2"; }
+cd "$MIRROR" 2>/dev/null || { P err "镜像目录不存在: $MIRROR"; exit 1; }
+case "$BR" in
+  bugfix/*) : ;;
+  *) P err "草稿只允许提交到 bugfix/* 分支，收到: $BR"; exit 1 ;;
+esac
+if ! git rev-parse --verify "refs/heads/$BR" >/dev/null 2>&1; then
+  P err "镜像上没有 $BR：先 python -m app.cli branch <禅道ID> 建分支再改码"
+  exit 1
+fi
+CUR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+if [ "$CUR" != "$BR" ]; then
+  P err "镜像当前停在 $CUR 而不是 $BR，不替你切分支（切走会动到别人的工作区）"
+  exit 1
+fi
+MSGF=$(mktemp); printf '%s' "$MSG_B64" | base64 -d > "$MSGF" 2>/dev/null || { P err "提交说明解码失败"; exit 1; }
+[ -s "$MSGF" ] || { P err "提交说明为空"; exit 1; }
+LISTF=$(mktemp); printf '%s' "$FILES_B64" | base64 -d > "$LISTF" 2>/dev/null || { P err "文件清单解码失败"; exit 1; }
+[ -s "$LISTF" ] || { P err "文件清单为空：draft 必须显式列出改了哪些文件"; exit 1; }
+while read F; do
+  [ -n "$F" ] || continue
+  case "$F" in
+    /*)          P err "文件必须是镜像内的相对路径: $F"; exit 1 ;;
+    ../*|*/..|*/../*) P err "文件路径不允许上级跳转: $F"; exit 1 ;;
+    .git|/*\.git*|.git/*) P err "文件路径不允许指向 .git: $F"; exit 1 ;;
+  esac
+done < "$LISTF"
+P before "$(git rev-parse "refs/heads/$BR")"
+set --
+while read F; do [ -n "$F" ] && set -- "$@" "$F"; done < "$LISTF"
+[ $# -gt 0 ] || { P err "文件清单为空"; exit 1; }
+git add -A -- "$@" 2>/dev/null || git add -- "$@" || { P err "git add 失败：$*"; exit 1; }
+if git diff --cached --quiet; then
+  P nothing "no staged change"
+  exit 0
+fi
+git diff --cached --name-only | while read F; do [ -n "$F" ] && P staged "$F"; done
+git commit -q -F "$MSGF" || { P err "git commit 失败"; exit 1; }
+P tip "$(git rev-parse "refs/heads/$BR")"
+git log -1 --format="PV|subject|%s"
+P done "$(git rev-parse --short=10 "refs/heads/$BR")"
+"""
+
+
+def draft_commit(bug: dict, message: str, files: list[str]) -> DraftCommit:
+    """Commit the executor's work on the mirror through one allow-listed call.
+
+    The reason this exists is the unattended loop: every raw ``ssh ... git ...``
+    the executor types is a command the IDE wants to approve, and one approval
+    prompt freezes the whole run. Routing the draft commit through the CLI keeps
+    the executor inside ``python -m app.cli``.
+
+    Refuses to run unless the mirror already sits on this bug's branch, because
+    switching branches there would move a working tree somebody else may be using.
+    """
+    branch = str(bug.get("branch") or "").strip()
+    if not branch:
+        zentao = bug.get("zentao_id") or bug.get("id")
+        branch = f"bugfix/zentao-{zentao}"
+    text = str(message or "").strip()
+    if not text:
+        raise PromoteError("提交说明不能为空（G8：fix #<禅道ID> <一句话根因>）")
+    paths = [str(f).strip().replace("\\", "/") for f in (files or [])]
+    paths = [f for f in paths if f]
+    if not paths:
+        raise PromoteError("必须显式给出 --files 文件清单，不许用通配或整仓 add")
+
+    from . import svn_client
+
+    mirror_dir = svn_client.resolve_target(bug=bug).working_copy
+    target = remote_target(mirror_dir)
+    args = [
+        target.mirror, branch,
+        base64.b64encode(text.encode("utf-8")).decode("ascii"),
+        base64.b64encode("\n".join(paths).encode("utf-8")).decode("ascii"),
+    ]
+    quoted = " ".join("'" + str(a).replace("'", "'\\''") + "'" for a in args)
+    proc = subprocess.run(
+        target.ssh_command(f"sh -s {quoted}"),
+        input=_DRAFT_COMMIT_SCRIPT.strip().replace("\r\n", "\n").encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=_SSH_TIMEOUT,
+    )
+    out_text = _decode(proc.stdout or b"")
+    err = _decode(proc.stderr or b"")
+    out = DraftCommit(branch=branch)
+    for line in out_text.splitlines():
+        if not line.startswith("PV|"):
+            continue
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            continue
+        tag, value = parts[1], parts[2]
+        if tag == "before":
+            out.before = value
+        elif tag == "staged":
+            out.staged.append(value)
+        elif tag == "tip":
+            out.tip = value
+        elif tag == "subject":
+            out.subject = value
+        elif tag == "nothing":
+            out.nothing = True
+            out.ok = True
+        elif tag == "done":
+            out.ok = True
+        elif tag == "err":
+            out.error = value
+    if not out.ok and not out.error and proc.returncode != 0 and err.strip():
+        out.error = err.strip().splitlines()[-1]
+    out.raw = out_text if not err.strip() else out_text + "\n[stderr] " + err.strip()
+    if out.error:
+        out.error = f"{out.error}（{target.host} · {target.mirror}）"
+    return out
+
+
+# ---------------------------------------------------------------------------
+# read-only mirror probe
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DraftState:
+    """What a bug's draft branch really looks like inside the mirror."""
+
+    branch: str = ""
+    present: bool = False
+    tip: str = ""
+    subject: str = ""
+    author: str = ""
+    when: str = ""
+    base: str = ""
+    base_source: str = ""
+    ahead: int = 0
+    commits: list[str] = field(default_factory=list)
+    files: list[str] = field(default_factory=list)
+    current: str = ""
+    trunk_head: str = ""
+    index_ok: bool = False
+    clean: bool = True
+    error: str = ""
+    raw: str = ""
+
+    @property
+    def short_tip(self) -> str:
+        return self.tip[:10]
+
+    @property
+    def ready(self) -> bool:
+        """Mirror readiness: trunk ref resolved, HEAD checked out, index populated."""
+        return bool(self.trunk_head) and bool(self.current) and self.index_ok
+
+    def summary(self) -> str:
+        if self.error:
+            return self.error
+        if not self.present:
+            return f"镜像上没有 {self.branch}（这条还没开工，或者分支已被清掉）"
+        return (f"{self.branch} @ {self.short_tip}，比 {self.base_source} 领先 "
+                f"{self.ahead} 笔，改了 {len(self.files)} 个文件")
+
+
+_DRAFT_SCRIPT = r"""
+# Report one draft branch read-only: tip, commits, touched files, and how far it
+# sits ahead of trunk. POSIX sh, runs on the build server. Nothing here writes:
+# no fetch, no checkout, no ref updates.
+export LC_ALL=C LANG=C
+set -f
+MIRROR=$1; BR=$2; BASE_REF=$3
+P() { printf 'PV|%s|%s\n' "$1" "$2"; }
+cd "$MIRROR" 2>/dev/null || { P err "镜像目录不存在: $MIRROR"; exit 0; }
+case "$BR" in
+  bugfix/*) : ;;
+  *) P err "只探测 bugfix/* 草稿分支，收到: $BR"; exit 0 ;;
+esac
+P current "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+P trunk_head "$(git rev-parse --short=10 refs/remotes/origin/trunk 2>/dev/null)"
+if git ls-files --error-unmatch AGENTS.md >/dev/null 2>&1; then P index ok; else P index missing; fi
+if [ -z "$(git status --porcelain 2>/dev/null | head -5)" ]; then P clean ok; else P clean dirty; fi
+if ! git rev-parse --verify "refs/heads/$BR" >/dev/null 2>&1; then
+  P absent "$BR"
+  exit 0
+fi
+P present "$BR"
+P tip "$(git rev-parse "refs/heads/$BR")"
+git log -1 --format="PV|subject|%s" "$BR"
+git log -1 --format="PV|author|%an" "$BR"
+git log -1 --format="PV|when|%ci" "$BR"
+BASE=""
+if [ -n "$BASE_REF" ] && git rev-parse --verify "$BASE_REF^{commit}" >/dev/null 2>&1; then
+  BASE=$(git merge-base "$BASE_REF" "$BR" 2>/dev/null)
+  P base_source "$BASE_REF"
+else
+  BASE=$(git merge-base refs/remotes/origin/trunk "$BR" 2>/dev/null)
+  P base_source "origin/trunk"
+fi
+if [ -z "$BASE" ]; then
+  P err "草稿分支与 trunk 没有公共祖先，无法算增量"
+  exit 0
+fi
+P base "$(git rev-parse --short=10 "$BASE")"
+P ahead "$(git rev-list --count "$BASE..$BR")"
+for H in $(git rev-list --max-count=20 "$BASE..$BR"); do
+  git log -1 --format="PV|commit|%h %ci %s" --abbrev=10 "$H"
+  git show --name-only --format= "$H" | while read F; do
+    [ -n "$F" ] && P file "M $F"
+  done
+done
+"""
+
+
+def draft_state(bug: dict, base_ref: str = "") -> DraftState:
+    """Inspect one bug's draft branch on the mirror without changing anything.
+
+    This exists so the executor never has to type a raw ``ssh ... git ...``
+    command: every mirror question it needs answered goes through a
+    ``python -m app.cli`` call, which keeps the unattended run inside the set of
+    commands that need no approval.
+    """
+    branch = str(bug.get("branch") or "").strip()
+    if not branch:
+        zentao = bug.get("zentao_id") or bug.get("id")
+        branch = f"bugfix/zentao-{zentao}"
+    from . import svn_client
+
+    mirror_dir = svn_client.resolve_target(bug=bug).working_copy
+    target = remote_target(mirror_dir)
+    args = [target.mirror, branch, base_ref or promoted_commit(bug)]
+    quoted = " ".join("'" + str(a).replace("'", "'\\''") + "'" for a in args)
+    proc = subprocess.run(
+        target.ssh_command(f"sh -s {quoted}"),
+        input=_DRAFT_SCRIPT.strip().replace("\r\n", "\n").encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=_SSH_TIMEOUT,
+    )
+    text = _decode(proc.stdout or b"")
+    err = _decode(proc.stderr or b"")
+    out = DraftState(branch=branch)
+    for line in text.splitlines():
+        if not line.startswith("PV|"):
+            continue
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            continue
+        tag, value = parts[1], parts[2]
+        if tag == "present":
+            out.present = True
+        elif tag == "tip":
+            out.tip = value
+        elif tag == "subject":
+            out.subject = value
+        elif tag == "author":
+            out.author = value
+        elif tag == "when":
+            out.when = value
+        elif tag == "base":
+            out.base = value
+        elif tag == "base_source":
+            out.base_source = value
+        elif tag == "ahead":
+            out.ahead = int(value or 0)
+        elif tag == "commit":
+            out.commits.append(value)
+        elif tag == "file":
+            if value not in out.files:
+                out.files.append(value)
+        elif tag == "current":
+            out.current = value
+        elif tag == "trunk_head":
+            out.trunk_head = value
+        elif tag == "index":
+            out.index_ok = value == "ok"
+        elif tag == "clean":
+            out.clean = value == "ok"
+        elif tag == "err":
+            out.error = value
+
+    # A login banner on stderr is normal here; only a script that said nothing and
+    # failed counts as an error.
+    if not out.present and not out.error and proc.returncode != 0 and err.strip():
+        out.error = err.strip().splitlines()[-1]
+    out.raw = text if not err.strip() else text + "\n[stderr] " + err.strip()
+    if out.error:
+        out.error = f"{out.error}（{target.host} · {target.mirror}）"
+    return out
+
+
+@dataclass
+class Checkout:
+    """Result of putting the mirror onto one bug's draft branch."""
+
+    ok: bool = False
+    branch: str = ""
+    action: str = ""          # created | switched | already
+    base: str = ""
+    tip: str = ""
+    error: str = ""
+    raw: str = ""
+
+    def summary(self) -> str:
+        if self.error:
+            return self.error
+        words = {"created": "已从", "switched": "已切到", "already": "本来就停在"}
+        if self.action == "created":
+            return f"已创建并切到 {self.branch}（基线 {self.base}），当前 {self.tip}"
+        return f"{words.get(self.action, '已切到')} {self.branch}，当前 {self.tip}"
+
+
+_CHECKOUT_SCRIPT = r"""
+# Put the mirror onto one bug's draft branch, creating it from trunk when needed.
+# Refuses to move a dirty working tree: that tree may belong to another session.
+# POSIX sh, runs on the build server. Local git only -- no fetch, no push, no svn.
+export LC_ALL=C LANG=C
+set -f
+MIRROR=$1; BR=$2; BASE=$3
+P() { printf 'PV|%s|%s\n' "$1" "$2"; }
+cd "$MIRROR" 2>/dev/null || { P err "镜像目录不存在: $MIRROR"; exit 1; }
+case "$BR" in
+  bugfix/*) : ;;
+  *) P err "只允许切到 bugfix/* 草稿分支，收到: $BR"; exit 1 ;;
+esac
+if ! git rev-parse --verify refs/remotes/origin/trunk >/dev/null 2>&1; then
+  P err "镜像缺 refs/remotes/origin/trunk（未就绪），不在这上面开工"; exit 1
+fi
+if ! git ls-files --error-unmatch AGENTS.md >/dev/null 2>&1; then
+  P err "镜像索引没落盘（ls-files 找不到 AGENTS.md，未就绪），不在这上面开工"; exit 1
+fi
+CUR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+if [ "$CUR" = "$BR" ]; then
+  P action already
+  P tip "$(git rev-parse --short=10 HEAD)"
+  P done ok
+  exit 0
+fi
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  P err "镜像工作区在 $CUR 上有未提交改动，不替你 stash / checkout：先让那条会话收口"
+  exit 1
+fi
+if git rev-parse --verify "refs/heads/$BR" >/dev/null 2>&1; then
+  git checkout -q "$BR" || { P err "切到已有分支 $BR 失败"; exit 1; }
+  P action switched
+else
+  FROM="$BASE"
+  [ -n "$FROM" ] || FROM=refs/remotes/origin/trunk
+  if ! git rev-parse --verify "$FROM^{commit}" >/dev/null 2>&1; then
+    P err "基线不可用: $FROM"; exit 1
+  fi
+  git checkout -q -b "$BR" "$FROM" || { P err "从 $FROM 建分支 $BR 失败"; exit 1; }
+  P action created
+  P base "$FROM"
+fi
+P tip "$(git rev-parse --short=10 HEAD)"
+P done ok
+"""
+
+
+def checkout_draft(bug: dict, base: str = "") -> Checkout:
+    """Create or switch the mirror's working tree onto this bug's draft branch.
+
+    Part of the same goal as ``draft_commit``: the executor should be able to do
+    its whole draft lifecycle through ``python -m app.cli`` instead of typing raw
+    ``ssh ... git checkout``, which is the kind of command that stops an
+    unattended run dead on an approval prompt.
+    """
+    branch = str(bug.get("branch") or "").strip()
+    if not branch:
+        zentao = bug.get("zentao_id") or bug.get("id")
+        branch = f"bugfix/zentao-{zentao}"
+    from . import svn_client
+
+    mirror_dir = svn_client.resolve_target(bug=bug).working_copy
+    target = remote_target(mirror_dir)
+    args = [target.mirror, branch, base or ""]
+    quoted = " ".join("'" + str(a).replace("'", "'\\''") + "'" for a in args)
+    proc = subprocess.run(
+        target.ssh_command(f"sh -s {quoted}"),
+        input=_CHECKOUT_SCRIPT.strip().replace("\r\n", "\n").encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=_SSH_TIMEOUT,
+    )
+    text = _decode(proc.stdout or b"")
+    err = _decode(proc.stderr or b"")
+    out = Checkout(branch=branch)
+    for line in text.splitlines():
+        if not line.startswith("PV|"):
+            continue
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            continue
+        tag, value = parts[1], parts[2]
+        if tag == "action":
+            out.action = value
+        elif tag == "base":
+            out.base = value
+        elif tag == "tip":
+            out.tip = value
+        elif tag == "done":
+            out.ok = True
+        elif tag == "err":
+            out.error = value
+    if not out.ok and not out.error and proc.returncode != 0 and err.strip():
+        out.error = err.strip().splitlines()[-1]
     out.raw = text if not err.strip() else text + "\n[stderr] " + err.strip()
     if out.error:
         out.error = f"{out.error}（{target.host} · {target.mirror}）"

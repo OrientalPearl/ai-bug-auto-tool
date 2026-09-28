@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from . import db
+from . import imgsize
 from .config import get_settings
 from .zentao_client import ZentaoError
 from .zentao_session import make_client
@@ -98,12 +100,14 @@ def refresh_detail(zentao_id: int, *, download: bool | None = None,
     images = [a for a in fields.get("attachments", []) if str(a.get("ext", "")).lower() in IMAGE_EXTS]
     saved = [a for a in images if a.get("local_path")]
     failed = [a for a in images if a.get("error")]
+    skipped = [a for a in images if a.get("unreadable")]
     db.log_sync("update", zentao_id, {
         "action": "detail",
         "comments": len(fields.get("comments") or []),
         "images": len(images),
         "saved": len(saved),
         "failed": len(failed),
+        "unreadable": len(skipped),
     })
     return {
         "ok": True,
@@ -112,6 +116,7 @@ def refresh_detail(zentao_id: int, *, download: bool | None = None,
         "comments": len(fields.get("comments") or []),
         "images": len(images),
         "images_saved": len(saved),
+        "images_unreadable": [f"{a.get('file_id')}: {a.get('unreadable')}" for a in skipped],
         "images_failed": [f"{a.get('file_id')}: {a.get('error')}" for a in failed],
         "module": fields.get("module"),
         "product_name": fields.get("product_name"),
@@ -164,6 +169,130 @@ def pull_details(limit: int | None = None, *, download: bool | None = None,
         "comments": notes,
         "errors": errors[:20],
     }
+
+
+def gate_images(apply: bool = True) -> dict[str, Any]:
+    """Re-measure every stored attachment without touching Zentao.
+
+    Screenshots downloaded before the size gate existed are already on disk, and
+    re-fetching them needs a live session. The header is all the answer needs, so
+    this walks the JSON already in the database instead.
+    """
+    rows = db.query_all(
+        "SELECT id, zentao_id, attachments FROM bugs"
+        " WHERE attachments IS NOT NULL AND attachments != ''"
+    )
+    changed = flagged = 0
+    for row in rows:
+        items = db._json_load(row.get("attachments")) or []
+        if not isinstance(items, list) or not items:
+            continue
+        touched = False
+        for item in items:
+            path = str(item.get("local_path") or "")
+            if not path or not Path(path).exists():
+                continue
+            pixels, reason = imgsize.gate(path, str(item.get("ext") or ""))
+            if pixels and item.get("pixels") != pixels:
+                item["pixels"] = pixels
+                touched = True
+            if reason and not item.get("unreadable"):
+                item["unreadable"] = reason
+                touched = True
+                flagged += 1
+            elif not reason and item.get("unreadable"):
+                item.pop("unreadable", None)
+                touched = True
+        if touched:
+            changed += 1
+            if apply:
+                db.execute("UPDATE bugs SET attachments = ? WHERE id = ?",
+                           (db._json_dump(items), row["id"]))
+    return {"ok": True, "bugs_scanned": len(rows), "bugs_updated": changed,
+            "pictures_flagged": flagged, "applied": apply}
+
+
+def reconcile_drafts(apply: bool = False, zentao_id: int | None = None,
+                     statuses: tuple[str, ...] = ("fixing", "pending", "rejected")) -> dict[str, Any]:
+    """Match the database against the draft branches that actually exist.
+
+    A run that ends without calling ``commit`` leaves its bug stuck in ``fixing``
+    even though the work is already sitting on ``bugfix/zentao-<ID>``. Trusting the
+    executor to report is not enough, so this reads the mirror and names every
+    branch whose commits were never registered here. ``apply`` adopts them: the
+    draft commit is recorded as ``git:<hash>`` and the bug moves to
+    ``await_review``, which is where a finished-but-unreported fix belongs.
+    """
+    from . import svn_promote
+
+    sql = "SELECT * FROM bugs WHERE status IN ({}) ".format(
+        ", ".join("?" for _ in statuses))
+    params: list[Any] = list(statuses)
+    if zentao_id:
+        sql += " AND zentao_id = ?"
+        params.append(int(zentao_id))
+    sql += " ORDER BY pri ASC, severity DESC, id ASC"
+    rows = db.query_all(sql, tuple(params))
+
+    found: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for row in rows:
+        bug = db.decorate_bug(row)
+        try:
+            state = svn_promote.draft_state(bug)
+        except Exception as exc:  # noqa: BLE001 - one unreachable mirror must not stop the scan
+            skipped.append({"zentao_id": bug["zentao_id"], "why": f"探测失败：{exc}"})
+            continue
+        if state.error:
+            skipped.append({"zentao_id": bug["zentao_id"], "why": state.error})
+            continue
+        if not state.present or state.ahead <= 0:
+            continue
+        known = {str(r.get("git_commit") or "") for r in bug["revisions"]}
+        known |= {str(r.get("revision") or "").replace("git:", "")[:10]
+                  for r in bug["revisions"]}
+        if state.short_tip in known or state.tip in known:
+            skipped.append({"zentao_id": bug["zentao_id"],
+                            "why": f"{state.short_tip} 已登记过，无需认领"})
+            continue
+        item = {
+            "zentao_id": bug["zentao_id"],
+            "status": bug["status"],
+            "branch": state.branch,
+            "tip": state.short_tip,
+            "subject": state.subject,
+            "author": state.author,
+            "when": state.when,
+            "ahead": state.ahead,
+            "commits": state.commits,
+            "files": [f.split(" ", 1)[-1] for f in state.files],
+        }
+        if apply:
+            paths = item["files"]
+            db.add_revision(
+                bug["id"], f"git:{state.short_tip}", branch=state.branch,
+                message=state.subject[:500], author=state.author,
+                files=paths, git_commit=state.tip)
+            db.set_bug_status(
+                bug["id"], "await_review", branch=state.branch, files_changed=paths,
+                fix_summary=(f"由对账认领：镜像分支 {state.branch} 上有 {state.ahead} 笔提交"
+                             f"（{state.short_tip}），但执行器没有回登记。"
+                             f"提交说明：{state.subject}"[:500]),
+                verify_steps=("这条的结论来自 git 提交信息，不是执行器写的分析；"
+                              "审查前请自行核对 diff，别当成已验证"))
+            db.add_analysis(
+                bug["id"],
+                {"conclusion": "对账认领：改动在镜像分支上，系统内原本无登记",
+                 "change": state.subject[:500],
+                 "evidence": f"git 分支 {state.branch} @ {state.short_tip}，"
+                             f"领先 {state.base_source} {state.ahead} 笔",
+                 "impact": "、".join(paths)[:500] or "（未取到文件清单）",
+                 "unverified": "未验证：认领动作不代跑编译与复现，全部结论待人工核对"},
+                kind="manual")
+            item["applied"] = True
+        found.append(item)
+    return {"ok": True, "scanned": len(rows), "apply": apply,
+            "unregistered": found, "skipped": skipped}
 
 
 def push_comment(zentao_id: int, text: str, *, client: ZentaoClient | None = None) -> dict:

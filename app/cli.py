@@ -549,6 +549,103 @@ def cmd_detail(args: argparse.Namespace) -> None:
     _out({"action": "detail", **result})
 
 
+def cmd_mirror(args: argparse.Namespace) -> None:
+    """Read-only look at one bug's draft branch inside the mirror.
+
+    The executor is meant to ask the mirror questions through this command rather
+    than typing ``ssh ... git ...`` itself: one allow-listed entry point keeps an
+    unattended run out of the IDE's approval prompts.
+    """
+    from . import svn_promote
+
+    bug = _bug_ref(args.ref)
+    state = svn_promote.draft_state(bug, base_ref=args.base or "")
+    _out({
+        "ok": not state.error, "action": "mirror", "zentao_id": bug["zentao_id"],
+        "status": bug["status"], "branch": state.branch, "present": state.present,
+        "tip": state.short_tip, "subject": state.subject, "author": state.author,
+        "when": state.when, "base": state.base, "base_source": state.base_source,
+        "ahead": state.ahead, "commits": state.commits,
+        "files": [f.split(" ", 1)[-1] for f in state.files],
+        "mirror_head": state.current, "trunk_head": state.trunk_head,
+        "mirror_ready": state.ready, "index_ok": state.index_ok,
+        "worktree_clean": state.clean,
+        "summary": state.summary(), "error": state.error,
+    })
+
+
+def cmd_checkout(args: argparse.Namespace) -> None:
+    """Put the mirror onto this bug's draft branch (create it from trunk if new).
+
+    The mirror's readiness gates (trunk ref present, index checked out) are
+    checked by the same call, so the executor gets one command instead of three
+    raw ``ssh`` probes it would otherwise have to be approved for.
+    """
+    from . import svn_promote
+
+    bug = _bug_ref(args.ref)
+    result = svn_promote.checkout_draft(bug, base=args.base or "")
+    if result.ok:
+        db.set_bug_status(bug["id"], "fixing", branch=result.branch)
+    _out({
+        "ok": bool(result.ok), "action": "checkout", "zentao_id": bug["zentao_id"],
+        "branch": result.branch, "mode": result.action, "base": result.base,
+        "tip": result.tip, "status": "fixing" if result.ok else bug["status"],
+        "summary": result.summary(), "error": result.error,
+    })
+
+
+def cmd_draft(args: argparse.Namespace) -> None:
+    """Stage the listed files and commit them on the bug's draft branch.
+
+    Same reason as ``mirror``: the executor should never type a raw
+    ``ssh ... git commit``, because that is exactly the kind of command the IDE
+    wants to approve and an unattended run cannot afford the pause.
+    """
+    from . import svn_promote
+
+    bug = _bug_ref(args.ref)
+    message = str(args.message or "").strip()
+    want = f"fix #{bug['zentao_id']}"
+    if not message.startswith(want):
+        raise SystemExit(json.dumps(
+            {"ok": False, "error": f"提交说明必须以 {want} 开头（闸门 G8），收到: {message[:60]}"},
+            ensure_ascii=False))
+    files = [f.strip() for f in str(args.files or "").split(",") if f.strip()]
+    if not files:
+        raise SystemExit(json.dumps(
+            {"ok": False, "error": "--files 必填：逗号分隔的改动文件（镜像内相对路径），"
+                                   "本命令不做整仓 add"}, ensure_ascii=False))
+    try:
+        result = svn_promote.draft_commit(bug, message, files)
+    except svn_promote.PromoteError as exc:
+        _out({"ok": False, "action": "draft", "error": str(exc)})
+        return
+    _out({
+        "ok": bool(result.ok and not result.nothing), "action": "draft",
+        "zentao_id": bug["zentao_id"], "branch": result.branch,
+        "commit": result.short_tip, "subject": result.subject,
+        "staged": result.staged, "nothing": result.nothing,
+        "summary": result.summary(), "error": result.error,
+        "next": (f"python -m app.cli commit {bug['zentao_id']} --message \"<一句话根因>\" "
+                 f"--files {','.join(result.staged or files)} --no-svn "
+                 f"--revision git:{result.short_tip} --analysis-file a.json"),
+    })
+
+
+def cmd_reconcile(args: argparse.Namespace) -> None:
+    """Compare the database with the draft branches that exist on the mirrors."""
+    ref = int(args.ref) if args.ref else None
+    result = sync.reconcile_drafts(apply=args.apply, zentao_id=ref)
+    _out({"ok": True, "action": "reconcile", **result})
+
+
+def cmd_img_gate(args: argparse.Namespace) -> None:
+    """Re-measure stored screenshots so a 1x1 placeholder never reaches a model."""
+    result = sync.gate_images(apply=not args.check)
+    _out({"ok": bool(result.get("ok")), "action": "img-gate", **result})
+
+
 def cmd_doctor(_args: argparse.Namespace) -> None:
     """Diagnose the configured Zentao channel step by step (read-only)."""
     from .zentao_session import make_client
@@ -674,6 +771,42 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=0, help="只抓前 N 条（按 pri/severity 排序）")
     p.add_argument("--no-images", action="store_true", help="只取文字，不下载附件")
     p.set_defaults(func=cmd_detail)
+
+    p = sub.add_parser("img-gate",
+                       help="重新量一遍已下载的截图：1x1 之类的坏图标为不可读，"
+                            "免得喂给模型换来一个 400 把整轮打断")
+    p.add_argument("--check", action="store_true", help="只报告，不写库")
+    p.set_defaults(func=cmd_img_gate)
+
+    p = sub.add_parser("mirror",
+                       help="只读探测某条 bug 的草稿分支（tip / 领先几笔 / 改了哪些文件）；"
+                            "看镜像一律走这条，不要自己拼 ssh + git 命令")
+    p.add_argument("ref")
+    p.add_argument("--base", default="", help="增量基准，默认取上一轮推入的草稿提交")
+    p.set_defaults(func=cmd_mirror)
+
+    p = sub.add_parser("checkout",
+                       help="把镜像切到这条 bug 的草稿分支（没有就从 origin/trunk 建）；"
+                            "顺带做镜像就绪判定，执行器不用自己拼 ssh + git checkout")
+    p.add_argument("ref")
+    p.add_argument("--base", default="", help="建分支的基线，默认 refs/remotes/origin/trunk")
+    p.set_defaults(func=cmd_checkout)
+
+    p = sub.add_parser("draft",
+                       help="在镜像的 bugfix 分支上落草稿提交（只 add --files 列出的文件）；"
+                            "执行器不要自己拼 ssh + git commit，那会卡在授权弹窗上")
+    p.add_argument("ref")
+    p.add_argument("--message", required=True, help="提交说明，必须以 fix #<禅道ID> 开头（G8）")
+    p.add_argument("--files", required=True,
+                   help="逗号分隔的改动文件（镜像内相对路径）；不做整仓 add")
+    p.set_defaults(func=cmd_draft)
+
+    p = sub.add_parser("reconcile",
+                       help="对账：镜像上已有草稿提交、库里却没登记的条目；"
+                            "--apply 认领为 git:<哈希> 并转待审查")
+    p.add_argument("ref", nargs="?", default=None, help="只查某一条（禅道ID）")
+    p.add_argument("--apply", action="store_true", help="真的认领（默认只报告）")
+    p.set_defaults(func=cmd_reconcile)
 
     p = sub.add_parser("tasks", help="读取待处理队列（pri 升序 / severity 降序）")
     p.add_argument("--limit", type=int, default=get_settings().batch_size)

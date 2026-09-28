@@ -387,11 +387,16 @@ def decorate_bug(row: dict) -> dict:
     row["files_changed"] = _json_load(row.get("files_changed")) or []
     row["comments"] = _json_load(row.get("comments")) or []
     row["attachments"] = _json_load(row.get("attachments")) or []
-    row["images"] = [
+    all_pics = [
         a for a in row["attachments"]
         if str(a.get("ext", "")).lower() in IMAGE_EXTS and a.get("web_path")
     ]
-    row["docs"] = [a for a in row["attachments"] if a not in row["images"]]
+    # A picture a vision model refuses (a 1x1 Zentao placeholder) is not something
+    # the executor can look at, so it must not sit in the "must read the
+    # screenshot" list; it stays visible on the page as a skipped one instead.
+    row["images"] = [a for a in all_pics if not a.get("unreadable")]
+    row["images_skipped"] = [a for a in all_pics if a.get("unreadable")]
+    row["docs"] = [a for a in row["attachments"] if a not in all_pics]
     row["latest_revision"] = None
     revs = query_all(
         "SELECT revision, branch, message, author, git_commit, created_at"

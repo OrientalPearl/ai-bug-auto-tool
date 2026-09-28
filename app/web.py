@@ -801,14 +801,19 @@ def _scope_block(group: dict[str, Any], base_label: str) -> str:
         lines.append("这些产品都还没有绑定代码库（会落到上面的全局目录）：本轮一律不许落码，"
                      "逐条 block 写明「产品未绑定代码库」，等主人 bind-repo 之后再接手。")
     else:
-        lines.append("开工前先验镜像就绪（§1.5 的三条判据全部在 SSH 侧跑）；"
-                     "不就绪就直接 block，不改码，也不许转去动正式 SVN 工作副本。")
-        lines.append("这个目录两侧是同一条数据：Windows 映射盘只用来读代码，**git 一律走 SSH 侧**，"
-                     "命令形态 `ssh <SSH用户>@<SSH主机> \"cd <镜像> && git -c core.ignorecase=false …\"`；"
+        lines.append("开工前先验镜像就绪：`python -m app.cli mirror <禅道ID>`，看 mirror_ready / index_ok / "
+                     "worktree_clean（§1.5 三条判据的内部实现）；不就绪就直接 block，不改码，"
+                     "也不许转去动正式 SVN 工作副本。")
+        lines.append("看镜像、开分支、落草稿一律走本系统命令（AUTO_LOOP.md §1.8）："
+                     "`mirror` 读、`checkout <禅道ID>` 建/切 bugfix 分支、"
+                     "`draft <禅道ID> --message \"fix #<ID> …\" --files a,b` 落本地提交并拿短哈希；"
+                     "**不要自己拼裸 ssh + git 命令** —— 每拼一次就多一处会把无人值守冻住的授权弹窗。"
+                     "这个目录两侧是同一条数据：Windows 映射盘只用来读代码，git 全部在 SSH 侧发生，"
                      "主机/用户/Linux 侧路径读该库镜像根的 CLAUDE.local.yaml（ssh.* 与 path_aliases）。"
                      "Windows 侧的 ignorecase 会把只差大小写的同名文件混成一个（本库实测 109 组），"
-                     "在它里面改 A 会落到 B 上。")
-        lines.append("只 add 自己改过的那几个文件，禁止 git add -A / add .；下列是结构性噪音、不是本次改动，"
+                     "在它里面改 A 会落到 B 上，所以核对拼名也用 SSH 侧的 ls-files。")
+        lines.append("草稿提交只 add 自己改过的那几个文件（draft 按 --files 逐个 add，命令里没有整仓 add），"
+                     "禁止 git add -A / add .；下列是结构性噪音、不是本次改动，"
                      "不许 checkout 复原、不许写进 --files、也不许为此 block（3.0 实测共 92 条）："
                      "整棵 .trae/**（镜像里它是指向主人知识库根的符号链接，checkout 会写穿覆盖知识库）、"
                      "openvpn-2.4.8/INSTALL（仓库里是文件、盘上是同名目录）、"
@@ -834,16 +839,21 @@ def _scope_block(group: dict[str, Any], base_label: str) -> str:
     else:
         lines.append("本队列独占这个目录 → 可以和其他目录的队列并行，但这个目录同时只允许一个操作方。")
     lines.append("取队列后自行过滤，只留本产品/本目录的条目：python -m app.cli tasks --limit 20")
-    lines.append("运行中这三类情况按 §3.4 自己解决，禁止停下来等我（无人值守时等待就是卡死）：")
+    lines.append("运行中这四类情况按 §3.4 自己解决，禁止停下来等我（无人值守时等待就是卡死）：")
     lines.append("  a) 模型/接口限流（rate limit、429、overloaded、quota、502/503、稍后再试）"
                  "→ 等 5 分钟重试同一步，最多 3 次（RETRY_WAIT/RETRY_MAX），期间不改状态、不 block、不退循环；"
                  "3 次用完才 block 写「上游限流未恢复」，随后继续下一条；写类动作（评论、i18n-commit）不重试")
     lines.append("  b) 任何需要授权的动作一律不许触发也不许等待：密码弹窗、SSH 密码登录（只准免密 key）、"
                  "IDE 命令审批、沙箱越权提示、sudo、yes/no 交互、提问工具；"
+                 "少触发审批的第一办法是别自己造命令 —— 看镜像/开分支/落草稿/对账都用 §1.8 的 "
+                 "mirror、checkout、draft、reconcile；"
                  "确实绕不开授权就 block 写清「要主人做什么授权/为什么/影响面/怎么回滚」，接着做下一条")
     lines.append("  c) 出现「本地文件比仓库新，是否比较」：自己在 SSH 侧 status + diff --ignore-cr-at-eol 取证 —— "
                  "只剩 CRLF/$Id$/大小写对偶/.trae 就当 §1.5 的结构性噪音照常做；"
                  "是别人写的真实改动就不覆盖、不 stash、不 revert、不 checkout 复原，block 写明摘要")
+    lines.append("  d) 模型报截图尺寸不合规（400 invalid_parameter_error / must be larger than 10）："
+                 "那是 1x1 占位图，status 里已被挪进 images_skipped —— 跳过它按文字与代码取证继续，"
+                 "在 unverified 里注明哪张图不可读；不许因为一张图中止这条，更不许中止整轮")
     lines.append("以下整段是 AUTO_LOOP.md 原文，规则以它为准：")
     return "\n".join(lines)
 
@@ -906,11 +916,16 @@ def _dispatch_checklist(queues: list[dict[str, Any]]) -> list[dict[str, str]]:
             add("ok", f"队列 #{group['no']}：产品 {group['ids']} 独占 {group['working_copy']}，"
                       f"可以和其他队列并行。")
 
-    add("info", "每条队列开跑前验一次镜像就绪（三条都要有输出；最后一条失败 = ref 在但 index/工作树没落盘）。"
-                "全部在 SSH 侧跑 —— Windows 侧那份只读代码不跑 git，主机与路径见该库镜像根的 CLAUDE.local.yaml：",
+    add("info", "每条队列开跑前验一次镜像就绪：执行器直接用 "
+                "`python -m app.cli mirror <禅道ID>`，看输出里的 mirror_ready / index_ok / worktree_clean "
+                "（内部就是 SSH 侧那三条判据，主机与路径取自该库镜像根的 CLAUDE.local.yaml，"
+                "不必自己拼 ssh 命令去触发审批）。你要手工复核时仍是这三条，全部在 SSH 侧跑：",
         'ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git -c core.ignorecase=false rev-parse --verify refs/remotes/origin/trunk" ; '
         'ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git -c core.ignorecase=false rev-parse --verify HEAD" ; '
         'ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git -c core.ignorecase=false ls-files --error-unmatch AGENTS.md"')
+    add("info", "开分支与落草稿同理走本系统命令：`checkout <禅道ID>` 建/切 bugfix 分支（脏工作区会拒绝）、"
+                "`draft <禅道ID> --message \"fix #<ID> …\" --files a,b` 只 add 列出的文件并提交，"
+                "返回的短哈希就是登记用的 git:<哈希>（AUTO_LOOP.md §1.8）。")
     add("info", "index 缺失只在 SSH（Linux）侧修：Windows 侧 ignorecase 遇上 109 组只差大小写的路径修不出完整工作树；"
                 "清单里排掉 .trae/，否则会写穿符号链接覆盖主人知识库。")
     add("info", "两条线的 SSH 侧不是一套环境（实测）：3.0 那台 git 2.33.0 认 -c / -C；"
@@ -945,6 +960,15 @@ def _dispatch_checklist(queues: list[dict[str, Any]]) -> list[dict[str, str]]:
                 f"等 {settings.retry_wait} 秒、总共 {settings.retry_max} 次（.env 的 RETRY_WAIT / RETRY_MAX），"
                 "等待过程打到 stderr 的 [retry] 行；评论推送与 i18n-commit 是写动作，刻意不重试。"
                 "模型侧的限流要你自己按同一条口径等，不许整轮退出。")
+    add("info", "镜像的读 / 开分支 / 落草稿 / 对账都已有本系统命令（AUTO_LOOP.md §1.8）："
+                "mirror、checkout、draft、reconcile —— 执行器不要再自己拼裸 ssh + git，"
+                "每拼一次就多一处会把无人值守冻住的授权弹窗。")
+    unreadable = db.query_one(
+        "SELECT COUNT(*) AS c FROM bugs WHERE attachments LIKE '%\"unreadable\"%'")["c"]
+    if unreadable:
+        add("info", f"{unreadable} 条 bug 带模型读不了的截图（1x1 占位图之类），已标 unreadable 并移出"
+                    "「必须看图」清单：执行器跳过它按文字继续，不许因为一张图中止这条。",
+            'python -m app.cli img-gate --check')
     stale = db.query_all(
         "SELECT zentao_id, updated_at FROM bugs WHERE status = 'fixing'"
         " AND updated_at < datetime('now', 'localtime', ?)",
@@ -953,8 +977,9 @@ def _dispatch_checklist(queues: list[dict[str, Any]]) -> list[dict[str, str]]:
     if stale:
         add("warn", f"{len(stale)} 条停在 fixing 已超过 {settings.stale_claim_minutes} 分钟"
                     "（上一轮被限流或中断打死）：它们已自动回到队列，下一轮会以 queue_kind=stale 重跑，"
-                    "不需要手工改状态。",
-            'python -m app.cli tasks --limit 20')
+                    "不需要手工改状态。先跑一次 reconcile —— 上一轮可能已经改完并提交了草稿，"
+                    "只是没收口，那种直接认领成待审查比重跑省一遍。",
+            'python -m app.cli reconcile')
     else:
         add("ok", f"没有超时未收的 fixing 占位（阈值 STALE_CLAIM_MINUTES="
                   f"{settings.stale_claim_minutes} 分钟，超过就自动回队列）。")

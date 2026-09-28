@@ -152,12 +152,15 @@ python -m app.cli doctor                   # 禅道通道分步诊断
 
 1. **先抓详情**：`python -m app.cli detail <禅道ID>`，把禅道描述里的截图、备注（操作记录）、附件下载到本地
    （`attachments/zentao-<ID>/`，`steps` 中的 `[图片N: /files/<ID>/xxx.png]` 就是本地文件）
-2. 读取该 bug 的禅道描述、截图、备注、历史提交记录、need_solution 中的 owner_reply（如果有）
+2. 读取该 bug 的禅道描述、截图、备注、历史提交记录、need_solution 中的 owner_reply（如果有）；
+   `images` 才是能看的图，`images_skipped` 里的（1x1 占位图、损坏图）模型读不了 —— 不要 Read 它，
+   硬喂换来一个 400 会把这条任务打断；按文字与代码取证继续，并在 `unverified` 里写明「某图不可读」
 3. `python -m app.cli claim <禅道ID>` 占住任务（置 fixing），避免其他子任务重复领同一条
 4. 确认这条 bug 属于哪个产品、哪份代码、镜像工作副本在哪：`python -m app.cli repos`；
-   **镜像未就绪（SSH 侧三条判据任一失败，`AUTO_LOOP.md` §1.5）时不许开工**，直接 `block` 写明「镜像未就绪」
-5. 在镜像里为这条 bug 开本地分支（**git 全部走 SSH 侧**，Windows 映射盘那一份不跑 git）：
-   `ssh <SSH用户>@<SSH主机> "cd <镜像> && git -c core.ignorecase=false checkout -b bugfix/zentao-<禅道ID> refs/remotes/origin/trunk"`；
+   **镜像就绪与否直接问 `python -m app.cli mirror <禅道ID>`**（`mirror_ready` = SSH 侧三条判据，
+   另给 `worktree_clean` 与镜像当前停在哪个分支），ready=false 时不许开工，直接 `block` 写明「镜像未就绪」
+5. 在镜像里为这条 bug 开/切本地分支：**`python -m app.cli checkout <禅道ID>`**（默认基线
+   `refs/remotes/origin/trunk`；镜像未就绪或工作区有别人未提交的改动时它会拒绝，不替你 stash）；
    **`queue_kind=rejected` 的重做不许另开分支、不许 `reset --hard` 丢掉上一轮**：上一轮的草稿分支还在
    （打回只改状态，不回滚改动），直接切回它继续追加提交 —— 主人推送时取的是分支相对 `origin/trunk`
    的合并差异，几轮改动会合成一次 svn 提交；分支已被主人「拒绝并回滚」删掉的，这条应是 `closed` 不会进队列；
@@ -177,8 +180,10 @@ python -m app.cli doctor                   # 禅道通道分步诊断
 9. **逐条核对提交闸门**（`AUTO_LOOP.md` §2 的 G1–G12：详情与截图看过、根因明确、改动范围与产品仓库一致、
    构建通过、状态矩阵自审、文案与 i18n 同步、目标是 bugfix 分支非 trunk、message 规范无敏感串、
    未验证路径已标注、所需授权已取得、**远端写入留给主人**、**多语言词条走直连通道**）
-10. 闸门全过 → **只在镜像里 `git commit`**（SSH 侧本地提交，只 `add` 自己改过的那几个文件，禁止 `add -A`），
-    取 `git rev-parse --short HEAD` 当登记的修订号；
+10. 闸门全过 → **`python -m app.cli draft <禅道ID> --message "fix #<禅道ID> <一句话根因>" --files a.c,b.c`**
+    （镜像里的本地提交：只 add 列出的这几个路径，返回短哈希当登记的修订号；说明不以 `fix #<ID>`
+    开头、清单为空、HEAD 不在这条分支上、暂存无变化，它都会直接拒），
+    取输出里的 `git:<短哈希>` 当登记的修订号；
     本次得出可复用且已验证的结论时，先把它追加进最近的 `.trae/agents/<相对路径>/AGENT.md`
     （顺序 `入口 -> 文件 -> 覆盖 -> 坑点`）——那是知识根那个独立仓的文件，**只追加不 add/commit**，
     在 `evidence` 里点名回写了什么，由主人自己收口
@@ -237,7 +242,8 @@ python -m app.cli block <禅道ID> --question "..." --options "..." --advice "..
 
 1. 如果 need_solution 表中存在 status=replied 的记录
 2. 优先处理这些 bug，按 owner_reply 继续修复
-3. 修复后按同样的方式再走一遍（镜像里 `git commit` → 登记新哈希 `--revision git:<新哈希>`），
+3. 修复后按同样的方式再走一遍（`checkout` 切回原分支 → 改 → `draft` 落新提交 →
+   登记新哈希 `--revision git:<新哈希>`），
    新的修订号会自动追加到同一个 bug 名下而不是覆盖
 4. 更新 bugs 表 status=await_review
 
@@ -309,11 +315,19 @@ python -m app.cli block <禅道ID> --question "..." --options "..." --advice "..
     推送会被护栏拦下（`trunk 相对草稿基线已有他人改动`），这是主人的事——他勾「自动按 trunk 对齐」或先 fetch 镜像。
     你若在镜像里看到同一文件已被别人改了（`svn log`/`git log` 取证），就在 `block` 或分析里写清「第 N 行区间已被 rXXXXX 改过」，
     不许 `revert`/`stash`/`checkout` 别人的改动，也不许把自己的改动挪到别人的行上去凑
+30. **看镜像、开分支、落草稿一律走本系统命令**（`AUTO_LOOP.md` §1.8）：`mirror` 读、`checkout` 开/切、
+    `draft` 落提交、`reconcile` 对账。自己拼裸 `ssh … git …` 每多一次就多一次 IDE 审批的机会，
+    而一次审批弹窗就地把无人值守冻住（违反 26）。只有该库规程要求的定位取证与编译测试才继续走 SSH
+31. **读不了的截图不许喂模型，也不许因为它中止这条**：`images_skipped`（1x1 占位图、损坏图）
+    模型会直接 400（`invalid_parameter_error` / `must be larger than 10`）。跳过它按文字与代码取证继续，
+    在 `unverified` 里写明哪张图不可读；G1 的「必须看图」对这种图自动降级，不算你没看图（§3.4 四）
 
 ## 停止条件
 
 1. 所有 pending 和 replied 的 bug 都已处理完（`tasks --limit 1` 返回空）
-2. 输出汇总报告：
+2. 收口前跑一次 `python -m app.cli reconcile`：镜像上有草稿提交、库里没登记的（子任务崩在收口前），
+   它按条点名 —— 别靠记忆，也别让那条永远停在 `fixing`
+3. 输出汇总报告：
    - 已本地提交待审查：bug ID 列表（含 `git:<哈希>`，并说明尚未进正式库）
    - 需主人给方案：bug ID 列表
    - 已按主人答复续修：bug ID 列表
@@ -323,9 +337,9 @@ python -m app.cli block <禅道ID> --question "..." --options "..." --advice "..
 ## 异常处理
 
 1. 禅道同步失败（网络/鉴权）：记录错误后直接读数据库里已有的 pending 继续干活，不要卡在同步步骤
-2. **镜像未就绪**（`refs/remotes/origin/trunk` 不存在或为空，clone/fetch 还在跑）：不改码、
-   不转去动正式工作副本，`block` 写明「镜像未就绪」后继续下一条
-3. 该仓库不允许本系统跑 svn（默认情况）、或 svn 客户端不可用：照样在镜像里完成修改与 `git commit`，
+2. **镜像未就绪**（`python -m app.cli mirror <ID>` 的 `mirror_ready=false`，即 trunk ref 缺失或索引
+   没落盘，clone/fetch 还在跑）：不改码、不转去动正式工作副本，`block` 写明「镜像未就绪」后继续下一条
+3. 该仓库不允许本系统跑 svn（默认情况）、或 svn 客户端不可用：照样在镜像里用 `draft` 完成修改与提交，
    用 `python -m app.cli commit <ID> --message "..." --no-svn --revision git:<哈希> --analysis-file a.json`
    登记为待审查并继续下一条；进正式库由主人完成，之后回填 `r<号>`
 4. 连本地 `git commit` 都不便做（分支冲突、镜像被另一侧占用）：登记 `--revision PENDING`

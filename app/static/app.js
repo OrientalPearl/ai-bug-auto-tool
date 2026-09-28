@@ -115,6 +115,13 @@
         </form></p>`;
     }
     if (pics) html += `<h4>截图（${(b.images || []).length} 张）</h4><div class="gallery">${pics}</div>`;
+    // A 1x1 placeholder is listed, not hidden: the owner should see that the AI
+    // skipped it on purpose instead of wondering why nobody looked at it.
+    const skipped = (b.images_skipped || []).map(a =>
+      `<li><a href="${esc(a.web_path)}" target="_blank">${esc(a.name || a.filename)}</a>
+        <span class="muted">${esc(a.pixels || "")}</span>
+        <span class="hint">—— ${esc(a.unreadable || "模型读不了")}，已跳过不喂给模型</span></li>`).join("");
+    if (skipped) html += `<h4>模型读不了的截图（${(b.images_skipped || []).length} 张）</h4><ul class="tight">${skipped}</ul>`;
     if (docs) html += `<h4>附件</h4><ul class="tight">${docs}</ul>`;
     if (notes) html += `<h4>禅道备注 / 操作记录</h4><ul class="tight">${notes}</ul>`;
 

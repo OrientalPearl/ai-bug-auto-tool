@@ -29,20 +29,25 @@
    只有镜像互不相同的组之间才并行）
 3) 每条 bug 起一个独立子任务，用 AUTO_LOOP.md §3.2 模板，只替换禅道ID
 4) 落码位置是 git-svn 镜像（AUTO_LOOP.md §1.5）；镜像未就绪就不许改码，也不许动正式 SVN 工作副本
-   所有 git 命令一律 `ssh <SSH用户>@<SSH主机> "cd <镜像> && git -c core.ignorecase=false …"` 在 Linux 侧跑，
-   Windows 侧那份只读代码不跑 git（本库 109 组只差大小写的路径会被 ignorecase 混成一个）
-5) 子任务只做：验镜像就绪 → status(看图看备注) → claim → 先读该库自带的 AI 知识体系
+   看镜像、开分支、落草稿一律走本系统命令：`mirror` / `checkout` / `draft`（§1.8）——
+   它们内部就是 SSH 侧带 `-c core.ignorecase=false` 的 git，Windows 侧那份只读代码不跑 git
+   （本库 109 组只差大小写的路径会被 ignorecase 混成一个）
+5) 子任务只做：`mirror <ID>` 验镜像就绪 → status(看图看备注) → claim → `checkout <ID>` 开/切分支
+   → 先读该库自带的 AI 知识体系
    （镜像根 CLAUDE.md 常驻层 → `.trae/` 指向的知识根 registry|doc|agents|playbooks，见 §1.6）
-   再定位 → 镜像里开 bugfix/zentao-<ID> 改码 → SSH 编译/测试 → 逐条核对提交闸门
-6) 闸门全过 → 只在镜像里 git commit（本地，只 add 自己改的那几个文件，禁止 add -A），
-   把短哈希当修订号登记，并一起写入分析结论
-   （--analysis-file a.json，字段见 §2.2）：
+   再定位 → 改码 → SSH 编译/测试 → 逐条核对提交闸门
+6) 闸门全过 → `python -m app.cli draft <ID> --message "fix #<ID> <根因>" --files a,b`
+   落草稿提交（只 add 列出的文件，禁止 add -A），把返回的短哈希当修订号登记，
+   并一起写入分析结论（--analysis-file a.json，字段见 §2.2）：
    commit --no-svn --revision git:<哈希> --analysis-file a.json；
    闸门任一条不过 → block 回填（也带上分析），继续下一条
 7) 一批跑完立刻取下一批，禁止问我是否继续；tasks --limit 1 返回 0 条才停并输出 report
-8) 运行中遇到这三类情况按 §3.4 自己解决，禁止停下来等我：
+   一批收尾后补一次 `python -m app.cli reconcile`：镜像上有提交、库里没登记的，它会点名
+8) 运行中遇到这四类情况按 §3.4 自己解决，禁止停下来等我：
    模型/接口限流（rate limit / 429 / 繁忙）→ 等 5 分钟重试，最多 3 次，不许中止整轮；
    任何需要授权的动作（密码弹窗、命令审批、sudo、交互 yes/no、提问工具）→ 不许触发，直接 block；
+   模型报截图尺寸不合规（400 invalid_parameter_error / must be larger than 10）→ 那张图本系统已标
+   unreadable，跳过它按文字继续，不许因为一张图中止这条；
    提示「本地文件比仓库新 / 要不要比较」→ 自己在 SSH 侧 diff 取证，噪音就照常做，别问我
 本系统不执行 svn、不判定提交细则；没写分析结论不许 commit；
 禁止 git svn dcommit / git push / svn ci / 提交或合并 trunk（进正式库只由我做）；
@@ -213,13 +218,30 @@ git --git-dir=<镜像名>/.git fsck   # dangling blob 是镜像的正常现象�
 包放在各台服务器自己的 `~/hy-10G-2/mirror-backup/`（3.0 的包在 3.0 那台，2.3 的包在 2.3 那台），
 不跨机拷贝；换盘或重装前先补一份新的，包名带短哈希，能看出它是哪条基线的备份。
 
+## 1.8 镜像操作收进本系统命令（执行器一律走这四条，别再自己拼 ssh）
+
+以前子任务要 `ssh … "cd 镜像 && git checkout -b …"`、`ssh … "git add && git commit"`、
+`ssh … "git rev-parse …"` 各来一遍。每一条都是 IDE 眼里的陌生命令，都要点一次授权；
+无人值守时那一下点击等于没人点，整轮就冻在那条 bug 上。现在镜像的整个草稿生命周期都有
+本系统命令，执行器只需要 `python -m app.cli …` 一种形态：
+
+| 命令 | 做什么 | 护栏 |
+| --- | --- | --- |
+| `mirror <ID>` | 只读探测：草稿分支在不在、tip、领先几笔、改了哪些文件、镜像当前停在哪个分支、工作区脏不脏、就绪三判据（`mirror_ready`） | 纯只读，不 fetch 不 checkout |
+| `checkout <ID> [--base …]` | 建/切这条 bug 的 `bugfix/zentao-<ID>`，默认基线 `refs/remotes/origin/trunk`，成功即置 `fixing` 并写回 branch | 镜像缺 trunk ref 或索引没落盘 → 拒绝；工作区有未提交改动 → 拒绝（不 stash 不切走，那是别人的会话） |
+| `draft <ID> --message "fix #<ID> …" --files a,b` | 只 `git add` 列出的文件并提交，返回短哈希 | 说明必须以 `fix #<禅道ID>` 开头（G8）；`--files` 必填、必须是镜像内相对路径、不许 `..`/绝对路径/`.git`；分支不存在就报错让你先 `checkout`；HEAD 不在这条分支上就拒绝；暂存为空 → 不造空提交 |
+| `reconcile [ID] [--apply]` | 对账：镜像上有草稿提交、库里却没登记（执行器跑完没收口 / 崩在收口前） | 默认只报告；`--apply` 才登记 `git:<哈希>` 并转 `await_review`，分析里写明「结论来自 git 提交信息，未验证」 |
+
+`draft` 之后仍然要 `commit --no-svn --revision git:<哈希> --analysis-file a.json` 收口——
+它只替你落 git 提交，不替你写分析、不替你过闸门。三条通道（推 SVN / 拒绝并回滚 / 重开）照旧是主人的。
+
 ## 2. 提交闸门（下达给执行器的「什么情况下可以提交」）
 
 闸门全过才允许提交；**任一条不过 → 走 `block` 回填需方案，绝不「先提交再说」**。
 
 | # | 条件 | 本系统提供的判据 |
 | --- | --- | --- |
-| G1 | 已看过禅道的完整描述、**截图**、备注/操作记录 | `status` 的 `steps` / `attachments[].local_path` / `comments`；缺则先 `detail <ID>` |
+| G1 | 已看过禅道的完整描述、**截图**、备注/操作记录 | `status` 的 `steps` / `images[].local_path` / `comments`；缺则先 `detail <ID>`；`images_skipped` 里的图模型读不了（1x1 之类），跳过它并在 `unverified` 注明即视为已尽看图义务（§3.4 四） |
 | G2 | 根因明确、修改点唯一（或已按主人 `owner_reply` 执行） | `status` 的 `owner_reply` 与历史提交 |
 | G3 | 只改与本 bug 直接相关的文件，且都在**该 bug 所属产品的工作副本**内（git 方式下 = `repos` 给出的镜像目录，不是正式工作副本） | `status` 的 `product_id` + `repos` 的产品→仓库映射（含 `working_copy`） |
 | G4 | 该产品的编译/测试实际通过（连续 2 次不过即视为不过） | `repos` 的 `build_command` / `test_command`（未绑定则按代码库自身构建规则） |
@@ -356,15 +378,15 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
    <SSH主机> / <SSH用户> / Linux 侧镜像路径 = 该库镜像根 `CLAUDE.local.yaml` 里的 `ssh.*` 与
    `path_aliases.LOCAL_WORKSPACE_ROOT`（同一份目录，Windows 侧只读代码，git 一律走 SSH）
 
-0) 先验镜像就绪（三条都要过，见 §1.5；不就绪就别开工）—— 全部走 SSH 且带 -c core.ignorecase=false：
-   ssh <SSH用户>@<SSH主机> "cd <镜像路径> && git -c core.ignorecase=false rev-parse --verify refs/remotes/origin/trunk"
-   ssh <SSH用户>@<SSH主机> "cd <镜像路径> && git -c core.ignorecase=false rev-parse --verify HEAD"
-   ssh <SSH用户>@<SSH主机> "cd <镜像路径> && git -c core.ignorecase=false ls-files --error-unmatch AGENTS.md"
-   任一条失败 = clone 没跑完或最后检出没落盘 → 直接跳到第 7 步 block，
+0) 先验镜像就绪（§1.8，别再自己拼 ssh）：python -m app.cli mirror <禅道ID>
+   看 `mirror_ready`（= trunk ref + HEAD + 索引里有 AGENTS.md 三条判据）与 `worktree_clean`
+   → ready=false = clone 没跑完或最后检出没落盘 → 直接跳到第 7 步 block，
    原因写「镜像未就绪（缺 ref / 缺 index）」，不许自己重跑 clone/fetch/read-tree 去补
 1) python -m app.cli status <禅道ID>
    读 product_id / product_name / steps / comments(备注) / attachments[].local_path / 历史提交 / owner_reply
    → 有截图必须用 Read 打开 local_path 真正看图，只看文字就动手是最常见的误判来源
+   → `images_skipped` 里的图（1x1 之类的占位图）模型读不了，硬喂会换来一个 400 把整条任务打断：
+     跳过它，按文字描述与代码取证继续，并在分析的 unverified 里写明「某张截图不可读」
    → 若 attachments 为空且没抓过详情：python -m app.cli detail <禅道ID>
 2) python -m app.cli claim <禅道ID>        # 占住任务，置 fixing，避免被别的子任务重复领
 3) 先读这条 bug 所在代码库自带的 AI 知识体系（§1.6），再动手定位：
@@ -373,11 +395,12 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
    从镜像内走这条路即可，别绕到镜像外面）→ 常驻层没覆盖该域时再读仓库正式的 `AGENTS.md`
    → 定下落点后读 `.trae/agents/<源码相对路径>/AGENT.md`，流程按 `.trae/skills/` 走，
    不许绕过知识体系全库散搜；跨文件检索与遍历也按该库硬门禁走 SSH（Windows 映射盘上本机 grep/find 会卡死）
-   然后在镜像里为这条 bug 开本地分支（SSH 侧）：
-   ssh <SSH用户>@<SSH主机> "cd <镜像路径> && git -c core.ignorecase=false checkout -b bugfix/zentao-<禅道ID> refs/remotes/origin/trunk"
+   然后为这条 bug 开/切本地分支（§1.8，它会顺带拒绝脏工作区，不替你 stash）：
+   python -m app.cli checkout <禅道ID>
    只改与这条 bug 直接相关的文件，且路径必须属于这条 bug 的产品仓库（闸门 G3）
-   改文件前先用 `git -c core.ignorecase=false ls-files <那个路径>` 确认大小写拼名 —— 本库有 109 组
-   只差大小写的同名对偶，Windows 侧两个拼名读到的是同一个文件，只有 Linux 侧才是真身份
+   改文件前先确认大小写拼名 —— 本库有 109 组只差大小写的同名对偶，Windows 侧两个拼名读到的是
+   同一个文件，只有 Linux 侧才是真身份：按该库规程在 SSH 侧跑
+   `git -c core.ignorecase=false ls-files <那个路径>`（这一条是定位取证，不属于 §1.8 的草稿动作）
 4) 编译 / 测试：用该库规定的构建方式（本系统 `repos` 里的 build_command / test_command 可作参考）
    本工程只能在 SSH 编译服务器上实测；连续 2 次不过 → 直接走第 7 步 block，写清失败现象，不要硬试
 5) 多语言词条（改了 .po/.mo 才做，G12；镜像分支里不留词条文件）
@@ -390,15 +413,15 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
    python -m app.cli i18n-commit <禅道ID> --files <同一批文件> --message "<一句话说明>"
    → 输出里的 r<号> 就是词条的真实修订号，稍后写进分析结论的 change_desc / evidence
 6) 提交判定（§2 的 G1–G12）
-   - 全过：只在镜像里做一次本地提交（SSH 侧，并记下短哈希）
+   - 全过：先做知识回写，再落草稿提交（§1.8，短哈希在它的返回里，不用再自己 rev-parse）
      本次若得出可复用、且已被代码或配置验证的结论 → 追加进
      `.trae/agents/<改动目录>/AGENT.md`（§1.6 的知识回写）；它是知识根那个独立仓的内容，
      **只追加文件、不 add 不 commit**，也不要写进本条 bug 的 `--files`，改为在 analysis 的
      evidence 里点名「回写了哪个知识文件、写了什么」，由主人自己收口
-     ssh <SSH用户>@<SSH主机> "cd <镜像路径> && git -c core.ignorecase=false add <改的文件> && git -c core.ignorecase=false -c user.name=<主人指定> -c user.email=<主人指定> commit -m 'fix #<禅道ID> <一句话根因>'"
-     ssh <SSH用户>@<SSH主机> "cd <镜像路径> && git -c core.ignorecase=false rev-parse --short HEAD"
-     只 add 你改过的那几个文件；`git add -A` / `add .` 禁止 —— 会把 §1.5 那批结构性噪音
-     （整棵 `.trae/**`、`openvpn-2.4.8/INSTALL`、Windows 检出留下的 CRLF `M`）一起卷进提交
+     python -m app.cli draft <禅道ID> --message "fix #<禅道ID> <一句话根因>" --files a.c,b.c
+     只列你改过的那几个文件；命令本身不做整仓 add —— §1.5 那批结构性噪音
+     （整棵 `.trae/**`、`openvpn-2.4.8/INSTALL`、Windows 检出留下的 CRLF `M`）
+     一旦被 `add -A` 卷进来就是白送的一堆误报，所以它按清单逐个 add
    - 禁止：git svn dcommit / git push / svn ci（G11，进正式库只由主人做；词条已由 i18n-commit 单独提过）
    - 任一条不过或需要业务决策：不提交，仍要写分析，跳到第 7 步的 block 分支
 7) 把分析结论写成 JSON 文件（字段规范见 §2.2，gates 必须逐条给结论，含 G11/G12），然后回本系统登记
@@ -415,7 +438,9 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
 把词条文件留在镜像分支里不提交、或用 i18n-commit 夹带任何非词条文件；
 resolve/close 禅道 bug；改无关文件；把 .env 内容写进任何输出；问我是否继续；
 触发任何要人授权的动作（密码弹窗、命令审批、sudo、交互 yes/no、提问工具）—— 需要授权就 block，别等；
+看镜像 / 开分支 / 落草稿自己拼 `ssh … git …`（一律用 §1.8 的 mirror / checkout / draft，那才是免审批的一条命令）；
 撞上模型/接口限流就按 §3.4 等 5 分钟重试（最多 3 次），不许把这条任务中止或跳过；
+把 `images_skipped` 里的图喂给模型，或因为一张读不了的图（400 / must be larger than 10）中止这条任务；
 看到「本地文件比仓库新 / 要不要比较」按 §3.4 自己取证判定，不许停下来问我
 ```
 
@@ -441,8 +466,9 @@ ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git -c core.ignorecase=false d
 #    被护栏拦下时预检会自己说清三件事：谁改的（该文件 trunk 上最近一笔 r 号与说明）、
 #    哪些文件与本草稿改在不同行区间（`可无损自动对齐`）、哪些真的撞上同一行（`必须人工对齐`）。
 #    不重叠的那类可以勾「自动按 trunk 对齐」（表单 `align=1`）后重推：脚本用
-#    `git merge-file` 三方合并，以 trunk 现内容为底再套本草稿的改动，他人改动一行不少，
-#    提交说明会自动附一行「已按 trunk 对齐 <文件>」。重叠/增删仍整笔拒绝，trunk 与草稿都不动。
+#    `git merge-file` 三方合并，以 trunk 现内容为底再套本草稿的改动，他人改动一行不少。
+#    对齐了哪些文件、跳过了哪些已入库文件，只写进审查留痕与禅道评论，**不写进 svn 的提交说明**
+#    （正式 log 里只该有这次改了什么，不该有本系统的过程日志）。重叠/增删仍整笔拒绝，trunk 与草稿都不动。
 #    这个勾只有主人能点，执行器不许调用本接口（G11），也不许改脚本放宽护栏。
 #    两台编译服务器都没有 git-svn（实测 `git: 'svn' is not a git command`），所以 dcommit 不是选项；
 #    镜像 `refs/remotes/origin/trunk` 落后于真实 trunk 是这类拦截的常见根因，能 fetch 时先 fetch 再推更干净。
@@ -453,8 +479,8 @@ python -m app.cli status <禅道ID>       # 推完再看一眼：r<号> 与 git:
 这条回到 `rejected` 重新入队，`queue_kind=reopened`，上一轮的结论/改动文件/r 号作为 `prior_fix`
 一起下发；登记的 r 号与草稿分支都不删，**trunk 不回退**（要回退是你自己的 svn 动作）。
 下一轮推送会自动以「上一轮推入的那个草稿提交」为增量基准（推送成功时 `svn_revisions.git_commit`
-记下了它），只提交新改动；trunk 上已经是草稿内容的文件直接跳过并在提交说明里注明，
-整批都一致时整笔拒——不会造空修订。拿不到那个提交（历史条目手工合入的）时会退回
+记下了它），只提交新改动；trunk 上已经是草稿内容的文件直接跳过（跳过清单进审查留痕与禅道评论，
+不进 svn 提交说明），整批都一致时整笔拒——不会造空修订。拿不到那个提交（历史条目手工合入的）时会退回
 `origin/trunk` 口径并靠「已落地」识别跳过，必要时勾「自动按 trunk 对齐」。
 
 ```
@@ -474,9 +500,9 @@ python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.
 `status` 与审查页能看到它从草稿到落库的完整轨迹。
 登记成 `PENDING` 的条目同理，只是还没有可信的本地哈希可审，得先看 `files` 与工作副本状态。
 
-### 3.4 运行中不许卡住的三类情况（限流 / 要授权 / 文件比仓库新）
+### 3.4 运行中不许卡住的四类情况（限流 / 要授权 / 文件比仓库新 / 截图读不了）
 
-这三类以前都会把整轮停下等人，现在一律**由执行器自己解决**，规则如下。
+这四类以前都会把整轮停下等人，现在一律**由执行器自己解决**，规则如下。
 
 **一、限流与暂时失败：等一会儿重试，不许中止整轮**
 
@@ -506,6 +532,10 @@ python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.
 - 也不许调用 `AskUserQuestion` 之类的提问工具：无人值守没有人在屏幕前。
 - 某一步确实非授权不可（例如必须主人本机才能做）→ **不要等批准**，直接 `block`
   写清「需要主人做什么授权、为什么、影响面、怎么回滚」，然后继续下一条。
+- **少触发审批的第一办法：别自己造命令。** 看镜像、开分支、落草稿、对账这四件事
+  都已经有 `python -m app.cli mirror / checkout / draft / reconcile`（§1.8），
+  它们和 `status` / `claim` / `commit` 同一种形态，不需要为它们点授权；
+  裸 `ssh … git …` 每出现一次就多一次被冻住的机会。
 - 结论：**授权需求一律转成 `block` 留痕，不转成等待。**
 
 **三、「本地文件比仓库新 / 要不要比较」：自己判定，不许问**
@@ -521,6 +551,25 @@ python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.
    `block` 写明「<文件> 有一份不是我改的改动：<一行摘要>，请确认保留还是丢弃」，继续下一条；
 4. 差异是你自己这次写的但分支不对（别的禅道 ID 混进来）→ 按 §8「分支基线莫名变化」那行处理。
 
+**四、模型读不了那张截图：跳过它，不许中止这条**
+
+禅道里有的是 1x1 的占位图或损坏图，视觉接口对它们的回答不是警告而是硬失败：
+
+```
+{"error":{"code":"invalid_parameter_error",
+ "message":"The image length and width do not meet the model restrictions.
+            [height:1 or width:1 must be larger than 10]"}} (HTTP Status: 400)
+```
+
+- 本系统在**下载附件时就量过尺寸**（`app/imgsize.py`）：短边不足 10px 或读不出尺寸的，
+  该条会带 `unreadable` 原因，并从 `images` 挪进 `images_skipped`。
+  所以 `status` / 审查页给你的 `images` 一律是「能看的图」，`images_skipped` 是「已经替你判定不能看的」。
+- 库里已有的历史附件用 `python -m app.cli img-gate` 离线重量一遍（不连禅道，只读文件头）。
+- 处置：`images_skipped` 里的图**不要 Read**；按描述文字 + 代码取证继续，
+  在分析的 `unverified` 里写「某张截图 1x1 不可读，未看图」。G1 的「必须看图」
+  对这种图自动降级，**不算你没看图**。
+- 万一还是撞上了这个 400（新图、或别的图触发的）：把图从这一步拿掉重试一次文字路径，
+  仍然不许中止整条任务，更不许中止整轮；实在缺图不可判断 → `block` 写明缺哪张图。
 
 ## 4. 为什么它能「自动下一个」而不会走偏
 
@@ -606,6 +655,9 @@ Web /review   待你审查：AI 分析结论 + 闸门逐条 + files_changed / fi
 Web /repos    各产品用哪个仓库、镜像在哪、正式 SVN 工作副本（多语言通道用）在哪、build/test 命令
 命令 python -m app.cli report            进度：counts + 三份清单 + remaining_work
 命令 python -m app.cli tasks --limit 5   下一条会被处理的是谁
+命令 python -m app.cli reconcile         对账：镜像上有草稿提交、库里没登记的（执行器没收口）——
+                                         看一眼，确认无误再 `reconcile <ID> --apply` 认领成待审查
+命令 python -m app.cli img-gate --check  有哪些截图模型读不了（1x1 / 损坏），量的是本地文件不连禅道
 ```
 
 ## 8. 异常与回退
@@ -630,7 +682,9 @@ Web /repos    各产品用哪个仓库、镜像在哪、正式 SVN 工作副本�
 | 推入 SVN 失败（编码、护栏拦下、远端不可达） | **不改状态**：只追加一条 `kind=manual` 人工留痕 + 禅道留言，`git:<哈希>` 草稿记录不动；修好原因后重推即可，多次草稿提交会合并成一次 svn 提交 |
 | 推送被护栏拦下：`trunk 相对草稿基线已有他人改动` | 根因几乎都是镜像 `origin/trunk` 落后。留痕里会带「trunk 上最近一笔 r 号」和可自动对齐的文件清单：改动不重叠就勾「自动按 trunk 对齐」重推（三方合并，他人改动保留）；撞在同一行区间或涉及增删文件时不许勾，先 fetch 镜像或把这条打回让 AI 在新基线上重做。执行器不许自己调这个接口，也不许放宽护栏 |
 | 模型或接口报限流（`rate limit` / `429` / `overloaded` / `quota` / 「稍后再试」/ 502、503） | **不许中止整轮**：等 5 分钟重试同一步，总共 3 次（`.env` 的 `RETRY_WAIT` / `RETRY_MAX`；本系统读禅道那侧已内置，会打印 `[retry] …等 N 秒后重试`）。3 次用完才 `block` 写「上游限流未恢复（已等 X 分钟重试 N 次）」，然后继续下一条。写类动作（评论、`i18n-commit`）不重试，失败就如实登记 |
-| 某一步需要授权（SSH 要密码、IDE 命令审批、沙箱越权、`sudo`、yes/no 交互、要人点「继续」） | **禁止出现，也禁止等**：本系统 svn 已 `--non-interactive`、SSH 只走免密 key（参数见该库 `CLAUDE.local.yaml`）。真绕不开就 `block` 写清「要主人做什么授权 / 为什么 / 影响面 / 怎么回滚」，立刻做下一条；不许调 `AskUserQuestion` 之类的提问工具 |
+| 模型报截图尺寸不合规（`400 invalid_parameter_error` / `must be larger than 10` / `height:1 or width:1`） | 那是禅道发的 1x1 占位图，不是你的错也不该中止：本系统已在下载时把它标 `unreadable` 并挪进 `images_skipped`（§3.4 四），执行器跳过它按文字继续即可；库里已有的历史附件跑一次 `python -m app.cli img-gate` 重量一遍 |
+| 任务其实跑完了、镜像上有 `bugfix/zentao-<ID>` 提交，库里却还停在 `fixing`（子任务崩在收口前 / 忘了 `commit`） | `python -m app.cli reconcile` 点名所有这种条目；核对无误后 `reconcile <ID> --apply` 认领：登记 `git:<哈希>`（带真实哈希）、写回分支与文件清单、转 `await_review`，并在分析里标明「结论来自 git 提交信息，未验证」。不 apply 就只报告，什么都不改 |
+| 某一步需要授权（SSH 要密码、IDE 命令审批、沙箱越权、`sudo`、yes/no 交互、要人点「继续」） | **禁止出现，也禁止等**：本系统 svn 已 `--non-interactive`、SSH 只走免密 key（参数见该库 `CLAUDE.local.yaml`）；看镜像 / 开分支 / 落草稿 / 对账一律用 §1.8 的 `mirror` / `checkout` / `draft` / `reconcile`，别自己拼裸 `ssh … git …`。真绕不开就 `block` 写清「要主人做什么授权 / 为什么 / 影响面 / 怎么回滚」，立刻做下一条；不许调 `AskUserQuestion` 之类的提问工具 |
 | 提示「本地文件比仓库新，是否比较」 | 执行器自己按 §3.4 第三步取证（SSH 侧 `status` + `diff --ignore-cr-at-eol`）：只剩 CRLF / `$Id$` / 大小写对偶 / `.trae/**` 就当已知噪音照常做；是别人写的真实改动就**不覆盖不 stash 不 revert**，`block` 写「<文件> 有一份不是我改的改动：<摘要>」；都不许停下来问人 |
 | 某条想先搁置 | 让它 `need_solution`，或直接在库里改状态，它就不在队列里 |
 | PENDING 一直没人提交 | 它已在 `await_review`，`report` 与 `/review` 都能看到；不提交就不会变 `merged` |
@@ -653,12 +707,13 @@ python -m app.cli repos                       # 确认该产品已 bound、worki
 
 # AI（自动）
 sync --details -1 → tasks → 每条一个子任务
-   （验镜像就绪 → status → claim → 在镜像开 bugfix/zentao-<ID> → 改 → SSH 编译测试
+   （mirror 验镜像就绪 → status → claim → checkout 开/切 bugfix/zentao-<ID> → 改 → SSH 编译测试
      → 改了词条就 i18n-up → 改词条 → i18n-commit（单独进 SVN，拿 r<号>）
-     → 闸门 G1–G12 → git commit（只本地，SSH 侧、只 add 自己改的文件）
+     → 闸门 G1–G12 → draft（只 add 列出的文件，只本地提交，返回短哈希）
      → commit --no-svn --revision git:<哈希> --analysis-file a.json）
-   → 下一条 → report
-   注：所有 git 子命令都长这样 —— ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git -c core.ignorecase=false …"
+   → 下一条 → report → reconcile（点名跑完没收口的条目）
+   注：镜像的读与草稿提交都在 mirror / checkout / draft 三条命令里（§1.8），
+   执行器不再自己拼 ssh + git；只有编译测试与定位取证仍按该库规程走 SSH
 
 # 你（收尾）
 /need 答复 → /review 逐条看分析与闸门 → 同样在 SSH 侧 git -c core.ignorecase=false log/diff 审改动

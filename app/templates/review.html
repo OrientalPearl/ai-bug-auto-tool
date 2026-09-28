@@ -55,6 +55,10 @@
       {% endfor %}
     </div>
     {% endif %}
+    {% if bug.images_skipped %}
+    <p class="hint">模型读不了的截图 {{ bug.images_skipped | length }} 张（{{ bug.images_skipped[0].unreadable }}），
+      执行器已按规则跳过，不是漏看。</p>
+    {% endif %}
 
     {% if bug.comments %}
     <h4 class="hint" style="color:#23272f;font-weight:600">禅道备注 / 操作记录</h4>

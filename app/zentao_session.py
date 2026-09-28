@@ -32,6 +32,7 @@ from typing import Any
 
 import requests
 
+from . import imgsize
 from . import zentao_parse as parse
 from .config import PROJECT_ROOT, get_settings
 from .net_retry import call_with_retry
@@ -444,6 +445,7 @@ class ZentaoSessionClient:
             if dest.exists() and dest.stat().st_size > 0:
                 item["local_path"] = str(dest)
                 item["size"] = dest.stat().st_size
+                self._gate_picture(item, dest)
                 continue
             try:
                 resp = call_with_retry(
@@ -460,7 +462,25 @@ class ZentaoSessionClient:
             dest.write_bytes(resp.content)
             item["local_path"] = str(dest)
             item["size"] = len(resp.content)
+            self._gate_picture(item, dest)
         return attachments
+
+    @staticmethod
+    def _gate_picture(item: dict, dest: Path) -> None:
+        """Measure the picture now, so a 1x1 placeholder never reaches a model.
+
+        Zentao serves degenerate screenshots; a vision endpoint answers them with
+        a 400 that kills the whole unattended run. The reason is stored on the
+        attachment so both the review page and the executor can see it was
+        skipped on purpose, not overlooked.
+        """
+        pixels, reason = imgsize.gate(dest, str(item.get("ext") or ""))
+        if pixels:
+            item["pixels"] = pixels
+        if reason:
+            item["unreadable"] = reason
+        else:
+            item.pop("unreadable", None)
 
     # ------------------------------------------------------------------
     # writes

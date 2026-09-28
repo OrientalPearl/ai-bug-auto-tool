@@ -188,13 +188,19 @@ python -m app.cli branch 51452 --dry-run
 
 ③ 逐条处理（每批 5 条，处理完自动取下一批，不问「是否继续」）
    python -m app.cli status <禅道ID>     # 全文 + 截图本地路径 + 备注 + 历史提交 + 主人答复 + 所属产品
+        # images 才是能看的图；images_skipped 是 1x1 之类的占位图，模型喂了会 400，跳过即可（不算没看图）
    python -m app.cli claim  <禅道ID>     # 占住任务，避免被别的子任务重复领
+   python -m app.cli mirror <禅道ID>     # 只读看镜像：草稿分支在不在、领先几笔、就绪与占用情况
+   python -m app.cli checkout <禅道ID>   # 在镜像里建/切这条的 bugfix 分支（脏工作区会拒绝，不替你 stash）
    ... 在该库自己的知识体系下定位并改代码、跑该库的编译/测试 ...
    ... 改了词条就单独走 G12：i18n-up <禅道ID> --files a.po（先 up）→ 改 → i18n-commit <禅道ID> --files a.po（立即单独提交，拿 r<号>） ...
    ... 逐条核对 AUTO_LOOP.md 的提交闸门 G1–G12 ...
-   闸门全过 → 只在落码位置（git 镜像/独立工作副本）本地提交，回本系统登记：
+   闸门全过 → 只在落码位置本地提交，回本系统登记：
+   python -m app.cli draft <禅道ID> --message "fix #<禅道ID> <根因>" --files a.c,b.c   # 镜像里落草稿提交，返回短哈希
    python -m app.cli commit <禅道ID> --message "..." --files a.c,b.c --summary "..." --verify "..." --no-svn --revision git:<短哈希> --analysis-file a.json
         # = 存 analyses（分析结论） + 写 svn_revisions + 状态置 await_review + 回写禅道评论（不跑 svn）
+        # mirror/checkout/draft 把执行器要用镜像的动作全收进本系统命令（AUTO_LOOP.md §1.8）：
+        # 不必自己拼裸 ssh + git，也就少一处会把无人值守冻住的授权弹窗
    **分析结论是必交付物**：REQUIRE_ANALYSIS=true（默认）时没写分析的 commit 会被直接拒绝，
    字段规范见 `AUTO_LOOP.md` §2.1；也可先 `analyze <禅道ID> --kind commit --analysis-file a.json` 再 commit
    还需你授权才提交：把 --revision 换成 PENDING 并用 --extra 说明「待主人按仓库细则提交」
@@ -212,6 +218,7 @@ python -m app.cli branch 51452 --dry-run
         # 推之前会逐个文件比对 trunk，草稿基线已被别人改动就直接拒绝覆盖；全程 --non-interactive，不会弹密码
         # 被拦下时预检会说明「谁改的（r 号）」+ 哪些文件与本改动不重叠：勾「自动按 trunk 对齐」再推，
         # 脚本用 git merge-file 以 trunk 现内容为底合并（他人改动一行不少）；真撞上同一行仍整笔拒绝
+        # 对齐了什么、跳过了哪些已入库文件，只写进审查留痕与禅道评论，不进 svn 的提交说明
       不想让它代推，就自己按仓库细则提交后回填真实修订号（`AUTO_LOOP.md` §3.3）；填 trunk 号点「通过」→ merged
    「审查清单」里的三种处置（都不碰 trunk）：
       「打回重做（保留草稿）」→ rejected，改动不回滚，AI 下一轮在原分支上接着改
@@ -225,6 +232,9 @@ python -m app.cli branch 51452 --dry-run
 
 ⑤ 收尾
    python -m app.cli report            # 已提交待审 / 需方案 / 续修 / PENDING 待提交
+   python -m app.cli reconcile         # 对账：镜像上有草稿提交、库里却没登记的（跑完没收口的那类）
+        # 只报告不改东西；核对无误后 reconcile <禅道ID> --apply 认领成待审查，
+        # 登记的 git:<哈希> 带真实哈希，分析与状态都会标明「结论来自提交信息，未验证」
 ```
 
 安全边界（系统强制，Trae 绕不过去）：AI 不能提交或合并 trunk、不能 resolve/close 禅道 bug、
@@ -258,8 +268,18 @@ python -m app.cli sync --details -1       # 并全量抓截图/备注/附件
 python -m app.cli detail 1024             # 抓单条截图/备注/附件到 attachments/
 python -m app.cli detail --limit 20       # 抓优先级最高的 20 条
 python -m app.cli detail --all            # 全量抓
+python -m app.cli img-gate --check        # 重量已下载的截图：1x1 / 损坏图标为 unreadable（去掉 --check 才写库）
+                                     # 这类图喂给视觉模型会 400 打断整轮，标出来后它们就不在「必须看图」清单里
 python -m app.cli tasks --limit 5         # 取队列：已答复 > 已打回 > 待处理，再按 pri 升序 / severity 降序
 python -m app.cli status 1024             # 读全文 + 历史提交 + 主人答复 + 所属产品
+python -m app.cli mirror 1024             # 只读探测镜像上这条的草稿分支：tip / 领先几笔 / 改了哪些文件 / 就绪与占用
+python -m app.cli checkout 1024 [--base <基线>]  # 在镜像里建/切 bugfix/zentao-1024（默认基线 origin/trunk）
+                                     # 镜像未就绪、或工作区有别人未提交的改动 → 拒绝且不改状态（不替你 stash）
+python -m app.cli draft 1024 --message "fix #1024 <根因>" --files a.c,b.c
+                                     # 在镜像的这条分支上落草稿提交：只 add 列出的文件，返回短哈希当 git:<哈希>
+                                     # 说明不以 fix #<ID> 开头 / 清单为空 / 路径越界 / HEAD 不在这条分支 → 直接拒
+python -m app.cli reconcile [1024] [--apply]
+                                     # 对账：镜像上有草稿提交、库里没登记的（跑完没收口）；--apply 才认领成待审查
 python -m app.cli repos                   # 每个产品的 bug 数与生效仓库
 python -m app.cli bind-repo 25 <仓库地址> --name "产品名" --build "..." --test "..."
                                      # 加 --working-copy <git 镜像> 指定改码目录，加 --svn-working-copy <正式SVN副本> 开多语言通道
