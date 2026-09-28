@@ -403,7 +403,13 @@ def decorate_bug(row: dict) -> dict:
         "SELECT * FROM reviews WHERE bug_id = ? ORDER BY id DESC", (row["id"],)
     )
     row["analyses"] = list_analyses(row["id"])
-    row["analysis"] = row["analyses"][0] if row["analyses"] else None
+    # The executor's write-up is what the review is judged on. A manual note (for
+    # instance a failed SVN push) is a trail, not a verdict, so it is exposed
+    # separately instead of hiding the analysis underneath it.
+    manual = [a for a in row["analyses"] if a.get("kind") == "manual"]
+    primary = [a for a in row["analyses"] if a.get("kind") != "manual"]
+    row["owner_notes"] = manual
+    row["analysis"] = (primary or row["analyses"] or [None])[0]
     return row
 
 

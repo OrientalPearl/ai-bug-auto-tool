@@ -299,27 +299,34 @@ def create_app() -> Flask:
                           "revision": prom.revision, "status": "merged",
                           "files": files}, "ok", text)
 
-        # Nothing landed: record the failure as an explicit note and hand the bug
-        # back so the next AI round keeps fixing it instead of waiting for a human.
+        # Nothing landed. That is a push failure, not a verdict on the fix: the bug
+        # stays exactly where it was (await_review), the git:<hash> draft record
+        # stays untouched, and only a trail is written. Re-trying, or deliberately
+        # sending it back to the AI, remains the owner's call.
         reason = prom.detail()
         db.add_analysis(
             bug["id"],
             {
-                "conclusion": "推入 SVN 未成功，改动仍只在镜像草稿里",
+                "conclusion": "推入 SVN 未成功（留痕）：改动与状态都未变动",
                 "symptom": f"点击「推 SVN」失败：{prom.error or '未知原因'}",
                 "evidence": (prom.raw or "")[-1200:],
-                "impact": "trunk 未被改动（远端写入未发生或已回退）",
+                "impact": "trunk 未被改动（远端写入未发生或已回退）；镜像草稿分支未动",
                 "verify": "推送清单：" + ("、".join(files) if files else "无"),
-                "unverified": "失败原因需要下一轮核实（见 evidence 原始输出）",
+                "unverified": "失败原因见 evidence 原始输出；修好原因后可直接重推",
                 "rollback": "无远端写入，无需回退",
             },
             kind="manual", author="owner",
         )
-        db.record_review(bug["id"], "reject", reject_reason=reason[:500])
-        sync.push_comment(bug["zentao_id"], f"人工推入 SVN 未成功，已打回继续修复：{reason[:300]}")
-        text = f"bug #{bug['zentao_id']} 推送失败，已记录异常并打回给 AI 继续修复。"
+        sync.push_comment(
+            bug["zentao_id"],
+            f"人工推入 SVN 未成功（仅留痕，状态仍是待审查，AI 草稿未变）：{reason[:300]}",
+        )
+        text = (f"bug #{bug['zentao_id']} 推送失败：已留痕，状态仍是"
+                f"「{STATUS_LABELS.get(bug['status'], bug['status'])}」，git 草稿记录未删。"
+                f"可直接重试，或你判定后手工打回。")
         return reply({"ok": False, "summary": text, "detail": reason,
-                      "conflicts": prom.conflicts, "status": "rejected"}, "error", text)
+                      "conflicts": prom.conflicts, "status": bug["status"],
+                      "unchanged": True}, "error", text)
 
     @app.route("/bug/<int:bug_id>/close", methods=["POST"])
     def bug_close(bug_id: int):
@@ -792,8 +799,9 @@ def _dispatch_checklist(queues: list[dict[str, Any]]) -> list[dict[str, str]]:
                 "只剩 CRLF / $Id$ / 大小写对偶 / .trae 就当噪音照常做；"
                 "是别人写的真实改动就不覆盖不 revert，block 写明摘要。")
     add("info", "草稿进正式库这一步现在有主人的按钮：审查详情弹窗「预检 / 正式推入 SVN」"
-                "（app/svn_promote.py，SSH 侧稀疏工作副本 + svn ci 进 trunk，成功自动登记真实 r 号并置 merged，"
-                "失败写异常备注并打回给你继续修）。你只登记 git:<哈希>，"
+                "（app/svn_promote.py，SSH 侧稀疏工作副本 + svn ci 进 trunk，只有成功进库才登记真实 r 号并置 merged；"
+                "推送失败只写人工留痕，状态仍是待审查、你的 git:<哈希> 草稿记录不动，所以你不会被莫名打回）。"
+                "你只登记 git:<哈希>，"
                 "不许调用 /bug/<id>/svn-push，也不许自己复刻那串 svn ci —— 那还是违反 G11。")
     return items
 

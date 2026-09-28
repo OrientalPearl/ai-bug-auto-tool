@@ -206,7 +206,8 @@ python -m app.cli branch 51452 --dry-run
    「需方案清单」/need  → 写答复提交 → 状态 replied，Trae 下轮优先处理
    「审查清单」/review  → 看 diff/说明 → 打开详情弹窗写提交说明 → 「预检（不写入）」→「正式推入 SVN」
         # 由 `app/svn_promote.py` 在 SSH 侧把该 bug 的 git 草稿落到稀疏 SVN 工作副本再 `svn ci` 进 trunk：
-        # 成功 → 自动登记真实 r 号并置 `merged` + 回写禅道评论；失败 → 写异常备注并打回 `rejected` 让 AI 继续修
+        # 成功 → 自动登记真实 r 号并置 `merged` + 回写禅道评论；失败 → 只写一条人工留痕，
+        #        状态仍是 `await_review`，`git:<哈希>` 草稿记录不动（推不入库不等于改得不对，不莫名打回）
         # 推之前会逐个文件比对 trunk，草稿基线已被别人改动就直接拒绝覆盖；全程 --non-interactive，不会弹密码
       不想让它代推，就自己按仓库细则提交后回填真实修订号（`AUTO_LOOP.md` §3.3）；填 trunk 号点「通过」→ merged
    merged 的卡片 → 「标记已结案」→ closed（禅道侧 resolve/close 由你手动做，AI 无权限）

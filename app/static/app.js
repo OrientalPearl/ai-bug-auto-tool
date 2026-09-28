@@ -129,6 +129,17 @@
     // The executor's written analysis (root cause / evidence / gates) is the main
     // thing a human reads before approving, so it goes right above the diff list.
     html += renderAnalysis(b.analysis);
+    // Manual notes (a failed SVN push, an owner remark) are a trail, not a verdict,
+    // so they sit below the analysis instead of replacing it.
+    const trail = (b.owner_notes || []).map(a => `
+      <li><b>${esc(a.created_at)}</b> · ${esc(a.conclusion || "")}
+        ${a.symptom ? `<br>${esc(a.symptom)}` : ""}
+        ${a.evidence ? `<br><span class="muted">${esc(String(a.evidence).slice(0, 400))}</span>` : ""}
+      </li>`).join("");
+    if (trail) {
+      html += `<h4>人工留痕（${(b.owner_notes || []).length} 条）</h4>
+        <ul class="tight" style="font-size:12px">${trail}</ul>`;
+    }
     if (!(b.analyses || []).length && ["await_review", "merged", "closed"].indexOf(b.status) >= 0) {
       html += `<h4>分析结论</h4><p class="hint" style="color:#b3261e">（缺失：要求执行器补
         <code>python -m app.cli analyze ${esc(b.zentao_id)} --analysis-file a.json</code>）</p>`;
@@ -147,7 +158,7 @@
             <button class="btn" type="submit" name="mode" value="dry"
               data-ask="预检：核对镜像、草稿基线，并逐个比对 trunk 上这些文件是否已被别人改动。不写入任何东西。">预检（不写入）</button>
             <button class="btn btn-pass" type="submit" name="mode" value="push"
-              data-ask="确认正式推入 SVN？上方文字会原样作为 svn ci 的提交说明进入 trunk；成功即记为已合入，失败会写异常备注并打回给 AI 继续修。">正式推入 SVN</button>
+              data-ask="确认正式推入 SVN？上方文字会原样作为 svn ci 的提交说明进入 trunk；只有真进了库才记为已合入。失败只留人工记录，状态仍是待审查，git 草稿记录不动。">正式推入 SVN</button>
             <span class="hint">分支 <code>${esc(b.branch || "-")}</code> 的草稿将按文件落到稀疏工作副本再提交；trunk 已被他人改动的文件不会被覆盖。</span>
           </div>
         </form>`;

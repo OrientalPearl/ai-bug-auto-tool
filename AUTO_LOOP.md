@@ -318,7 +318,8 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
 `GET /api/bug/<id>` 与 `python -m app.cli status <禅道ID>`。闸门逐条按颜色显示：
 `pass` 绿、`未验证` 黄、其它红。
 
-一条 bug 可以有多份分析（打回重做、卡点后再修都会追加），审查页显示最新一份。
+一条 bug 可以有多份分析（打回重做、卡点后再修都会追加），审查页显示最新一份**非人工**分析；
+`kind=manual` 的人工留痕（例如推入 SVN 失败）另列在「人工留痕」里，不会盖掉执行器的根因分析。
 
 ## 3. 标准指令模板（复制即用）
 
@@ -433,7 +434,10 @@ ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git -c core.ignorecase=false d
 # 3) 你判定可以进正式库：在审查页打开这条的详情弹窗，写提交说明后点「正式推入 SVN」
 #    （先点「预检（不写入）」看一眼清单与 trunk 漂移更稳）。这一步执行器绝不代做。
 #    它做的事全在 SSH 侧：读镜像里的草稿对象 -> 落到 <项目>/svn_promote/<镜像名> 这个
-#    --depth empty 稀疏工作副本 -> 按文件 svn ci 进 trunk，真实 r 号自动回填并记为已合入。
+#    --depth empty 稀疏工作副本 -> 按文件 svn ci 进 trunk（提交说明按 UTF-8 交给 svn）。
+#    只有真进了库才登记真实 r 号并置 merged；推送失败只写一条人工留痕（`kind=manual`），
+#    状态仍是 await_review、`git:<哈希>` 草稿记录不动 —— 推不入库不等于改得不对，
+#    要不要打回重做由你判定。被护栏拦下（trunk 已有他人改动）也走这条留痕路径。
 #    两台编译服务器都没有 git-svn（实测 `git: 'svn' is not a git command`），所以 dcommit 不是选项。
 python -m app.cli status <禅道ID>       # 推完再看一眼：r<号> 与 git:<哈希> 会同时挂在这条名下
 ```

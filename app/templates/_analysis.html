@@ -58,3 +58,14 @@
 <p class="hint" style="color:#b3261e">（AI 未写入分析结论：该轮 `REQUIRE_ANALYSIS` 可能被关掉了，
   要求执行器补 <code>python -m app.cli analyze {{ zentao_id }} --analysis-file a.json</code>）</p>
 {% endif %}
+{# Manual notes are a trail (failed SVN push, owner remark); never replaces the analysis. #}
+{% if owner_notes %}
+<h4 class="hint" style="color:#23272f;font-weight:600">人工留痕（{{ owner_notes | length }} 条）</h4>
+<ul class="tight" style="font-size:12px">
+  {% for n in owner_notes %}
+  <li><b>{{ n.created_at }}</b> · {{ n.conclusion }}
+    {% if n.symptom %}<br>{{ n.symptom }}{% endif %}
+    {% if n.evidence %}<br><span class="muted">{{ n.evidence | truncate(400) }}</span>{% endif %}</li>
+  {% endfor %}
+</ul>
+{% endif %}

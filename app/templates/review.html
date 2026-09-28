@@ -22,6 +22,7 @@
     <div style="white-space:pre-wrap">{{ bug.fix_summary or '（AI 未填写，可用 svn log 查看提交说明）' }}</div>
 
     {% set analysis = bug.analysis %}
+    {% set owner_notes = bug.owner_notes %}
     {% set show_missing = true %}
     {% set zentao_id = bug.zentao_id %}
     {% include "_analysis.html" %}
