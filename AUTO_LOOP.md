@@ -43,9 +43,12 @@
    闸门任一条不过 → block 回填（也带上分析），继续下一条
 7) 一批跑完立刻取下一批，禁止问我是否继续；tasks --limit 1 返回 0 条才停并输出 report
    一批收尾后补一次 `python -m app.cli reconcile`：镜像上有提交、库里没登记的，它会点名
+   再补一次 `python -m app.cli tmp-clean --apply`：回收本次留下的交接文件
 8) 运行中遇到这四类情况按 §3.4 自己解决，禁止停下来等我：
    模型/接口限流（rate limit / 429 / 繁忙）→ 等 5 分钟重试，最多 3 次，不许中止整轮；
-   任何需要授权的动作（密码弹窗、命令审批、sudo、交互 yes/no、提问工具）→ 不许触发，直接 block；
+   任何需要授权的动作（密码弹窗、命令审批、删除文件、sudo、交互 yes/no、提问工具）→ 不许触发，直接 block；
+   分析长文本写进 JSON 交给 --analysis-file / --block-file，命令入库后会自己回收那个文件，
+   所以你全程不需要、也不许自己去删文件（删除是最常把无人值守冻住的那一下点击）；
    模型报截图尺寸不合规（400 invalid_parameter_error / must be larger than 10）→ 那张图本系统已标
    unreadable，跳过它按文字继续，不许因为一张图中止这条；
    提示「本地文件比仓库新 / 要不要比较」→ 自己在 SSH 侧 diff 取证，噪音就照常做，别问我
@@ -231,9 +234,16 @@ git --git-dir=<镜像名>/.git fsck   # dangling blob 是镜像的正常现象�
 | `checkout <ID> [--base …]` | 建/切这条 bug 的 `bugfix/zentao-<ID>`，默认基线 `refs/remotes/origin/trunk`，成功即置 `fixing` 并写回 branch | 镜像缺 trunk ref 或索引没落盘 → 拒绝；工作区有未提交改动 → 拒绝（不 stash 不切走，那是别人的会话） |
 | `draft <ID> --message "fix #<ID> …" --files a,b` | 只 `git add` 列出的文件并提交，返回短哈希 | 说明必须以 `fix #<禅道ID>` 开头（G8）；`--files` 必填、必须是镜像内相对路径、不许 `..`/绝对路径/`.git`；分支不存在就报错让你先 `checkout`；HEAD 不在这条分支上就拒绝；暂存为空 → 不造空提交 |
 | `reconcile [ID] [--apply]` | 对账：镜像上有草稿提交、库里却没登记（执行器跑完没收口 / 崩在收口前） | 默认只报告；`--apply` 才登记 `git:<哈希>` 并转 `await_review`，分析里写明「结论来自 git 提交信息，未验证」 |
+| `tmp-clean [--apply]` | 回收跑完留在项目根的交接文件（`a_<ID>.json`、`blk_<ID>.json`、`py_<ID>.py`、`_tmp_*.py`） | 只认上面这几种命名；分析**没**入库的 `a_<ID>.json` 一律留着只报告；默认 dry-run，`--apply` 才删；`.env`、库文件、源码都不在候选里 |
 
 `draft` 之后仍然要 `commit --no-svn --revision git:<哈希> --analysis-file a.json` 收口——
 它只替你落 git 提交，不替你写分析、不替你过闸门。三条通道（推 SVN / 拒绝并回滚 / 重开）照旧是主人的。
+
+**还有一条最容易踩的：执行器不许自己去删文件。** 现场核对下来，无人值守弹授权的动作
+绝大多数是「清理用完的 `a_<ID>.json`」这类删除，而删除要人点确认，一点确认整轮就冻在原地。
+所以规则改成：长文本写进 JSON 交给 `--analysis-file` / `--block-file`，**命令写库成功之后由本系统
+把它读过的文件回收掉**（返回里的 `handoff_removed` 就是清单），想留着自查就加 `--keep-handoff`；
+一批跑完统一 `tmp-clean --apply` 清场。这样整条链路上没有任何一步需要「删除」这个动作。
 
 ## 2. 提交闸门（下达给执行器的「什么情况下可以提交」）
 
@@ -313,6 +323,10 @@ python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.
 python -m app.cli analyze <禅道ID> --kind commit --analysis-file a.json
 python -m app.cli commit <禅道ID> --message "..." --files a.c,b.c --no-svn --revision git:<短哈希>
 ```
+
+`a.json` 由命令读入并写库，**成功后本系统把它回收掉**（返回里的 `handoff_removed`），
+执行器不需要、也不许再去删它 —— 删除动作会弹授权、把无人值守冻在原地（§1.8、§3.4 二）；
+想留着自查就加 `--keep-handoff`，一批跑完统一 `tmp-clean --apply` 清场。
 
 `a.json` 的字段（除 gates 外都建议写满，写不出来的就是没分析到位）：
 
@@ -431,6 +445,8 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
      python -m app.cli commit <禅道ID> ... --no-svn --revision PENDING --analysis-file a.json --extra "待主人按仓库提交细则提交"
    卡住需要方案（question/options/advice 之外照样给分析）：
      python -m app.cli block <禅道ID> --question "<卡在哪一步>" --options "方案A：…；方案B：…" --advice "<建议及理由>" --analysis-file a.json
+     # 三段中文太长不好过 shell 时，写成 blk.json（question / options / advice，可再带 analysis_file）
+     # 用 --block-file blk.json 一次交进去，命令同样在入库后把它们回收掉
 8) 回报字段：zentao_id / product / 分支名 / 改了哪些文件 / git 短哈希 / 词条修订号 r<号>（若有）/
    闸门逐条结论 / analysis_id / action(commit|pending-commit|block) / revision 或 need_id
 禁止：没写分析就 commit（REQUIRE_ANALYSIS 会直接拒绝）；git svn dcommit / git push / svn ci / 提交或合并 trunk；
@@ -529,6 +545,9 @@ python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.
   该库 `CLAUDE.local.yaml`）、IDE 的命令审批/沙箱越权提示、`sudo`、要求输入 yes/no 的
   `svn`/`git` 交互（本系统的 svn 一律 `--non-interactive`）、让你「确认是否继续」的提问，
   以及 G11 禁的 `git svn dcommit` / `git push` / `svn ci`。
+- **实测最常见的触发点是「删除文件」**：清理用完的 `a_<ID>.json`、临时脚本、`__pycache__`
+  都会弹确认。所以这些删除根本不该由你做 —— 见上面 §1.8 的交接文件回收与 `tmp-clean`。
+  同理别顺手 `rm`、别 `del`、别用删除工具去"收拾现场"；要留就 `--keep-handoff`，要清就一条命令。
 - 也不许调用 `AskUserQuestion` 之类的提问工具：无人值守没有人在屏幕前。
 - 某一步确实非授权不可（例如必须主人本机才能做）→ **不要等批准**，直接 `block`
   写清「需要主人做什么授权、为什么、影响面、怎么回滚」，然后继续下一条。
@@ -658,6 +677,8 @@ Web /repos    各产品用哪个仓库、镜像在哪、正式 SVN 工作副本�
 命令 python -m app.cli reconcile         对账：镜像上有草稿提交、库里没登记的（执行器没收口）——
                                          看一眼，确认无误再 `reconcile <ID> --apply` 认领成待审查
 命令 python -m app.cli img-gate --check  有哪些截图模型读不了（1x1 / 损坏），量的是本地文件不连禅道
+命令 python -m app.cli tmp-clean         列出本次留下的交接文件（a_<ID>.json 等）；--apply 才回收，
+                                         分析没入库的那份一律留着只报告
 ```
 
 ## 8. 异常与回退
@@ -685,6 +706,7 @@ Web /repos    各产品用哪个仓库、镜像在哪、正式 SVN 工作副本�
 | 模型报截图尺寸不合规（`400 invalid_parameter_error` / `must be larger than 10` / `height:1 or width:1`） | 那是禅道发的 1x1 占位图，不是你的错也不该中止：本系统已在下载时把它标 `unreadable` 并挪进 `images_skipped`（§3.4 四），执行器跳过它按文字继续即可；库里已有的历史附件跑一次 `python -m app.cli img-gate` 重量一遍 |
 | 任务其实跑完了、镜像上有 `bugfix/zentao-<ID>` 提交，库里却还停在 `fixing`（子任务崩在收口前 / 忘了 `commit`） | `python -m app.cli reconcile` 点名所有这种条目；核对无误后 `reconcile <ID> --apply` 认领：登记 `git:<哈希>`（带真实哈希）、写回分支与文件清单、转 `await_review`，并在分析里标明「结论来自 git 提交信息，未验证」。不 apply 就只报告，什么都不改 |
 | 某一步需要授权（SSH 要密码、IDE 命令审批、沙箱越权、`sudo`、yes/no 交互、要人点「继续」） | **禁止出现，也禁止等**：本系统 svn 已 `--non-interactive`、SSH 只走免密 key（参数见该库 `CLAUDE.local.yaml`）；看镜像 / 开分支 / 落草稿 / 对账一律用 §1.8 的 `mirror` / `checkout` / `draft` / `reconcile`，别自己拼裸 `ssh … git …`。真绕不开就 `block` 写清「要主人做什么授权 / 为什么 / 影响面 / 怎么回滚」，立刻做下一条；不许调 `AskUserQuestion` 之类的提问工具 |
+| 弹「删除文件」的授权确认（清理 `a_<ID>.json` / 临时脚本 / `__pycache__`） | 实测最常见的卡死点，而且全是**没必要的删除**：分析长文本交给 `--analysis-file`、需方案文本交给 `--block-file`，命令入库成功后自己回收（返回里的 `handoff_removed`），想留着看就加 `--keep-handoff`；一批跑完 `python -m app.cli tmp-clean --apply` 统一清场。执行器侧一律不许出现删除动作（§1.8、§3.4 二） |
 | 提示「本地文件比仓库新，是否比较」 | 执行器自己按 §3.4 第三步取证（SSH 侧 `status` + `diff --ignore-cr-at-eol`）：只剩 CRLF / `$Id$` / 大小写对偶 / `.trae/**` 就当已知噪音照常做；是别人写的真实改动就**不覆盖不 stash 不 revert**，`block` 写「<文件> 有一份不是我改的改动：<摘要>」；都不许停下来问人 |
 | 某条想先搁置 | 让它 `need_solution`，或直接在库里改状态，它就不在队列里 |
 | PENDING 一直没人提交 | 它已在 `await_review`，`report` 与 `/review` 都能看到；不提交就不会变 `merged` |

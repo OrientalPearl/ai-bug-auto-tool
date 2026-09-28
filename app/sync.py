@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -293,6 +294,42 @@ def reconcile_drafts(apply: bool = False, zentao_id: int | None = None,
         found.append(item)
     return {"ok": True, "scanned": len(rows), "apply": apply,
             "unregistered": found, "skipped": skipped}
+
+
+def handoff_leftovers(root: Path | None = None) -> tuple[list[dict], list[dict]]:
+    """Executor scratch files sitting in the project root, split by safety.
+
+    An ``a_<ID>.json`` is the analysis the executor wrote for a bug. If that bug
+    has no analysis in the database, the file is the only surviving copy of the
+    conclusion, so it is held back and reported instead of swept.
+    """
+    from .config import PROJECT_ROOT
+
+    base = Path(root) if root is not None else PROJECT_ROOT
+    safe: list[dict] = []
+    held: list[dict] = []
+    try:
+        entries = sorted(base.iterdir())
+    except OSError:
+        return safe, held
+    for path in entries:
+        if not path.is_file():
+            continue
+        name = path.name
+        matched = re.match(r"^(?:a|analysis)_(\d+)\.json$", name)
+        if matched:
+            zentao = int(matched.group(1))
+            bug = db.get_bug_by_zentao_id(zentao)
+            registered = bool(bug and db.has_analysis(bug["id"]))
+            item = {"file": name, "bytes": path.stat().st_size, "zentao_id": zentao,
+                    "registered": registered}
+            (safe if registered else held).append(item)
+            continue
+        if (re.match(r"^(?:blk|block|note|gate)_?\d*\.json$", name)
+                or re.match(r"^py_\d+\.py$", name)
+                or re.match(r"^_tmp_[\w-]*\.(?:py|out|txt|json)$", name)):
+            safe.append({"file": name, "bytes": path.stat().st_size})
+    return safe, held
 
 
 def push_comment(zentao_id: int, text: str, *, client: ZentaoClient | None = None) -> dict:

@@ -193,7 +193,8 @@ python -m app.cli doctor                   # 禅道通道分步诊断
     把结果写成 JSON 文件（字段：`symptom` 现象、`root_cause` 根因、`evidence` 真实读过的文件:行/日志、
     `call_chain` 链路、`change_desc` 改动、`impact` 影响面与同构路径自审、`verify` 验证方式与实际结果、
     `unverified` 未验证项、`rollback` 回退、`conclusion` 一句话结论、`gates` G1–G12 逐条结论），
-    词条那次 `r<号>` 要写进 `change_desc`，规范见 `AUTO_LOOP.md` §2.2
+    词条那次 `r<号>` 要写进 `change_desc`，规范见 `AUTO_LOOP.md` §2.2；
+    **写完不用你去删那个文件** —— 命令入库成功后会把它回收（见禁止事项 32）
 12. 回到本系统登记（一条命令同时写入分析与修订号：存 `analyses` → 写 `svn_revisions` →
     置 `await_review` → 回写禅道评论）
 
@@ -321,13 +322,22 @@ python -m app.cli block <禅道ID> --question "..." --options "..." --advice "..
 31. **读不了的截图不许喂模型，也不许因为它中止这条**：`images_skipped`（1x1 占位图、损坏图）
     模型会直接 400（`invalid_parameter_error` / `must be larger than 10`）。跳过它按文字与代码取证继续，
     在 `unverified` 里写明哪张图不可读；G1 的「必须看图」对这种图自动降级，不算你没看图（§3.4 四）
+32. **禁止自己删文件**：现场核对下来，无人值守弹授权的动作绝大多数是**删除**（清理用完的
+    `a_<ID>.json` 之类交接文件、临时脚本、`__pycache__`）。删除要 IDE 点确认，一点确认整轮就冻住。
+    规则改成：长文本写进 JSON 交给 `--analysis-file` / `--block-file`，**命令写库成功后由本系统回收**
+    （输出里的 `handoff_removed` 就是它删掉的那些），要留着自查就加 `--keep-handoff`；
+    跑完统一 `python -m app.cli tmp-clean` 报告、`--apply` 回收，`report` 也会列出遗留。
+    `tmp-clean` 只认项目根下 `a_<数字>.json` / `blk_<数字>.json` / `py_<数字>.py` / `_tmp_*` 这些命名，
+    且**分析没入库的 `a_<ID>.json` 它会留着只报告**，不吞掉唯一一份结论
 
 ## 停止条件
 
 1. 所有 pending 和 replied 的 bug 都已处理完（`tasks --limit 1` 返回空）
 2. 收口前跑一次 `python -m app.cli reconcile`：镜像上有草稿提交、库里没登记的（子任务崩在收口前），
    它按条点名 —— 别靠记忆，也别让那条永远停在 `fixing`
-3. 输出汇总报告：
+3. 收口时跑一次 `python -m app.cli tmp-clean --apply` 回收本次留下的交接文件；
+   **不要用删除动作去清场**（禁止事项 32）
+4. 输出汇总报告：
    - 已本地提交待审查：bug ID 列表（含 `git:<哈希>`，并说明尚未进正式库）
    - 需主人给方案：bug ID 列表
    - 已按主人答复续修：bug ID 列表

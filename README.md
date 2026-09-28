@@ -201,6 +201,8 @@ python -m app.cli branch 51452 --dry-run
         # = 存 analyses（分析结论） + 写 svn_revisions + 状态置 await_review + 回写禅道评论（不跑 svn）
         # mirror/checkout/draft 把执行器要用镜像的动作全收进本系统命令（AUTO_LOOP.md §1.8）：
         # 不必自己拼裸 ssh + git，也就少一处会把无人值守冻住的授权弹窗
+        # --analysis-file 那个 JSON 在命令入库成功后由本系统自己回收（返回里的 handoff_removed）；
+        # 执行器全程不需要、也不许去做「删除文件」这个动作 —— 它是实测最常见的授权触发点
    **分析结论是必交付物**：REQUIRE_ANALYSIS=true（默认）时没写分析的 commit 会被直接拒绝，
    字段规范见 `AUTO_LOOP.md` §2.1；也可先 `analyze <禅道ID> --kind commit --analysis-file a.json` 再 commit
    还需你授权才提交：把 --revision 换成 PENDING 并用 --extra 说明「待主人按仓库细则提交」
@@ -235,6 +237,9 @@ python -m app.cli branch 51452 --dry-run
    python -m app.cli reconcile         # 对账：镜像上有草稿提交、库里却没登记的（跑完没收口的那类）
         # 只报告不改东西；核对无误后 reconcile <禅道ID> --apply 认领成待审查，
         # 登记的 git:<哈希> 带真实哈希，分析与状态都会标明「结论来自提交信息，未验证」
+   python -m app.cli tmp-clean         # 回收跑完留下的交接文件（a_<ID>.json / blk_<ID>.json / py_<ID>.py …）
+        # 默认只报告，加 --apply 才删；分析没入库的那份 a_<ID>.json 一律留着，不吞掉唯一一份结论。
+        # 命令入库时已顺手回收自己读过的那份，这条是清场用的 —— 执行器不必自己去删文件
 ```
 
 安全边界（系统强制，Trae 绕不过去）：AI 不能提交或合并 trunk、不能 resolve/close 禅道 bug、
@@ -280,6 +285,9 @@ python -m app.cli draft 1024 --message "fix #1024 <根因>" --files a.c,b.c
                                      # 说明不以 fix #<ID> 开头 / 清单为空 / 路径越界 / HEAD 不在这条分支 → 直接拒
 python -m app.cli reconcile [1024] [--apply]
                                      # 对账：镜像上有草稿提交、库里没登记的（跑完没收口）；--apply 才认领成待审查
+python -m app.cli tmp-clean [--apply]
+                                     # 回收留在项目根的交接文件（a_<ID>.json / blk_<ID>.json / py_<ID>.py / _tmp_*）
+                                     # 默认只报告；分析未入库的那份一定留着。执行器不必自己去删文件
 python -m app.cli repos                   # 每个产品的 bug 数与生效仓库
 python -m app.cli bind-repo 25 <仓库地址> --name "产品名" --build "..." --test "..."
                                      # 加 --working-copy <git 镜像> 指定改码目录，加 --svn-working-copy <正式SVN副本> 开多语言通道

@@ -844,8 +844,11 @@ def _scope_block(group: dict[str, Any], base_label: str) -> str:
                  "→ 等 5 分钟重试同一步，最多 3 次（RETRY_WAIT/RETRY_MAX），期间不改状态、不 block、不退循环；"
                  "3 次用完才 block 写「上游限流未恢复」，随后继续下一条；写类动作（评论、i18n-commit）不重试")
     lines.append("  b) 任何需要授权的动作一律不许触发也不许等待：密码弹窗、SSH 密码登录（只准免密 key）、"
-                 "IDE 命令审批、沙箱越权提示、sudo、yes/no 交互、提问工具；"
-                 "少触发审批的第一办法是别自己造命令 —— 看镜像/开分支/落草稿/对账都用 §1.8 的 "
+                 "IDE 命令审批、**删除文件的确认**、沙箱越权提示、sudo、yes/no 交互、提问工具；"
+                 "实测最常见的就是「清理用完的 a_<ID>.json」这类删除 —— 长文本交给 --analysis-file / "
+                 "--block-file，命令入库后会自己回收那份文件（返回里的 handoff_removed），"
+                 "跑完用 tmp-clean --apply 清场，你全程不必做任何删除；"
+                 "少触发审批的第二办法是别自己造命令 —— 看镜像/开分支/落草稿/对账都用 §1.8 的 "
                  "mirror、checkout、draft、reconcile；"
                  "确实绕不开授权就 block 写清「要主人做什么授权/为什么/影响面/怎么回滚」，接着做下一条")
     lines.append("  c) 出现「本地文件比仓库新，是否比较」：自己在 SSH 侧 status + diff --ignore-cr-at-eol 取证 —— "
@@ -963,6 +966,15 @@ def _dispatch_checklist(queues: list[dict[str, Any]]) -> list[dict[str, str]]:
     add("info", "镜像的读 / 开分支 / 落草稿 / 对账都已有本系统命令（AUTO_LOOP.md §1.8）："
                 "mirror、checkout、draft、reconcile —— 执行器不要再自己拼裸 ssh + git，"
                 "每拼一次就多一处会把无人值守冻住的授权弹窗。")
+    sweepable, unregistered = sync.handoff_leftovers()
+    if sweepable or unregistered:
+        add("warn", f"项目根还留着 {len(sweepable)} 个交接文件"
+                    + (f"，另有 {len(unregistered)} 个 a_<ID>.json 的分析没入库（会被留着，别当垃圾删）"
+                       if unregistered else "")
+                    + "。删除动作是实测最常见的授权触发点，清场走命令、不要让执行器自己删。",
+            'python -m app.cli tmp-clean --apply')
+    else:
+        add("ok", "项目根没有遗留的交接文件（分析文件由命令入库后自动回收）。")
     unreadable = db.query_one(
         "SELECT COUNT(*) AS c FROM bugs WHERE attachments LIKE '%\"unreadable\"%'")["c"]
     if unreadable:

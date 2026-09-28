@@ -22,11 +22,12 @@ import argparse
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from . import db, svn_client, sync
-from .config import get_settings
+from .config import PROJECT_ROOT, get_settings
 
 
 def _out(payload: dict[str, Any]) -> None:
@@ -138,6 +139,9 @@ def _add_analysis_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rollback", help="回退方式")
     parser.add_argument("--conclusion", help="一句话结论")
     parser.add_argument("--gates", help="闸门逐条结论，例：G1=pass,G5=未验证:未跑 OEM 同名页")
+    parser.add_argument("--keep-handoff", action="store_true",
+                        help="写完分析后保留 --analysis-file / --block-file 那个文件"
+                             "（默认命令成功后由本系统回收，执行器不必也不该自己去删文件）")
 
 
 def _parse_gates(raw: str | None) -> dict[str, str]:
@@ -200,6 +204,76 @@ def _write_analysis(bug: dict, payload: dict[str, Any], kind: str) -> dict:
     return db.add_analysis(bug["id"], payload, kind=kind, gates=gates, author=author)
 
 
+# ---------------------------------------------------------------------------
+# handoff files
+# ---------------------------------------------------------------------------
+# The executor writes its long analysis text into a JSON file, hands the path to
+# `--analysis-file`, and then wants to delete it. Deleting is exactly the action
+# that stops an unattended run: the IDE asks for approval and nobody is there to
+# answer. So the command that consumed the file removes it once the write has
+# succeeded -- the caller never performs a delete itself.
+
+HANDOFF_FLAGS = ("analysis_file", "block_file")
+
+
+def _is_handoff_area(path: Path) -> bool:
+    """Only files the caller dropped for us are ours to remove."""
+    try:
+        root = PROJECT_ROOT.resolve()
+        temp = Path(tempfile.gettempdir()).resolve()
+    except OSError:
+        return False
+    for base in (root, temp):
+        try:
+            path.relative_to(base)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def consume_handoff(args: argparse.Namespace) -> list[str]:
+    """Delete the handoff files this command has already ingested."""
+    if getattr(args, "keep_handoff", False):
+        return []
+    removed: list[str] = []
+    for flag in HANDOFF_FLAGS:
+        raw = str(getattr(args, flag, "") or "").strip()
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if not resolved.is_file() or not _is_handoff_area(resolved):
+            continue
+        try:
+            resolved.unlink()
+            removed.append(resolved.name)
+        except OSError:
+            pass
+    return removed
+
+
+def _load_json_handoff(path: str, label: str) -> dict[str, Any]:
+    """Read a handoff JSON the same way the analysis file is read."""
+    try:
+        raw = Path(path).expanduser().read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(json.dumps(
+            {"ok": False, "error": f"{label} 读不出来：{exc}"}, ensure_ascii=False)) from None
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(json.dumps(
+            {"ok": False, "error": f"{label} 不是合法 JSON：{exc}"}, ensure_ascii=False)) from None
+    if not isinstance(loaded, dict):
+        raise SystemExit(json.dumps(
+            {"ok": False, "error": f"{label} 必须是一个 JSON 对象"}, ensure_ascii=False))
+    return loaded
+
+
 def _require_analysis_or_die(bug: dict, payload: dict[str, Any] | None) -> None:
     """When REQUIRE_ANALYSIS is on, a bug cannot be committed without a written analysis."""
     if payload is not None or not get_settings().require_analysis:
@@ -228,7 +302,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     saved = _write_analysis(bug, payload, args.kind)
     _out({"ok": True, "action": "analyze", "zentao_id": bug["zentao_id"],
           "analysis_id": saved["id"], "kind": saved["kind"], "gates": saved["gates"],
-          "analysis": saved})
+          "handoff_removed": consume_handoff(args), "analysis": saved})
 
 
 def cmd_note(args: argparse.Namespace) -> None:
@@ -244,7 +318,8 @@ def cmd_note(args: argparse.Namespace) -> None:
     updated = db.set_bug_status(bug["id"], bug["status"], **fields)
     payload = _normalized_analysis(args)
     saved = _write_analysis(bug, payload, "manual") if payload else None
-    _out({"ok": True, "action": "note", "analysis_id": (saved or {}).get("id"), "bug": updated})
+    _out({"ok": True, "action": "note", "analysis_id": (saved or {}).get("id"),
+          "handoff_removed": consume_handoff(args), "bug": updated})
 
 
 def cmd_commit(args: argparse.Namespace) -> None:
@@ -305,6 +380,7 @@ def cmd_commit(args: argparse.Namespace) -> None:
         "status": "await_review",
         "analysis_id": analysis_id,
         "analysis_fields": sorted(k for k in (payload or {}) if not k.startswith("_")),
+        "handoff_removed": consume_handoff(args),
         "zentao_comment": comment,
     })
 
@@ -395,14 +471,33 @@ def cmd_i18n_commit(args: argparse.Namespace) -> None:
 
 
 def cmd_block(args: argparse.Namespace) -> None:
+    """Register a blocker that needs the owner's decision.
+
+    Long Chinese text is painful to pass through a shell, so the same payload may
+    live in a JSON file given with `--block-file`; the command ingests it and then
+    removes the file, so the executor never has to delete anything itself.
+    """
     bug = _bug_ref(args.ref)
+    text = _load_json_handoff(args.block_file, "--block-file") if args.block_file else {}
+    if args.block_file and not getattr(args, "analysis_file", None) and text.get("analysis_file"):
+        args.analysis_file = str(text["analysis_file"])
+    question = str(args.question or text.get("question") or "").strip()
+    options = str(args.options if args.options is not None
+                  else text.get("options") or "").strip()
+    advice = str(args.advice if args.advice is not None
+                 else text.get("advice") or "").strip()
+    if not question:
+        raise SystemExit(json.dumps(
+            {"ok": False, "error": "必须给出 --question，或在 --block-file 里写 question 字段"},
+            ensure_ascii=False))
     payload = _normalized_analysis(args)
-    need = db.create_need(bug["id"], args.question, args.options or "", args.advice or "")
+    need = db.create_need(bug["id"], question, options, advice)
     db.set_bug_status(bug["id"], "need_solution")
-    comment = sync.comment_block(bug["zentao_id"], args.question, args.options or "", args.advice or "")
+    comment = sync.comment_block(bug["zentao_id"], question, options, advice)
     analysis = _write_analysis(bug, payload, "block") if payload else None
     _out({"ok": True, "action": "block", "need": need, "status": "need_solution",
-          "analysis_id": (analysis or {}).get("id"), "zentao_comment": comment})
+          "analysis_id": (analysis or {}).get("id"),
+          "handoff_removed": consume_handoff(args), "zentao_comment": comment})
 
 
 def cmd_need_done(args: argparse.Namespace) -> None:
@@ -417,6 +512,7 @@ def cmd_comment(args: argparse.Namespace) -> None:
 def cmd_report(_args: argparse.Namespace) -> None:
     counts = db.counts_by_status()
     queue = db.fetch_task_queue(limit=1000)
+    sweepable, unregistered = _handoff_leftovers()
     _out({
         "ok": True,
         "action": "report",
@@ -432,6 +528,10 @@ def cmd_report(_args: argparse.Namespace) -> None:
             for t in queue
         ],
         "remaining_work": len(queue),
+        # Scratch files the run dropped: report them here so nobody reaches for a
+        # delete action (that is an approval prompt) to get rid of them.
+        "handoff_leftovers": [i["file"] for i in sweepable],
+        "handoff_held_unregistered": [i["file"] for i in unregistered],
     })
 
 
@@ -646,6 +746,41 @@ def cmd_img_gate(args: argparse.Namespace) -> None:
     _out({"ok": bool(result.get("ok")), "action": "img-gate", **result})
 
 
+def _handoff_leftovers() -> tuple[list[dict], list[dict]]:
+    """Scratch files in the project root, split by whether it is safe to sweep."""
+    return sync.handoff_leftovers(PROJECT_ROOT)
+
+
+def cmd_tmp_clean(args: argparse.Namespace) -> None:
+    """Sweep the scratch files an unattended run leaves behind.
+
+    The point is that the executor never deletes anything on its own: a delete is
+    an approval prompt, and an approval prompt is a frozen loop.
+    """
+    safe, held = _handoff_leftovers()
+    removed: list[str] = []
+    freed = 0
+    for item in list(safe):
+        if not args.apply:
+            continue
+        try:
+            (PROJECT_ROOT / item["file"]).unlink()
+            removed.append(item["file"])
+            freed += int(item.get("bytes") or 0)
+            safe.remove(item)
+        except OSError as exc:
+            item["error"] = str(exc)
+    _out({
+        "ok": True, "action": "tmp-clean", "apply": bool(args.apply),
+        "removed": removed,
+        "left": [i["file"] for i in safe],
+        "kept_unregistered": [i["file"] for i in held],
+        "bytes_freed": freed,
+        "note": ("已删除 removed 里列出的文件" if args.apply and removed
+                 else "只报告，没有删任何东西（加 --apply 才回收）"),
+    })
+
+
 def cmd_doctor(_args: argparse.Namespace) -> None:
     """Diagnose the configured Zentao channel step by step (read-only)."""
     from .zentao_session import make_client
@@ -778,6 +913,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--check", action="store_true", help="只报告，不写库")
     p.set_defaults(func=cmd_img_gate)
 
+    p = sub.add_parser("tmp-clean",
+                       help="回收无人值守跑完留下的临时交接文件（a_<ID>.json / blk_<ID>.json / "
+                            "py_<ID>.py / _tmp_*.py 等，只认项目根下这些命名）；"
+                            "执行器不必自己去删文件 —— 删除动作会触发授权弹窗、把整轮冻住")
+    p.add_argument("--apply", action="store_true", help="真的删（默认只报告）")
+    p.set_defaults(func=cmd_tmp_clean)
+
     p = sub.add_parser("mirror",
                        help="只读探测某条 bug 的草稿分支（tip / 领先几笔 / 改了哪些文件）；"
                             "看镜像一律走这条，不要自己拼 ssh + git 命令")
@@ -871,7 +1013,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("block", help="登记需方案并置为 need_solution，同时回写禅道评论")
     p.add_argument("ref")
-    p.add_argument("--question", required=True)
+    p.add_argument("--question", help="卡在哪一步（也可写进 --block-file 的 question）")
+    p.add_argument("--block-file",
+                   help="JSON 文件：一次性写入 question / options / advice（长文本免转义），"
+                        "命令成功后由本系统回收")
     p.add_argument("--options", default="")
     p.add_argument("--advice", default="")
     _add_analysis_args(p)

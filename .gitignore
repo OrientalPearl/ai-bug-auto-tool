@@ -14,3 +14,13 @@ __pycache__/
 venv/
 logs/
 *.log
+# Executor scratch handed to the CLI and swept back by it (AUTO_LOOP §1.8).
+# Root-anchored: tmp-clean only ever looks at the project root.
+/a_*.json
+/analysis_*.json
+/blk_*.json
+/block_*.json
+/note_*.json
+/gate_*.json
+/py_*.py
+/_tmp_*
