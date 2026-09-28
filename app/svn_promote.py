@@ -236,12 +236,14 @@ cleanup_wc() {
   done < "$TMPP"
 }
 
-# svn 1.6 only brings a file into a depth-empty parent when that path already
-# exists on disk, so a placeholder is created before the update.
+# Grow the file's own directory to depth=files so the file becomes versioned with
+# pristine trunk content. `svn update <file>` alone is unreliable on 1.6: it only
+# picks the path up when the entry already exists, which left earlier runs with an
+# unversioned file and an empty commit list.
 fetch_file() {
-  mkdir -p "$(dirname "$WCPATH/$1")" 2>/dev/null
-  [ -f "$WCPATH/$1" ] || : > "$WCPATH/$1"
-  timeout 90 svn update --non-interactive "$WCPATH/$1" >/dev/null 2>&1
+  _d=$(dirname "$1")
+  if [ "$_d" = "." ]; then _t="$WCPATH"; else _t="$WCPATH/$_d"; fi
+  timeout 90 svn update --non-interactive --set-depth files "$_t" >/dev/null 2>&1
   timeout 60 svn info --non-interactive "$WCPATH/$1" >/dev/null 2>&1 \
     || { P err "取 trunk 版本失败: $1"; return 1; }
   return 0
@@ -404,7 +406,12 @@ done < "$TMPT"
 P target "$1"
 P targets "$#"
 
-OUT=$(timeout 300 svn ci --non-interactive -F "$MSGF" "$@" 2>&1)
+# --encoding UTF-8 is not cosmetic: LC_ALL=C above makes svn read the log file as
+# plain ASCII and a Chinese message then dies with "Can't convert string from
+# native encoding to 'UTF-8'" on the http commit path (verified in the field).
+# Declaring the encoding keeps the message bytes intact and the English output
+# that the revision parse below relies on.
+OUT=$(timeout 300 svn ci --non-interactive --encoding UTF-8 -F "$MSGF" "$@" 2>&1)
 RC=$?
 rm -f "$MSGF"
 printf '%s\n' "$OUT" | sed '/^$/d' | while read L; do P svnout "$L"; done
