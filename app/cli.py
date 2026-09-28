@@ -671,9 +671,10 @@ def cmd_mirror(args: argparse.Namespace) -> None:
         "mirror_ready": state.ready, "index_ok": state.index_ok,
         # worktree_clean now means "no real local edit", not "porcelain is empty":
         # these mirrors carry a permanent baseline of structural noise (§1.5).
-        "worktree_clean": state.clean, "dirty_real": state.dirty_real,
-        "dirty_noise": state.dirty_noise, "dirty_untracked": state.dirty_untracked,
-        "dirty_paths": state.dirty_paths,
+        "worktree_clean": state.clean, "dirty_real": state.dirty_real, "dirty_noise": state.dirty_noise,
+        "dirty_untracked": state.dirty_untracked, "dirty_paths": state.dirty_paths,
+        # Read-only: mirror never sweeps a lock, it only says what it found.
+        "lock": _lock_info(state),
         "summary": state.summary(), "error": state.error,
     })
 
@@ -697,8 +698,28 @@ def cmd_checkout(args: argparse.Namespace) -> None:
         "tip": result.tip, "status": "fixing" if result.ok else bug["status"],
         "dirty_real": result.dirty_real, "dirty_noise": result.dirty_noise,
         "dirty_untracked": result.dirty_untracked, "dirty_paths": result.dirty_paths,
+        "lock": _lock_info(result),
         "summary": result.summary(), "error": result.error,
     })
+
+
+def _lock_info(result: Any) -> dict:
+    """The index.lock verdict carried by mirror / checkout / draft results.
+
+    Reported on every one of the three so a blocker can say in one line whether the
+    mirror is frozen by a leftover (which the writers now sweep themselves) or by a
+    live git process that must not be touched.
+    """
+    state = getattr(result, "lock_state", "") or ""
+    if not state:
+        return {}
+    info = {"state": state, "size": getattr(result, "lock_size", -1),
+            "age_seconds": getattr(result, "lock_age", -1),
+            "git_procs": getattr(result, "lock_procs", 0)}
+    swept = getattr(result, "lock_swept", "") or ""
+    if swept:
+        info["swept"] = swept
+    return info
 
 
 def cmd_draft(args: argparse.Namespace) -> None:
@@ -732,6 +753,7 @@ def cmd_draft(args: argparse.Namespace) -> None:
         "zentao_id": bug["zentao_id"], "branch": result.branch,
         "commit": result.short_tip, "subject": result.subject,
         "staged": result.staged, "nothing": result.nothing,
+        "lock": _lock_info(result),
         "summary": result.summary(), "error": result.error,
         "next": (f"python -m app.cli commit {bug['zentao_id']} --message \"<一句话根因>\" "
                  f"--files {','.join(result.staged or files)} --no-svn "

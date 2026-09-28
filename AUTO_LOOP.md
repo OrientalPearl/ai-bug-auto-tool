@@ -230,9 +230,9 @@ git --git-dir=<镜像名>/.git fsck   # dangling blob 是镜像的正常现象�
 
 | 命令 | 做什么 | 护栏 |
 | --- | --- | --- |
-| `mirror <ID>` | 只读探测：草稿分支在不在、tip、领先几笔、改了哪些文件、镜像当前停在哪个分支、工作区**真实**脏不脏（`worktree_clean` + `dirty_real`/`dirty_noise`/`dirty_untracked` + `dirty_paths`）、就绪三判据（`mirror_ready`） | 纯只读，不 fetch 不 checkout |
-| `checkout <ID> [--base …]` | 建/切这条 bug 的 `bugfix/zentao-<ID>`，默认基线 `refs/remotes/origin/trunk`，成功即置 `fixing` 并写回 branch | 镜像缺 trunk ref 或索引没落盘 → 拒绝；工作区有**别人的真实未提交改动** → 拒绝并列出文件（不 stash 不切走，那是别人的会话）。本镜像的结构性噪音**不拦**（见下） |
-| `draft <ID> --message "fix #<ID> …" --files a,b` | 只 `git add` 列出的文件并提交，返回短哈希 | 说明必须以 `fix #<禅道ID>` 开头（G8）；`--files` 必填、必须是镜像内相对路径、不许 `..`/绝对路径/`.git`；分支不存在就报错让你先 `checkout`；HEAD 不在这条分支上就拒绝；暂存为空 → 不造空提交 |
+| `mirror <ID>` | 只读探测：草稿分支在不在、tip、领先几笔、改了哪些文件、镜像当前停在哪个分支、工作区**真实**脏不脏（`worktree_clean` + `dirty_real`/`dirty_noise`/`dirty_untracked` + `dirty_paths`）、`index.lock` 现状（`lock.state`）、就绪三判据（`mirror_ready`） | 纯只读，不 fetch 不 checkout，**也不删锁** |
+| `checkout <ID> [--base …]` | 建/切这条 bug 的 `bugfix/zentao-<ID>`，默认基线 `refs/remotes/origin/trunk`，成功即置 `fixing` 并写回 branch | 镜像缺 trunk ref 或索引没落盘 → 拒绝；工作区有**别人的真实未提交改动** → 拒绝并列出文件（不 stash 不切走，那是别人的会话）。本镜像的结构性噪音**不拦**；上一轮死掉留下的陈锁**自动回收**（见下） |
+| `draft <ID> --message "fix #<ID> …" --files a,b` | 只 `git add` 列出的文件并提交，返回短哈希 | 同上：陈锁自动回收后才动手；说明必须以 `fix #<禅道ID>` 开头（G8）；`--files` 必填、必须是镜像内相对路径、不许 `..`/绝对路径/`.git`；分支不存在就报错让你先 `checkout`；HEAD 不在这条分支上就拒绝；暂存为空 → 不造空提交 |
 | `reconcile [ID] [--apply]` | 对账：镜像上有草稿提交、库里却没登记（执行器跑完没收口 / 崩在收口前） | 默认只报告；`--apply` 才登记 `git:<哈希>` 并转 `await_review`，分析里写明「结论来自 git 提交信息，未验证」 |
 | `tmp-clean [--apply]` | 回收跑完留在项目根的交接文件（`a_<ID>.json`、`blk_<ID>.json`、`py_<ID>.py`、`_tmp_*.py`） | 只认上面这几种命名；分析**没**入库的 `a_<ID>.json` 一律留着只报告；默认 dry-run，`--apply` 才删；`.env`、库文件、源码都不在候选里 |
 
@@ -249,6 +249,16 @@ git --git-dir=<镜像名>/.git fsck   # dangling blob 是镜像的正常现象�
 加起来等于你自己在 SSH 侧数出来的 `git status --porcelain` 行数，`dirty_paths` 给出前 5 个真实改动的文件。
 执行器**不许**因为噪音就 `block`，也不许绕过这条判据自己拼 `ssh … git checkout`：真撞上有人的真实改动，
 按 §3.4 三处理（不动它、block 写清是哪个文件）。
+
+`index.lock` 也一样：会话被 IDE 崩掉或模型报错打断时，git 正在写的 `.git/index.lock` 会留下一个
+**0 字节空锁**，git 自己不会清，于是这个镜像上后面每一条 bug 都撞同一堵墙（实测一天内三次，
+`#41538` 那把甚至躺了 8 小时）。等主人逐条去删不成设计，所以写类命令（`checkout`/`draft`）自己回收，
+判定条件必须同时成立：① 恰好 0 字节（真在写的进程会持续往里写，空的说明刚建就死了）② 本机 `pgrep -x git`
+为 0（没人持有；**不能拿 `git status` 探** —— 它自己就会创建 index.lock）③ 已静默 `LOCK_STALE_MINUTES`
+（默认 5 分钟，远大于重写这 96 MB 索引所需时间）。任何一条不满足就**只报告不动**：非 0 字节、太新、
+或有活的 git 进程，都会明确拒着并告诉你该 `rm -f` 哪个文件。`mirror` 永远只报告不删（它是只读通道）。
+`LOCK_STALE_MINUTES=0` 可以整条关掉自动回收。返回里的 `lock.state` 是 `absent|stale|hold|busy|odd`，
+`lock.swept` 说明回收了什么。**执行器侧不需要、也不允许为陈锁写 block** —— 系统已经处理完了。
 
 **还有一条最容易踩的：执行器不许自己去删文件。** 现场核对下来，无人值守弹授权的动作
 绝大多数是「清理用完的 `a_<ID>.json`」这类删除，而删除要人点确认，一点确认整轮就冻在原地。
@@ -409,6 +419,8 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
    原因写「镜像未就绪（缺 ref / 缺 index）」，不许自己重跑 clone/fetch/read-tree 去补
    → `worktree_clean=false` 只看 `dirty_real`（那几条才是人的改动，`dirty_paths` 列了文件名）；
      `dirty_noise` / `dirty_untracked` 是 §1.5 的常年噪音，**照旧开工、不许为此 block**
+   → `lock.state` 告诉你 `.git/index.lock` 的现状：`stale` 会被 `checkout`/`draft` 自己回收（返回里带
+     `lock.swept`），`hold`/`busy` 才需要 block 并抄上 size/age —— 别为已经被回收的锁写 block
 1) python -m app.cli status <禅道ID>
    读 product_id / product_name / steps / comments(备注) / attachments[].local_path / 历史提交 / owner_reply
    → 有截图必须用 Read 打开 local_path 真正看图，只看文字就动手是最常见的误判来源
@@ -719,6 +731,7 @@ Web /repos    各产品用哪个仓库、镜像在哪、正式 SVN 工作副本�
 | `git status` 里整棵 `.trae/**` 是 ` D`、`openvpn-2.4.8/INSTALL` 是 ` D` | 结构性噪音（`.trae` 是指向主人知识库根的符号链接 + 仓库里文件与盘上目录同名），**不是这次 bug 造成的**：不许 `checkout` 它们（会写穿符号链接覆盖知识库）、不许写进 `--files`、不许为此 `block`。本系统已认得这类噪音：`mirror` 把它们计入 `dirty_noise`，`checkout` 只被 `dirty_real` 拦（§1.8） |
 | 在 Windows 侧改了 `xt_dscp.c`，结果 `xt_DSCP.c` 变了 / `git status` 说另一半被删 | Windows 的 `ignorecase` 把大小写对偶混成一个（实测两个拼名 md5 相同）。立刻 `git -c core.ignorecase=false checkout -- <被误改的那个>` 回退，改到 SSH 侧重做；这类事故只有 Linux 侧能看出来 |
 | 工作树/分支基线莫名变化，或 `git status` 里冒出**别的产品/别的禅道 ID** 的文件 | 两个产品共用了同一份镜像却被并行处理（违反 §5）：立刻停掉其中一条队列，在 SSH 侧 `git -c core.ignorecase=false status` 核对，被串味的分支 `git reset --hard <基线>` 重做；要让它们真并行只能给其中一个另开一份镜像 |
+| 镜像被 `.git/index.lock` 冻住（`Unable to create …index.lock: File exists`） | 上一轮会话被 IDE 崩溃或模型报错打断在写索引的中间，留下 0 字节空锁，git 自己不清，于是这个镜像上后面每条 bug 都撞同一堵墙。**系统已经处理**：`checkout`/`draft` 会回收「0 字节 + 本机无 git 进程 + 静默超过 `LOCK_STALE_MINUTES`」的锁并返回 `lock.swept`；不满足条件（非 0 字节、太新、或有活的 git）就拒绝并告诉你该删哪个文件——那种情况才 `block`，并把 `lock.state`/size/age 抄进去。**不许**自己拼 `rm`，也不许为已被回收的锁写 block（§1.8） |
 | 某条被 AI 反复处理不满意 | 三种处置别混：「打回」→ `rejected`，**改动与草稿分支都不回滚**，AI 在同一分支上追加提交，最终一次推入 SVN；「拒绝并回滚」→ 删掉该草稿分支（提交先存进 `refs/rejected/<分支>` 可取回），这条直接置 `closed`，AI 不再重做；「重开补修」（限 `merged`/`closed`）→ 已入过库但仍不完全，回到 `rejected` 重新入队，`queue_kind=reopened` |
 | 已合入的条目发现修得不完全 | 弹窗点「重开补修（入队列）」。登记的 r 号与草稿分支都保留，**trunk 不回退**（回退 trunk 是主人自己的 svn 动作）；上一轮的结论、改动文件、r 号作为 `prior_fix` 随任务下发。AI 在原分支续做；推送时以「上一轮推入的那个草稿提交」为增量基准，只把新改动入库，trunk 上已有的文件自动跳过，全一致就拒（不许空修订） |
 | 这条根本不该修（复现不出来 / 不是缺陷 / 重复单 / 禅道那边已关闭） | 主人在 `/need` 或详情弹窗点「结案（不修了）」，选理由即可，不必写方案（`await_review` 有草稿要推时走「拒绝并回滚」）。对执行器而言这是**正常收口**，不是失败：条目变 `closed` 后不再进队列，阻塞项被标记已处理，别重试也别再 `block` 同一条（§3.3） |

@@ -81,6 +81,11 @@ class Settings:
     # queue skips them forever; claims older than this many minutes are handed
     # back. 0 disables the reclaim.
     stale_claim_minutes: int = field(default_factory=lambda: _env_int("STALE_CLAIM_MINUTES", 40))
+    # A run killed mid-write leaves a 0-byte .git/index.lock behind and nothing
+    # clears it, so every later bug on that mirror dies on the same wall. A writer
+    # (checkout / draft) sweeps such a lock once it has sat untouched this long and
+    # no git process is alive on the mirror host. 0 = never sweep, only report.
+    lock_stale_minutes: int = field(default_factory=lambda: _env_int("LOCK_STALE_MINUTES", 5))
     # Override when a Zentao build exposes comment endpoints on another path.
     zentao_comment_path: str = field(default_factory=lambda: _env_str("ZENTAO_COMMENT_PATH"))
     zentao_http_proxy: str = field(default_factory=lambda: _env_str("ZENTAO_HTTP_PROXY"))

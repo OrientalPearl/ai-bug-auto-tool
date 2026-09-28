@@ -161,7 +161,10 @@ python -m app.cli doctor                   # 禅道通道分步诊断
    另给 `worktree_clean` 与镜像当前停在哪个分支），ready=false 时不许开工，直接 `block` 写明「镜像未就绪」；
    `worktree_clean` 只数**真实改动**（`dirty_real` / `dirty_paths`），该库 §1.5 那常年几十行结构性噪音
    （`.trae/**`、`openvpn-2.4.8/INSTALL`、CRLF 与 `$Id$` 差异）算在 `dirty_noise` / `dirty_untracked` 里，
-   **不是 block 的理由，也不是开工的障碍**
+   **不是 block 的理由，也不是开工的障碍**；`lock.state` 是 `.git/index.lock` 的现状
+   （`absent`/`stale`/`hold`/`busy`/`odd`）——`stale` 表示是上一轮崩掉留下的 0 字节空锁，
+   `checkout`/`draft` 会自己回收（返回里带 `lock.swept`），**不需要也不许为它写 block**；
+   只有 `hold`/`busy`（非 0 字节、太新、或有活的 git 进程）才 block 并抄上 size/age
 5. 在镜像里为这条 bug 开/切本地分支：**`python -m app.cli checkout <禅道ID>`**（默认基线
    `refs/remotes/origin/trunk`；镜像未就绪、或工作区有**别人未提交的真实改动**时它会拒绝并列出文件，
    不替你 stash）；

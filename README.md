@@ -44,6 +44,7 @@ AI_BATCH_SIZE=5                            # 每批处理条数
 RETRY_WAIT=300                             # 限流/5xx/连不上时等这么久再重试（秒）
 RETRY_MAX=3                                # 总共试几次（读类请求；评论等写动作不重试）
 STALE_CLAIM_MINUTES=40                     # claim 后这么久没回音的 bug 自动回队列（0=关闭）
+LOCK_STALE_MINUTES=5                       # 0 字节且静默这么久、本机又无 git 进程的 index.lock 由 checkout/draft 自动回收（0=只报告不删）
 ```
 
 SVN。**默认方式下本系统不执行 svn**（提交动作由目标代码库自己的提交细则负责），这里填的仓库地址只用于：
@@ -287,12 +288,15 @@ python -m app.cli img-gate --check        # 重量已下载的截图：1x1 / 损
 python -m app.cli tasks --limit 5         # 取队列：已答复 > 已打回 > 待处理，再按 pri 升序 / severity 降序
 python -m app.cli status 1024             # 读全文 + 历史提交 + 主人答复 + 所属产品
 python -m app.cli mirror 1024             # 只读探测镜像上这条的草稿分支：tip / 领先几笔 / 改了哪些文件 / 就绪与占用
+                                     # 返回里的 lock.state = absent|stale|hold|busy|odd（只报告，mirror 从不删锁）
 python -m app.cli checkout 1024 [--base <基线>]  # 在镜像里建/切 bugfix/zentao-1024（默认基线 origin/trunk）
                                      # 镜像未就绪、或工作区有别人未提交的**真实**改动 → 拒绝且不改状态（不替你 stash）；
                                      # 该库那几十行常年结构性噪音（.trae/ 符号链接、CRLF、$Id$）不拦，另计入 dirty_noise
+                                     # 上一轮崩在写索引中途留下的陈锁（0 字节 + 本机无 git 进程 + 静默超 5 分钟）自动回收，返回 lock.swept
 python -m app.cli draft 1024 --message "fix #1024 <根因>" --files a.c,b.c
                                      # 在镜像的这条分支上落草稿提交：只 add 列出的文件，返回短哈希当 git:<哈希>
                                      # 说明不以 fix #<ID> 开头 / 清单为空 / 路径越界 / HEAD 不在这条分支 → 直接拒
+                                     # 陈锁同样先自动回收；不满足回收条件（非 0 字节 / 太新 / 有活 git）就拒绝并告诉你该删哪个文件
 python -m app.cli reconcile [1024] [--apply]
                                      # 对账：镜像上有草稿提交、库里没登记的（跑完没收口）；--apply 才认领成待审查
 python -m app.cli tmp-clean [--apply]

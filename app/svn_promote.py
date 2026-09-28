@@ -38,6 +38,43 @@ class PromoteError(RuntimeError):
     """A promotion that is refused before anything is written."""
 
 
+def lock_limit_minutes() -> int:
+    """How long a 0-byte index.lock must sit untouched before a writer sweeps it.
+
+    Kept well above the time git needs to rewrite this mirror's ~96 MB index: a
+    live writer is continuously streaming into the lock, so it never idles this
+    long. ``LOCK_STALE_MINUTES=0`` disables the automatic sweep entirely -- a
+    leftover then only gets reported and must be removed by hand.
+    """
+    try:
+        return max(0, int(get_settings().lock_stale_minutes))
+    except (TypeError, ValueError, AttributeError):
+        return 5
+
+
+def read_lock_marker(obj, tag: str, value: str) -> bool:
+    """Copy a ``lock`` / ``swept`` marker onto any of the three result dataclasses.
+
+    Kept in one place because mirror / checkout / draft all carry the same fields:
+    the numbers are the point, so an operator reading a block can tell a leftover
+    lock from a live one without logging into the build server.
+    """
+    if tag == "lock":
+        bits = (value.split("|") + ["0", "0", "0", "0"])[:4]
+        try:
+            obj.lock_state = bits[0] or "absent"
+            obj.lock_size = int(bits[1])
+            obj.lock_age = int(bits[2])
+            obj.lock_procs = int(bits[3])
+        except ValueError:
+            return False
+        return True
+    if tag == "swept":
+        obj.lock_swept = value.strip()
+        return True
+    return False
+
+
 @dataclass
 class RemoteTarget:
     """The SSH endpoint and paths of one mirrored code line."""
@@ -957,6 +994,11 @@ class DraftCommit:
     subject: str = ""
     staged: list[str] = field(default_factory=list)
     nothing: bool = False
+    lock_state: str = ""
+    lock_size: int = -1
+    lock_age: int = -1
+    lock_procs: int = 0
+    lock_swept: str = ""
     error: str = ""
     raw: str = ""
 
@@ -969,15 +1011,121 @@ class DraftCommit:
             return self.error
         if self.nothing:
             return "暂存区是空的：列出来的文件没有实际改动，什么都没提交"
-        return f"已在 {self.branch} 提交 {self.short_tip}（{len(self.staged)} 个文件）"
+        swept = f"（顺手回收了上一轮留下的 {self.lock_swept}）" if self.lock_swept else ""
+        return f"已在 {self.branch} 提交 {self.short_tip}（{len(self.staged)} 个文件）{swept}"
 
 
-_DRAFT_COMMIT_SCRIPT = r"""
+# ---------------------------------------------------------------------------
+# stale .git/index.lock
+# ---------------------------------------------------------------------------
+# git creates .git/index.lock, streams the new index into it, then renames it
+# over .git/index. A run killed in the middle leaves the lock behind and nothing
+# ever clears it, so every later bug on that mirror dies on the same wall.
+#
+# These runs do get killed on their own (the IDE is not stable, a model error
+# aborts the task), so waiting for a human to delete one lock per bug is not a
+# design -- it is an outage. A writer therefore sweeps a lock only when all
+# three conditions hold at once:
+#   1. it is exactly 0 bytes  -- a write in flight streams bytes into it, so an
+#      empty one was created and abandoned before any content went in;
+#   2. no git process at all on this host -- nothing can still own it;
+#   3. it has not been touched for LOCK_LIMIT minutes -- a real writer on a
+#      96 MB index is continuously busy, it never idles that long.
+# Anything else (non-zero size, a live process, a fresh lock) is reported and
+# left alone: the residual risk is a writer on another machine going through the
+# same share, which no check on this host can see. LOCK_LIMIT=0 (.env
+# LOCK_STALE_MINUTES=0) switches the sweep off and leaves only the report.
+_LOCK_GATE = r"""
+# Counts live git writers on this host. `pgrep -x` never matches its own shell
+# pipeline; the `ps -e -o comm=` fallback is safe the same way, because the
+# process doing the matching is called `grep`, not `git`. A full-command-line
+# grep would count itself and would need a self-exclusion filter that breaks
+# down on a host with hundreds of git children -- do not switch to one.
+git_procs() {
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -x git 2>/dev/null | grep -c . || true
+  else
+    ps -e -o comm= 2>/dev/null | grep -c '^git' || true
+  fi
+}
+
+# Fills LOCK_STATE (absent|stale|hold|busy|odd) / LOCK_SIZE / LOCK_AGE / LOCK_PROCS.
+# Order matters: process count comes first. `git status` -- the obvious way to ask
+# who holds the lock -- creates index.lock itself to refresh stat info, so probing
+# with git would manufacture the very lock we are looking for.
+assess_lock() {
+  LOCK_STATE=absent; LOCK_SIZE=-1; LOCK_AGE=-1; LOCK_PROCS=0
+  LOCK_PATH="$GD/index.lock"
+  if [ ! -f "$LOCK_PATH" ]; then
+    [ -e "$LOCK_PATH" ] && LOCK_STATE=odd
+    return 0
+  fi
+  LOCK_SIZE=$(wc -c < "$LOCK_PATH" 2>/dev/null | tr -d ' ')
+  LOCK_AGE=$(awk -v n="$(date +%s)" -v m="$(stat -c %Y "$LOCK_PATH" 2>/dev/null || echo 0)" \
+              'BEGIN{printf "%d", n-m}')
+  LOCK_PROCS=$(git_procs)
+  if [ "${LOCK_PROCS:-0}" -gt 0 ]; then
+    LOCK_STATE=busy
+  elif [ "$LOCK_SIZE" = 0 ] && [ "${LOCK_LIMIT:-5}" -gt 0 ] \
+       && [ "${LOCK_AGE:-0}" -ge $((LOCK_LIMIT * 60)) ]; then
+    LOCK_STATE=stale
+  else
+    LOCK_STATE=hold
+  fi
+  return 0
+}
+
+report_lock() {
+  P lock "$LOCK_STATE|$LOCK_SIZE|$LOCK_AGE|$LOCK_PROCS"
+  return 0
+}
+
+# One wording for every writer that had to leave a lock alone, so a blocker reads
+# the same in checkout and in draft and says what the owner can do about it.
+lock_refuse() {
+  case "$LOCK_STATE" in
+    busy) P err "本机还有 $LOCK_PROCS 个 git 进程活着，index.lock（$LOCK_SIZE 字节）不按残留处理：可能有会话正在写这个镜像，等它结束再试" ;;
+    hold) P err "index.lock 还在（$LOCK_SIZE 字节、$LOCK_AGE 秒前），但不满足自动回收条件（要 0 字节且静默 ${LOCK_LIMIT} 分钟）；确认没有别的机器在写这个镜像后 rm -f $LOCK_PATH 即可清掉" ;;
+    odd)  P err "index.lock 不是普通文件，形态异常，不自动删: $LOCK_PATH" ;;
+    *)    P err "index.lock 未通过陈旧判定，不自动删: $LOCK_PATH（$LOCK_STATE）" ;;
+  esac
+  return 0
+}
+
+git_dir_of() {
+  GD=$(git rev-parse --git-dir 2>/dev/null)
+  [ -n "$GD" ] || { P err "不是 git 仓库或 git 不可用: $PWD"; return 1; }
+  case "$GD" in
+    /*) : ;;
+    *) GD="$PWD/$GD" ;;
+  esac
+  return 0
+}
+
+# Writer scripts only: removes a provably ownerless leftover and re-reads the state.
+sweep_lock() {
+  assess_lock
+  if [ "$LOCK_STATE" = stale ]; then
+    if rm -f "$LOCK_PATH" 2>/dev/null; then
+      P swept "index.lock(0 字节、$LOCK_AGE 秒未变动、本机无 git 进程)"
+    else
+      P err "陈旧 index.lock 删不掉: $LOCK_PATH"
+      return 1
+    fi
+    assess_lock
+  fi
+  report_lock
+  [ "$LOCK_STATE" = stale ] || [ "$LOCK_STATE" = absent ] || return 1
+  return 0
+}
+"""
+
+_DRAFT_COMMIT_SCRIPT = _LOCK_GATE + r"""
 # Stage exactly the listed files and commit them on the bug's own draft branch.
 # Local git only: no push, no dcommit, no svn. POSIX sh, runs on the build server.
 export LC_ALL=C LANG=C
 set -f
-MIRROR=$1; BR=$2; MSG_B64=$3; FILES_B64=$4
+MIRROR=$1; BR=$2; MSG_B64=$3; FILES_B64=$4; LOCK_LIMIT=${5:-5}
 P() { printf 'PV|%s|%s\n' "$1" "$2"; }
 cd "$MIRROR" 2>/dev/null || { P err "镜像目录不存在: $MIRROR"; exit 1; }
 case "$BR" in
@@ -997,7 +1145,11 @@ MSGF=$(mktemp); printf '%s' "$MSG_B64" | base64 -d > "$MSGF" 2>/dev/null || { P 
 [ -s "$MSGF" ] || { P err "提交说明为空"; exit 1; }
 LISTF=$(mktemp); printf '%s' "$FILES_B64" | base64 -d > "$LISTF" 2>/dev/null || { P err "文件清单解码失败"; exit 1; }
 [ -s "$LISTF" ] || { P err "文件清单为空：draft 必须显式列出改了哪些文件"; exit 1; }
-while read F; do
+# `|| [ -n "$F" ]` is not decoration: read returns non-zero on a final line with no
+# trailing newline and skips the loop body, so a path list joined by "\n" would lose
+# its LAST file silently -- the commit would go through with one file fewer than the
+# executor asked for. The caller also appends a newline now; keep both halves fixed.
+while read F || [ -n "$F" ]; do
   [ -n "$F" ] || continue
   case "$F" in
     /*)          P err "文件必须是镜像内的相对路径: $F"; exit 1 ;;
@@ -1007,8 +1159,10 @@ while read F; do
 done < "$LISTF"
 P before "$(git rev-parse "refs/heads/$BR")"
 set --
-while read F; do [ -n "$F" ] && set -- "$@" "$F"; done < "$LISTF"
+while read F || [ -n "$F" ]; do [ -n "$F" ] && set -- "$@" "$F"; done < "$LISTF"
 [ $# -gt 0 ] || { P err "文件清单为空"; exit 1; }
+git_dir_of || exit 1
+sweep_lock || { lock_refuse; exit 1; }
 git add -A -- "$@" 2>/dev/null || git add -- "$@" || { P err "git add 失败：$*"; exit 1; }
 if git diff --cached --quiet; then
   P nothing "no staged change"
@@ -1052,7 +1206,10 @@ def draft_commit(bug: dict, message: str, files: list[str]) -> DraftCommit:
     args = [
         target.mirror, branch,
         base64.b64encode(text.encode("utf-8")).decode("ascii"),
-        base64.b64encode("\n".join(paths).encode("utf-8")).decode("ascii"),
+        # Trailing newline included: the remote loop reads lines, and a list whose
+        # last path has no newline would drop that path from the commit.
+        base64.b64encode(("\n".join(paths) + "\n").encode("utf-8")).decode("ascii"),
+        str(lock_limit_minutes()),
     ]
     quoted = " ".join("'" + str(a).replace("'", "'\\''") + "'" for a in args)
     proc = subprocess.run(
@@ -1085,6 +1242,8 @@ def draft_commit(bug: dict, message: str, files: list[str]) -> DraftCommit:
             out.ok = True
         elif tag == "done":
             out.ok = True
+        elif read_lock_marker(out, tag, value):
+            pass
         elif tag == "err":
             out.error = value
     if not out.ok and not out.error and proc.returncode != 0 and err.strip():
@@ -1122,6 +1281,10 @@ class DraftState:
     dirty_noise: int = 0
     dirty_untracked: int = 0
     dirty_paths: str = ""
+    lock_state: str = ""
+    lock_size: int = -1
+    lock_age: int = -1
+    lock_procs: int = 0
     error: str = ""
     raw: str = ""
 
@@ -1222,13 +1385,14 @@ report_dirt() {
 }
 """
 
-_DRAFT_SCRIPT = _DIRTY_GATE + r"""
+_DRAFT_SCRIPT = _DIRTY_GATE + _LOCK_GATE + r"""
 # Report one draft branch read-only: tip, commits, touched files, and how far it
 # sits ahead of trunk. POSIX sh, runs on the build server. Nothing here writes:
-# no fetch, no checkout, no ref updates.
+# no fetch, no checkout, no ref updates, and a leftover index.lock is only
+# reported -- clearing it is a writer's decision, made in checkout / draft.
 export LC_ALL=C LANG=C
 set -f
-MIRROR=$1; BR=$2; BASE_REF=$3
+MIRROR=$1; BR=$2; BASE_REF=$3; LOCK_LIMIT=${4:-5}
 P() { printf 'PV|%s|%s\n' "$1" "$2"; }
 cd "$MIRROR" 2>/dev/null || { P err "镜像目录不存在: $MIRROR"; exit 0; }
 case "$BR" in
@@ -1241,6 +1405,9 @@ if git ls-files --error-unmatch AGENTS.md >/dev/null 2>&1; then P index ok; else
 assess_dirt
 if [ "$REAL" = 0 ]; then P clean ok; else P clean dirty; fi
 report_dirt
+git_dir_of || exit 0
+assess_lock
+report_lock
 if ! git rev-parse --verify "refs/heads/$BR" >/dev/null 2>&1; then
   P absent "$BR"
   exit 0
@@ -1289,7 +1456,7 @@ def draft_state(bug: dict, base_ref: str = "") -> DraftState:
 
     mirror_dir = svn_client.resolve_target(bug=bug).working_copy
     target = remote_target(mirror_dir)
-    args = [target.mirror, branch, base_ref or promoted_commit(bug)]
+    args = [target.mirror, branch, base_ref or promoted_commit(bug), str(lock_limit_minutes())]
     quoted = " ".join("'" + str(a).replace("'", "'\\''") + "'" for a in args)
     proc = subprocess.run(
         target.ssh_command(f"sh -s {quoted}"),
@@ -1345,6 +1512,8 @@ def draft_state(bug: dict, base_ref: str = "") -> DraftState:
             out.dirty_untracked = int(bits[2] or 0)
         elif tag == "dirt_paths":
             out.dirty_paths = value.strip()
+        elif read_lock_marker(out, tag, value):
+            pass
         elif tag == "err":
             out.error = value
 
@@ -1371,6 +1540,11 @@ class Checkout:
     dirty_noise: int = 0
     dirty_untracked: int = 0
     dirty_paths: str = ""
+    lock_state: str = ""
+    lock_size: int = -1
+    lock_age: int = -1
+    lock_procs: int = 0
+    lock_swept: str = ""
     error: str = ""
     raw: str = ""
 
@@ -1379,15 +1553,17 @@ class Checkout:
             return self.error
         words = {"created": "已从", "switched": "已切到", "already": "本来就停在"}
         swept = ""
+        if self.lock_swept:
+            swept += f"（回收了上一轮留下的 {self.lock_swept}）"
         if self.dirty_noise or self.dirty_untracked:
-            swept = (f"（已忽略本镜像的结构性噪音：{self.dirty_noise} 条 .trae/INSTALL 类 + "
-                     f"{self.dirty_untracked} 条未跟踪）")
+            swept += (f"（已忽略本镜像的结构性噪音：{self.dirty_noise} 条 .trae/INSTALL/CRLF/"
+                      f"$Id$ 类 + {self.dirty_untracked} 条未跟踪）")
         if self.action == "created":
             return f"已创建并切到 {self.branch}（基线 {self.base}），当前 {self.tip}{swept}"
         return f"{words.get(self.action, '已切到')} {self.branch}，当前 {self.tip}{swept}"
 
 
-_CHECKOUT_SCRIPT = _DIRTY_GATE + r"""
+_CHECKOUT_SCRIPT = _DIRTY_GATE + _LOCK_GATE + r"""
 # Put the mirror onto one bug's draft branch, creating it from trunk when needed.
 # Refuses to move a working tree that holds somebody's real edit -- that edit may
 # belong to another session. The mirror's permanent noise is counted, not refused
@@ -1395,7 +1571,7 @@ _CHECKOUT_SCRIPT = _DIRTY_GATE + r"""
 # POSIX sh, runs on the build server. Local git only -- no fetch, no push, no svn.
 export LC_ALL=C LANG=C
 set -f
-MIRROR=$1; BR=$2; BASE=$3
+MIRROR=$1; BR=$2; BASE=$3; LOCK_LIMIT=${4:-5}
 P() { printf 'PV|%s|%s\n' "$1" "$2"; }
 cd "$MIRROR" 2>/dev/null || { P err "镜像目录不存在: $MIRROR"; exit 1; }
 case "$BR" in
@@ -1408,12 +1584,20 @@ fi
 if ! git ls-files --error-unmatch AGENTS.md >/dev/null 2>&1; then
   P err "镜像索引没落盘（ls-files 找不到 AGENTS.md，未就绪），不在这上面开工"; exit 1
 fi
+git_dir_of || exit 1
+assess_lock
+report_lock
 CUR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
 if [ "$CUR" = "$BR" ]; then
   P action already
   P tip "$(git rev-parse --short=10 HEAD)"
   P done ok
   exit 0
+fi
+# Clear a provably dead leftover before measuring dirt: while the lock sits there
+# git cannot refresh the index, so a status taken first reads misleadingly.
+if [ "$LOCK_STATE" != absent ]; then
+  sweep_lock || { lock_refuse; exit 1; }
 fi
 assess_dirt
 report_dirt
@@ -1455,7 +1639,7 @@ def checkout_draft(bug: dict, base: str = "") -> Checkout:
 
     mirror_dir = svn_client.resolve_target(bug=bug).working_copy
     target = remote_target(mirror_dir)
-    args = [target.mirror, branch, base or ""]
+    args = [target.mirror, branch, base or "", str(lock_limit_minutes())]
     quoted = " ".join("'" + str(a).replace("'", "'\\''") + "'" for a in args)
     proc = subprocess.run(
         target.ssh_command(f"sh -s {quoted}"),
@@ -1487,6 +1671,8 @@ def checkout_draft(bug: dict, base: str = "") -> Checkout:
             out.dirty_untracked = int(bits[2] or 0)
         elif tag == "dirt_paths":
             out.dirty_paths = value.strip()
+        elif read_lock_marker(out, tag, value):
+            pass
         elif tag == "done":
             out.ok = True
         elif tag == "err":
