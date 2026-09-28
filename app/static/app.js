@@ -57,6 +57,15 @@
     return /^\d+$/.test(text) ? "r" + text : text;
   }
 
+  // AUTO_LOOP.md G8 shape for the real svn log message; the owner edits it before
+  // pushing, so it is only a starting point that already carries the bug number.
+  function pushMessage(b) {
+    const a = b.analysis || {};
+    const one = String(a.conclusion || b.fix_summary || b.title || "")
+      .split("\n")[0].trim();
+    return `fix #${b.zentao_id} ${one}`.slice(0, 200).trim();
+  }
+
   function renderBug(b) {
     const revs = (b.revisions || []).map(r =>
       `<li><b>${esc(revLabel(r.revision))}</b> · ${esc(r.created_at)} · ${esc(r.branch || b.branch || "")}<br>${esc(r.message)}</li>`
@@ -129,6 +138,21 @@
     html += `<h4>需方案记录</h4>` + (needs ? `<ul class="tight">${needs}</ul>` : `<p class="muted">无</p>`);
     html += `<h4>审查记录</h4>` + (reviews ? `<ul class="tight">${reviews}</ul>` : `<p class="muted">无</p>`);
 
+    if (b.status === "await_review") {
+      html += `
+        <h4>推入 SVN（正式进库，只有主人能做）</h4>
+        <form method="post" action="/bug/${esc(b.id)}/svn-push" data-json="1">
+          <textarea name="message" rows="3" style="width:100%">${esc(pushMessage(b))}</textarea>
+          <div class="row-actions">
+            <button class="btn" type="submit" name="mode" value="dry"
+              data-ask="预检：核对镜像、草稿基线，并逐个比对 trunk 上这些文件是否已被别人改动。不写入任何东西。">预检（不写入）</button>
+            <button class="btn btn-pass" type="submit" name="mode" value="push"
+              data-ask="确认正式推入 SVN？上方文字会原样作为 svn ci 的提交说明进入 trunk；成功即记为已合入，失败会写异常备注并打回给 AI 继续修。">正式推入 SVN</button>
+            <span class="hint">分支 <code>${esc(b.branch || "-")}</code> 的草稿将按文件落到稀疏工作副本再提交；trunk 已被他人改动的文件不会被覆盖。</span>
+          </div>
+        </form>`;
+    }
+
     if (b.status === "merged") {
       html += `
         <form method="post" action="/bug/${b.id}/close" class="row-actions">
@@ -185,7 +209,7 @@
     location.hash = hash;
   }
 
-  function loadBug(bugId, note) {
+  function loadBug(bugId, note, bad) {
     currentBug = bugId;
     mount("Bug 详情");
     dialogBody.innerHTML = '<p class="muted">加载中…</p>';
@@ -194,7 +218,8 @@
       .then(function (data) {
         if (currentBug !== bugId) return;
         const title = `禅道 #${data.zentao_id || "-"} · ${data.title || "(无标题)"}`;
-        const tip = note ? `<p class="hint" style="color:#188038">${esc(note)}</p>` : "";
+        const color = bad ? "#b3261e" : "#188038";
+        const tip = note ? `<p class="hint" style="color:${color};white-space:pre-wrap">${esc(note)}</p>` : "";
         mount(title);
         dialogBody.innerHTML = `<div class="bugdoc">${tip}${renderBug(data)}</div>`;
       })
@@ -332,9 +357,28 @@
   // forms: destructive / comment-writing actions ask first; forms inside the
   // dialog are posted without a page reload so the dialog stays open.
   // ------------------------------------------------------------------
+  // Which submit button was pressed decides both the warning text and whether
+  // the answer is rendered inside the dialog (SVN push) or as a page reload.
+  let lastSubmitter = null;
+  document.addEventListener("click", function (event) {
+    const btn = event.target && event.target.closest
+      ? event.target.closest("button[type=submit], input[type=submit]")
+      : null;
+    lastSubmitter = btn;
+  }, true);
+
+  function noteOf(data) {
+    const summary = String(data.summary || "");
+    const detail = String(data.detail || "");
+    const text = detail && detail !== summary ? `${summary}\n${detail}` : summary;
+    return text.slice(0, 900);
+  }
+
   document.addEventListener("submit", function (event) {
     const form = event.target;
-    const tip = form.dataset.confirm;
+    const pressed = event.submitter || lastSubmitter;
+    const tip = (pressed && pressed.dataset && pressed.dataset.ask) || form.dataset.confirm;
+    lastSubmitter = null;
     if (tip && !window.confirm(tip)) {
       event.preventDefault();
       return;
@@ -342,26 +386,35 @@
     if (!form.closest(".dialog-body")) return;
     event.preventDefault();
     const bugId = currentBug;
+    const json = form.dataset.json === "1";
     mount("处理中…");
-    dialogBody.innerHTML = '<p class="muted">正在执行，请稍候…</p>';
-    fetch(form.action, { method: "post", body: new FormData(form) })
+    dialogBody.innerHTML = json
+      ? '<p class="muted">正在核对镜像与 SVN trunk 并按需提交，请稍候（可能要几十秒）…</p>'
+      : '<p class="muted">正在执行，请稍候…</p>';
+    const headers = json ? { "X-Requested-With": "fetch-dialog" } : {};
+    fetch(form.action, { method: "post", body: new FormData(form), headers: headers })
       .then(function (resp) {
+        if (json) {
+          return resp.json().then(function (data) {
+            if (bugId) loadBug(bugId, noteOf(data || {}), !data || !data.ok);
+          });
+        }
         if (form.dataset.reload) {
           // Follow the server's own target: the bind route points back at the
           // dialog only when the save was rejected.
           location.href = resp.url || location.pathname;
-          return;
+          return undefined;
         }
         if (bugId) {
           loadBug(bugId, "操作已提交，上方内容已刷新。");
-          return;
+          return undefined;
         }
         location.reload();
+        return undefined;
       })
       .catch(function (err) {
-        if (bugId) loadBug(bugId, "");
+        if (bugId) loadBug(bugId, `请求失败：${err.message}`, true);
         else location.reload();
-        window.alert(`提交失败：${err.message}`);
       });
   });
 

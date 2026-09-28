@@ -293,6 +293,10 @@ python -m app.cli block <禅道ID> --question "..." --options "..." --advice "..
     `git -c core.ignorecase=false status --porcelain -- <文件>` + `diff --ignore-cr-at-eol -- <文件>` 取证；
     差异只剩 CRLF / `$Id$` / 大小写对偶 / `.trae/**` → 按 §「落码位置」的结构性噪音照常做；
     是别人写的真实改动 → 不覆盖、不 `stash`、不 `revert`、不 `checkout` 复原，`block` 写明摘要
+28. **禁止执行器碰「推 SVN」通道**：`/bug/<id>/svn-push`（`app/svn_promote.py`）是主人点审查弹窗
+    才走的正式进库动作，它会把草稿真实 `svn ci` 进 trunk。执行器既不许调用该接口，也不许自己
+    复刻它的命令序列（那等于违反 11/26 里的 G11）；你只负责把草稿提交成 `git:<哈希>` 并登记，
+    推不推、用什么提交说明，是主人的决定
 
 ## 停止条件
 

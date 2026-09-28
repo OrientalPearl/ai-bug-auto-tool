@@ -10,7 +10,7 @@ from typing import Any
 from flask import (Flask, abort, flash, jsonify, redirect, render_template,
                    request, send_from_directory, url_for)
 
-from . import db, svn_client, sync
+from . import db, svn_client, svn_promote, sync
 from .config import PROJECT_ROOT, get_settings, reload_settings
 from .zentao_client import ZentaoError
 from .zentao_session import make_client
@@ -238,6 +238,88 @@ def create_app() -> Flask:
         sync.push_comment(bug["zentao_id"], f"人工审查打回，原因：{reason}")
         flash(f"bug #{bug['zentao_id']} 已打回，AI 下次运行会重新处理。", "ok")
         return redirect(url_for("review_page"))
+
+    @app.route("/bug/<int:bug_id>/svn-push", methods=["POST"])
+    def bug_svn_push(bug_id: int):
+        """The owner's promotion click: turn this bug's draft into a real SVN revision.
+
+        AUTO_LOOP.md G11 reserves every remote write for the owner, and this route
+        is the only place the system performs one -- because a human asked for it
+        and typed the log message itself. ``mode=dry`` runs the identical checks
+        (mirror, base, trunk drift, pending list) without writing anywhere.
+        """
+        bug = db.get_bug(bug_id)
+        if bug is None:
+            abort(404)
+        payload = _form()
+        message = str(payload.get("message") or "").strip()
+        dry = str(payload.get("mode") or "push") == "dry"
+        inline = request.headers.get("X-Requested-With") == "fetch-dialog"
+
+        def reply(data: dict[str, Any], level: str, text: str):
+            """JSON for the dialog (it must stay open), flash+redirect otherwise."""
+            if inline:
+                return jsonify(data)
+            flash(text, level)
+            return redirect(url_for("review_page"))
+
+        if bug["status"] != "await_review" and not dry:
+            text = (f"bug #{bug['zentao_id']} 当前状态是"
+                    f"「{STATUS_LABELS.get(bug['status'], bug['status'])}」，不是待审查，未推送。")
+            return reply({"ok": False, "summary": text, "detail": text}, "error", text)
+
+        try:
+            prom = svn_promote.promote(bug, message, dry_run=dry)
+        except svn_promote.PromoteError as exc:
+            text = f"bug #{bug['zentao_id']} 推送被拒绝：{exc}"
+            return reply({"ok": False, "summary": text, "detail": text}, "error", text)
+
+        files = [item.split("|", 1)[1] for item in prom.want if "|" in item]
+        if dry:
+            clean = bool(prom.ready) and not prom.conflicts
+            text = prom.detail()
+            return reply({
+                "ok": clean, "dry_run": True, "summary": prom.summary(), "detail": text,
+                "conflicts": prom.conflicts, "files": files, "url": prom.url,
+                "commit": prom.commit, "base": prom.base, "wc": prom.wc,
+            }, "ok" if clean else "error", text)
+
+        if prom.ok:
+            db.add_revision(bug["id"], prom.revision, branch=bug.get("branch") or "",
+                            message=message,
+                            author=get_settings().svn_username or "owner", files=files)
+            db.record_review(bug["id"], "pass", merged_revision=prom.revision)
+            note = (f"已由主人从审查页正式推入 SVN：{prom.url} r{prom.revision}"
+                    f"（{len(files)} 个文件）。提交说明：{message}")
+            result = sync.push_comment(bug["zentao_id"], note)
+            text = (f"bug #{bug['zentao_id']} 已推入 SVN r{prom.revision}，"
+                    f"状态改为已合入。"
+                    + ("" if result["ok"] else f" 禅道评论未写入：{result['detail'][:120]}"))
+            return reply({"ok": True, "summary": text, "detail": prom.detail(),
+                          "revision": prom.revision, "status": "merged",
+                          "files": files}, "ok", text)
+
+        # Nothing landed: record the failure as an explicit note and hand the bug
+        # back so the next AI round keeps fixing it instead of waiting for a human.
+        reason = prom.detail()
+        db.add_analysis(
+            bug["id"],
+            {
+                "conclusion": "推入 SVN 未成功，改动仍只在镜像草稿里",
+                "symptom": f"点击「推 SVN」失败：{prom.error or '未知原因'}",
+                "evidence": (prom.raw or "")[-1200:],
+                "impact": "trunk 未被改动（远端写入未发生或已回退）",
+                "verify": "推送清单：" + ("、".join(files) if files else "无"),
+                "unverified": "失败原因需要下一轮核实（见 evidence 原始输出）",
+                "rollback": "无远端写入，无需回退",
+            },
+            kind="manual", author="owner",
+        )
+        db.record_review(bug["id"], "reject", reject_reason=reason[:500])
+        sync.push_comment(bug["zentao_id"], f"人工推入 SVN 未成功，已打回继续修复：{reason[:300]}")
+        text = f"bug #{bug['zentao_id']} 推送失败，已记录异常并打回给 AI 继续修复。"
+        return reply({"ok": False, "summary": text, "detail": reason,
+                      "conflicts": prom.conflicts, "status": "rejected"}, "error", text)
 
     @app.route("/bug/<int:bug_id>/close", methods=["POST"])
     def bug_close(bug_id: int):
@@ -709,6 +791,10 @@ def _dispatch_checklist(queues: list[dict[str, Any]]) -> list[dict[str, str]]:
     add("info", "「本地文件比仓库新，是否比较」由执行器自己判定（§3.4 第三步）："
                 "只剩 CRLF / $Id$ / 大小写对偶 / .trae 就当噪音照常做；"
                 "是别人写的真实改动就不覆盖不 revert，block 写明摘要。")
+    add("info", "草稿进正式库这一步现在有主人的按钮：审查详情弹窗「预检 / 正式推入 SVN」"
+                "（app/svn_promote.py，SSH 侧稀疏工作副本 + svn ci 进 trunk，成功自动登记真实 r 号并置 merged，"
+                "失败写异常备注并打回给你继续修）。你只登记 git:<哈希>，"
+                "不许调用 /bug/<id>/svn-push，也不许自己复刻那串 svn ci —— 那还是违反 G11。")
     return items
 
 

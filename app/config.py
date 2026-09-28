@@ -118,6 +118,10 @@ class Settings:
     svn_allow_trunk_write: bool = field(
         default_factory=lambda: _env_bool("SVN_ALLOW_TRUNK_WRITE", False)
     )
+    # Remote directory that holds the sparse SVN checkouts used by the owner-side
+    # "推 SVN" action (AUTO_LOOP.md G11's only exception). Empty means: derive it
+    # beside ssh.remote_workspace of that mirror, as <project>/svn_promote.
+    svn_promote_root: str = field(default_factory=lambda: _env_str("SVN_PROMOTE_ROOT"))
 
     # --- i18n direct-commit channel (AUTO_LOOP.md G12) ---
     # Translation files held in a local draft branch always end up in conflicts,

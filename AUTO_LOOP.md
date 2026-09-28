@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | 任务管理 | **本系统（AI-BUG）** | 拉禅道、抓截图/备注/附件、排队与优先级、占任务、状态流转、登记改动与修订号、审查流、回写禅道评论 |
 | 提交资格与提交动作 | **代码库自己的知识体系**（目标仓库工作区的 `CLAUDE.md` 及其 `registry/playbooks/skills`） | 什么情况下允许提交、怎么走 SSH、要不要征求同意、`svn ci` 怎么执行、真实修订号从哪来 |
-| 远端写入（进正式库） | **只有主人** | `git svn dcommit` / `git push` / `svn ci` / merge 到 trunk —— 执行器一律不碰，见 §1.5 与闸门 G11 |
+| 远端写入（进正式库） | **只有主人** | `git svn dcommit` / `git push` / `svn ci` / merge 到 trunk —— 执行器一律不碰，见 §1.5 与闸门 G11；主人侧点审查弹窗的「正式推入 SVN」（§3.3） |
 
 本系统**不做提交决策、默认也不执行 svn**。它只把一份「提交闸门」清单交给执行器；
 执行器在代码库侧按自己的细则完成**本地**提交（`git commit`），回到本系统只做一件事：
@@ -229,7 +229,7 @@ git --git-dir=<镜像名>/.git fsck   # dangling blob 是镜像的正常现象�
 | G8 | commit message = `fix #<禅道ID> <一句话根因>`，不含账号密码等敏感串 | `commit --message` 拼接规则 |
 | G9 | 未验证的路径必须标「未验证」，不得按「已完成 / 可直接合入」收口 | 登记内容进 `fix_summary` / `verify_steps` 供你审查 |
 | G10 | 提交所需的授权已按代码库规程取得（如 SSH 写操作需显式同意） | 无（属代码库规则；本系统只要求拿到真实修订号再登记） |
-| G11 | **远端写入留给主人**：执行器只做本地动作（`git commit` / 改工作副本不 `ci`），绝不 `git svn dcommit`、`git push`、`svn ci`、merge 到 trunk。**唯一例外是 G12 的多语言通道**，其余任何文件都不适用 | 无（本系统不检测，靠禁止事项 + 登记形态 `git:<哈希>` 让审查页一眼可辨） |
+| G11 | **远端写入留给主人**：执行器只做本地动作（`git commit` / 改工作副本不 `ci`），绝不 `git svn dcommit`、`git push`、`svn ci`、merge 到 trunk。主人那一侧走审查详情弹窗的「正式推入 SVN」（§3.3，`app/svn_promote.py`），执行器不许调用该接口。**唯一例外是 G12 的多语言通道**，其余任何文件都不适用 | 无（本系统不检测，靠禁止事项 + 登记形态 `git:<哈希>` 让审查页一眼可辨） |
 | G12 | **多语言词条走独立快车道**：词条文件不与代码一起提交，改前先 up、改完立即单独 `svn ci` 进正式库（详见 §2.1） | `i18n-up` / `i18n-commit` 两条命令；`repos` 的 `svn_working_copy`（正式 SVN 工作副本）没配就无法执行 |
 
 > G5 / G6 / G10 这三类是**代码库自己的细则**，本系统不复制也不解释它们，只在闸门清单里点名要求 ——
@@ -430,8 +430,20 @@ python -m app.cli status <禅道ID>       # 输出里的 analysis 就是 AI 写�
 ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git -c core.ignorecase=false show <短哈希>"
 ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git -c core.ignorecase=false diff --ignore-cr-at-eol refs/remotes/origin/trunk..<分支名>"
 
-# 3) 你判定可以进正式库，就自己做回灌（这一步执行器绝不代做），拿到真实 r 号后回填：
-git svn dcommit          # 在有 git-svn 的那一侧执行；或出 patch 打到正式工作副本再 svn ci
+# 3) 你判定可以进正式库：在审查页打开这条的详情弹窗，写提交说明后点「正式推入 SVN」
+#    （先点「预检（不写入）」看一眼清单与 trunk 漂移更稳）。这一步执行器绝不代做。
+#    它做的事全在 SSH 侧：读镜像里的草稿对象 -> 落到 <项目>/svn_promote/<镜像名> 这个
+#    --depth empty 稀疏工作副本 -> 按文件 svn ci 进 trunk，真实 r 号自动回填并记为已合入。
+#    两台编译服务器都没有 git-svn（实测 `git: 'svn' is not a git command`），所以 dcommit 不是选项。
+python -m app.cli status <禅道ID>       # 推完再看一眼：r<号> 与 git:<哈希> 会同时挂在这条名下
+```
+
+想手工做也可以，顺序与按钮一致（`--non-interactive` 保证不会弹密码）：
+
+```
+ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git diff --name-status <基线>..<提交>"
+ssh <SSH用户>@<SSH主机> "cd <稀疏副本> && svn update <文件> && ..."   # 逐个落内容
+ssh <SSH用户>@<SSH主机> "cd <稀疏副本> && svn ci --non-interactive -m 'fix #<禅道ID> <一句话根因>' <文件...>"
 python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.c --no-svn --revision r<真实号>
 ```
 
