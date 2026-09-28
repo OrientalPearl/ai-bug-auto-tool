@@ -191,7 +191,8 @@ python -m app.cli branch 51452 --dry-run
         # images 才是能看的图；images_skipped 是 1x1 之类的占位图，模型喂了会 400，跳过即可（不算没看图）
    python -m app.cli claim  <禅道ID>     # 占住任务，避免被别的子任务重复领
    python -m app.cli mirror <禅道ID>     # 只读看镜像：草稿分支在不在、领先几笔、就绪与占用情况
-   python -m app.cli checkout <禅道ID>   # 在镜像里建/切这条的 bugfix 分支（脏工作区会拒绝，不替你 stash）
+   python -m app.cli checkout <禅道ID>   # 在镜像里建/切这条的 bugfix 分支（只有别人未提交的真实改动才拒绝；
+                                         # 该库常年那几十行结构性噪音不拦，见 mirror 的 dirty_real/dirty_noise）
    ... 在该库自己的知识体系下定位并改代码、跑该库的编译/测试 ...
    ... 改了词条就单独走 G12：i18n-up <禅道ID> --files a.po（先 up）→ 改 → i18n-commit <禅道ID> --files a.po（立即单独提交，拿 r<号>） ...
    ... 逐条核对 AUTO_LOOP.md 的提交闸门 G1–G12 ...
@@ -287,7 +288,8 @@ python -m app.cli tasks --limit 5         # 取队列：已答复 > 已打回 > 
 python -m app.cli status 1024             # 读全文 + 历史提交 + 主人答复 + 所属产品
 python -m app.cli mirror 1024             # 只读探测镜像上这条的草稿分支：tip / 领先几笔 / 改了哪些文件 / 就绪与占用
 python -m app.cli checkout 1024 [--base <基线>]  # 在镜像里建/切 bugfix/zentao-1024（默认基线 origin/trunk）
-                                     # 镜像未就绪、或工作区有别人未提交的改动 → 拒绝且不改状态（不替你 stash）
+                                     # 镜像未就绪、或工作区有别人未提交的**真实**改动 → 拒绝且不改状态（不替你 stash）；
+                                     # 该库那几十行常年结构性噪音（.trae/ 符号链接、CRLF、$Id$）不拦，另计入 dirty_noise
 python -m app.cli draft 1024 --message "fix #1024 <根因>" --files a.c,b.c
                                      # 在镜像的这条分支上落草稿提交：只 add 列出的文件，返回短哈希当 git:<哈希>
                                      # 说明不以 fix #<ID> 开头 / 清单为空 / 路径越界 / HEAD 不在这条分支 → 直接拒

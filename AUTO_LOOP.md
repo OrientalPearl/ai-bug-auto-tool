@@ -230,14 +230,25 @@ git --git-dir=<镜像名>/.git fsck   # dangling blob 是镜像的正常现象�
 
 | 命令 | 做什么 | 护栏 |
 | --- | --- | --- |
-| `mirror <ID>` | 只读探测：草稿分支在不在、tip、领先几笔、改了哪些文件、镜像当前停在哪个分支、工作区脏不脏、就绪三判据（`mirror_ready`） | 纯只读，不 fetch 不 checkout |
-| `checkout <ID> [--base …]` | 建/切这条 bug 的 `bugfix/zentao-<ID>`，默认基线 `refs/remotes/origin/trunk`，成功即置 `fixing` 并写回 branch | 镜像缺 trunk ref 或索引没落盘 → 拒绝；工作区有未提交改动 → 拒绝（不 stash 不切走，那是别人的会话） |
+| `mirror <ID>` | 只读探测：草稿分支在不在、tip、领先几笔、改了哪些文件、镜像当前停在哪个分支、工作区**真实**脏不脏（`worktree_clean` + `dirty_real`/`dirty_noise`/`dirty_untracked` + `dirty_paths`）、就绪三判据（`mirror_ready`） | 纯只读，不 fetch 不 checkout |
+| `checkout <ID> [--base …]` | 建/切这条 bug 的 `bugfix/zentao-<ID>`，默认基线 `refs/remotes/origin/trunk`，成功即置 `fixing` 并写回 branch | 镜像缺 trunk ref 或索引没落盘 → 拒绝；工作区有**别人的真实未提交改动** → 拒绝并列出文件（不 stash 不切走，那是别人的会话）。本镜像的结构性噪音**不拦**（见下） |
 | `draft <ID> --message "fix #<ID> …" --files a,b` | 只 `git add` 列出的文件并提交，返回短哈希 | 说明必须以 `fix #<禅道ID>` 开头（G8）；`--files` 必填、必须是镜像内相对路径、不许 `..`/绝对路径/`.git`；分支不存在就报错让你先 `checkout`；HEAD 不在这条分支上就拒绝；暂存为空 → 不造空提交 |
 | `reconcile [ID] [--apply]` | 对账：镜像上有草稿提交、库里却没登记（执行器跑完没收口 / 崩在收口前） | 默认只报告；`--apply` 才登记 `git:<哈希>` 并转 `await_review`，分析里写明「结论来自 git 提交信息，未验证」 |
 | `tmp-clean [--apply]` | 回收跑完留在项目根的交接文件（`a_<ID>.json`、`blk_<ID>.json`、`py_<ID>.py`、`_tmp_*.py`） | 只认上面这几种命名；分析**没**入库的 `a_<ID>.json` 一律留着只报告；默认 dry-run，`--apply` 才删；`.env`、库文件、源码都不在候选里 |
 
 `draft` 之后仍然要 `commit --no-svn --revision git:<哈希> --analysis-file a.json` 收口——
 它只替你落 git 提交，不替你写分析、不替你过闸门。三条通道（推 SVN / 拒绝并回滚 / 重开）照旧是主人的。
+
+「工作区脏不脏」判的是**有没有人的真实改动**，不是 `git status` 有没有输出。§1.5 记着这两个
+镜像常年带着 92 行结构性噪音（`.trae/**` 是指向知识根的符号链接 → 整棵读成 ` D`、它自己的文件读成 `??`；
+`openvpn-2.4.8/INSTALL` 仓库里是文件、盘上是目录；`php`/`openvpn`/`products` 三棵第三方树的 CRLF 与
+`$Id$` 关键字差异）。若按「有输出即脏」拦，`checkout` 对本镜像上任何一条 bug 都必然失败，而 `draft`
+又要求 HEAD 已在该分支 —— 整条链路从第一步就死。所以判据是：未跟踪不算、上面列的噪音路径不算、
+`M` 要先过 `--ignore-cr-at-eol` 并剔掉 `$Id$` 行后**还剩内容差异**才算；已 `git add` 的暂存改动、
+真实删除、类型变化一律算真实改动。返回里的 `dirty_real` / `dirty_noise` / `dirty_untracked` 三个数
+加起来等于你自己在 SSH 侧数出来的 `git status --porcelain` 行数，`dirty_paths` 给出前 5 个真实改动的文件。
+执行器**不许**因为噪音就 `block`，也不许绕过这条判据自己拼 `ssh … git checkout`：真撞上有人的真实改动，
+按 §3.4 三处理（不动它、block 写清是哪个文件）。
 
 **还有一条最容易踩的：执行器不许自己去删文件。** 现场核对下来，无人值守弹授权的动作
 绝大多数是「清理用完的 `a_<ID>.json`」这类删除，而删除要人点确认，一点确认整轮就冻在原地。
@@ -396,6 +407,8 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
    看 `mirror_ready`（= trunk ref + HEAD + 索引里有 AGENTS.md 三条判据）与 `worktree_clean`
    → ready=false = clone 没跑完或最后检出没落盘 → 直接跳到第 7 步 block，
    原因写「镜像未就绪（缺 ref / 缺 index）」，不许自己重跑 clone/fetch/read-tree 去补
+   → `worktree_clean=false` 只看 `dirty_real`（那几条才是人的改动，`dirty_paths` 列了文件名）；
+     `dirty_noise` / `dirty_untracked` 是 §1.5 的常年噪音，**照旧开工、不许为此 block**
 1) python -m app.cli status <禅道ID>
    读 product_id / product_name / steps / comments(备注) / attachments[].local_path / 历史提交 / owner_reply
    → 有截图必须用 Read 打开 local_path 真正看图，只看文字就动手是最常见的误判来源
@@ -409,7 +422,7 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
    从镜像内走这条路即可，别绕到镜像外面）→ 常驻层没覆盖该域时再读仓库正式的 `AGENTS.md`
    → 定下落点后读 `.trae/agents/<源码相对路径>/AGENT.md`，流程按 `.trae/skills/` 走，
    不许绕过知识体系全库散搜；跨文件检索与遍历也按该库硬门禁走 SSH（Windows 映射盘上本机 grep/find 会卡死）
-   然后为这条 bug 开/切本地分支（§1.8，它会顺带拒绝脏工作区，不替你 stash）：
+   然后为这条 bug 开/切本地分支（§1.8，它只在**有人的真实未提交改动**时拒绝并列出文件，§1.5 那 92 行噪音不拦）：
    python -m app.cli checkout <禅道ID>
    只改与这条 bug 直接相关的文件，且路径必须属于这条 bug 的产品仓库（闸门 G3）
    改文件前先确认大小写拼名 —— 本库有 109 组只差大小写的同名对偶，Windows 侧两个拼名读到的是
@@ -703,7 +716,7 @@ Web /repos    各产品用哪个仓库、镜像在哪、正式 SVN 工作副本�
 | clone 末尾报 `Filename too long` + `read-tree -m -u -v HEAD HEAD: command returned error: 128` | **不用重拉**：对象、基线 commit、`.git/svn/…/.rev_map` 都已写好，只是 `.git/index` 没落盘。**必须在 SSH（Linux）侧修** —— 本库有 109 组只差大小写的路径，Windows 侧的 `ignorecase` 修不出完整工作树。主人执行：`ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git read-tree HEAD"` 建 index，再 `git -c core.ignorecase=false ls-files -z -d` 列出盘上缺的文件、`grep -zv '^\.trae/'` 滤掉符号链接那棵，`git -c core.ignorecase=false checkout --pathspec-from-file=<清单> --pathspec-file-nul` 补齐（实测 3.0 缺 129 条、补回 128 条，剩下 `.trae/doc/vpp-23.02/VPP_CORE_SHOW_LOG_AND_ERROR.md` 属符号链接噪音）。清单务必排掉 `.trae/` —— 那会写穿符号链接覆盖主人知识库。执行器遇到这种情况一律 `block` 写「镜像缺 index」，别自己动 |
 | 本地 git 分支攒了一堆 commit 没进正式库 | 正常状态（G11 设计如此）。由主人在 SSH 侧 `git -c core.ignorecase=false diff refs/remotes/origin/trunk..<分支>` 审，通过后自行 `git svn dcommit` 或出 patch 打到正式副本，再回填真实修订号 |
 | SSH 侧 `git status` 一跑冒出几十条 `M`，diff 是整文件重写 | Windows 侧检出留下的 CRLF（HEAD 里是 LF），本库实测 53 条（php / openvpn / products 那几棵第三方树居多）。不是改动，别去「修复」也别 `add -A`；看真实差异用 `git -c core.ignorecase=false diff --ignore-cr-at-eol`，`git add` 单文件时 git 会自动归一回 LF，提交内容不受影响。剩约 40 条是 `$Id$` 关键字形态差异，`--ignore-cr-at-eol` 消不掉，改到这类文件时在分析里点明 |
-| `git status` 里整棵 `.trae/**` 是 ` D`、`openvpn-2.4.8/INSTALL` 是 ` D` | 结构性噪音（`.trae` 是指向主人知识库根的符号链接 + 仓库里文件与盘上目录同名），**不是这次 bug 造成的**：不许 `checkout` 它们（会写穿符号链接覆盖知识库）、不许写进 `--files`、不许为此 `block` |
+| `git status` 里整棵 `.trae/**` 是 ` D`、`openvpn-2.4.8/INSTALL` 是 ` D` | 结构性噪音（`.trae` 是指向主人知识库根的符号链接 + 仓库里文件与盘上目录同名），**不是这次 bug 造成的**：不许 `checkout` 它们（会写穿符号链接覆盖知识库）、不许写进 `--files`、不许为此 `block`。本系统已认得这类噪音：`mirror` 把它们计入 `dirty_noise`，`checkout` 只被 `dirty_real` 拦（§1.8） |
 | 在 Windows 侧改了 `xt_dscp.c`，结果 `xt_DSCP.c` 变了 / `git status` 说另一半被删 | Windows 的 `ignorecase` 把大小写对偶混成一个（实测两个拼名 md5 相同）。立刻 `git -c core.ignorecase=false checkout -- <被误改的那个>` 回退，改到 SSH 侧重做；这类事故只有 Linux 侧能看出来 |
 | 工作树/分支基线莫名变化，或 `git status` 里冒出**别的产品/别的禅道 ID** 的文件 | 两个产品共用了同一份镜像却被并行处理（违反 §5）：立刻停掉其中一条队列，在 SSH 侧 `git -c core.ignorecase=false status` 核对，被串味的分支 `git reset --hard <基线>` 重做；要让它们真并行只能给其中一个另开一份镜像 |
 | 某条被 AI 反复处理不满意 | 三种处置别混：「打回」→ `rejected`，**改动与草稿分支都不回滚**，AI 在同一分支上追加提交，最终一次推入 SVN；「拒绝并回滚」→ 删掉该草稿分支（提交先存进 `refs/rejected/<分支>` 可取回），这条直接置 `closed`，AI 不再重做；「重开补修」（限 `merged`/`closed`）→ 已入过库但仍不完全，回到 `rejected` 重新入队，`queue_kind=reopened` |

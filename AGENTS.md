@@ -158,9 +158,13 @@ python -m app.cli doctor                   # 禅道通道分步诊断
 3. `python -m app.cli claim <禅道ID>` 占住任务（置 fixing），避免其他子任务重复领同一条
 4. 确认这条 bug 属于哪个产品、哪份代码、镜像工作副本在哪：`python -m app.cli repos`；
    **镜像就绪与否直接问 `python -m app.cli mirror <禅道ID>`**（`mirror_ready` = SSH 侧三条判据，
-   另给 `worktree_clean` 与镜像当前停在哪个分支），ready=false 时不许开工，直接 `block` 写明「镜像未就绪」
+   另给 `worktree_clean` 与镜像当前停在哪个分支），ready=false 时不许开工，直接 `block` 写明「镜像未就绪」；
+   `worktree_clean` 只数**真实改动**（`dirty_real` / `dirty_paths`），该库 §1.5 那常年几十行结构性噪音
+   （`.trae/**`、`openvpn-2.4.8/INSTALL`、CRLF 与 `$Id$` 差异）算在 `dirty_noise` / `dirty_untracked` 里，
+   **不是 block 的理由，也不是开工的障碍**
 5. 在镜像里为这条 bug 开/切本地分支：**`python -m app.cli checkout <禅道ID>`**（默认基线
-   `refs/remotes/origin/trunk`；镜像未就绪或工作区有别人未提交的改动时它会拒绝，不替你 stash）；
+   `refs/remotes/origin/trunk`；镜像未就绪、或工作区有**别人未提交的真实改动**时它会拒绝并列出文件，
+   不替你 stash）；
    **`queue_kind=rejected` 的重做不许另开分支、不许 `reset --hard` 丢掉上一轮**：上一轮的草稿分支还在
    （打回只改状态，不回滚改动），直接切回它继续追加提交 —— 主人推送时取的是分支相对 `origin/trunk`
    的合并差异，几轮改动会合成一次 svn 提交；分支已被主人「拒绝并回滚」删掉的，这条应是 `closed` 不会进队列；

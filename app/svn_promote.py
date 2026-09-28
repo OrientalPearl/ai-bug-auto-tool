@@ -1118,6 +1118,10 @@ class DraftState:
     trunk_head: str = ""
     index_ok: bool = False
     clean: bool = True
+    dirty_real: int = 0
+    dirty_noise: int = 0
+    dirty_untracked: int = 0
+    dirty_paths: str = ""
     error: str = ""
     raw: str = ""
 
@@ -1139,7 +1143,86 @@ class DraftState:
                 f"{self.ahead} 笔，改了 {len(self.files)} 个文件")
 
 
-_DRAFT_SCRIPT = r"""
+# ---------------------------------------------------------------------------
+# worktree dirt, minus this mirror's permanent structural noise
+# ---------------------------------------------------------------------------
+# AUTO_LOOP.md §1.5/§8 records that these git-svn mirrors carry a fixed baseline
+# of dirt that is nobody's edit: ``.trae/`` is a symlink into the owner's
+# knowledge root (so every file under it reads as deleted, and its own files read
+# as untracked), one vendored path exists on disk as a directory, and the CRLF
+# plus ``$Id$`` keyword drift in the php / openvpn / products trees shows up as
+# modified content. Measured 2026-09: 92 lines on 3.0.
+#
+# Only a *real* local edit is ever at stake in a branch switch, so only that may
+# stop one. Counting the rest and reporting it is what keeps the guard useful --
+# a guard that refuses everything protects nothing and breaks the whole §1.8 chain.
+_DIRTY_GATE = r"""
+is_mirror_noise() {
+  case "$1" in
+    .trae|.trae/*) return 0 ;;
+    openvpn-2.4.8/INSTALL) return 0 ;;
+  esac
+  return 1
+}
+
+# Fills REAL / NOISE / UNTRACKED / REAL_LIST. The loop reads from a here-document
+# on purpose: a pipe would run it in a subshell and the counters would be lost.
+assess_dirt() {
+  REAL=0
+  NOISE=0
+  UNTRACKED=0
+  REAL_LIST=""
+  DIRTY=$(git -c core.ignorecase=false status --porcelain 2>/dev/null)
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    xy=$(printf '%s' "$line" | cut -c1-2)
+    path=$(printf '%s' "$line" | cut -c4-)
+    case "$path" in *' -> '*) path=${path##* -> } ;; esac
+    case "$xy" in '??') UNTRACKED=$((UNTRACKED + 1)); continue ;; esac
+    if is_mirror_noise "$path"; then
+      NOISE=$((NOISE + 1))
+      continue
+    fi
+    idx=$(printf '%s' "$xy" | cut -c1)
+    wt=$(printf '%s' "$xy" | cut -c2)
+    real=0
+    case "$idx" in 'M'|'A'|'R'|'C'|'U') real=1 ;; esac
+    if [ "$real" = 0 ]; then
+      case "$wt" in
+        'M')
+          # Somebody's edit is what is left after ignoring CR at line ends and the
+          # $Id$ keyword lines; unified=0 keeps a huge file from flooding us.
+          res=$(git -c core.ignorecase=false diff --ignore-cr-at-eol --unified=0 -- "$path" 2>/dev/null \
+                | grep '^[+-]' | grep -v '^+++' | grep -v '^---' | grep -v '\$Id' | sed -n '1,20p')
+          [ -n "$res" ] && real=1
+          ;;
+        'D'|'U'|'T') real=1 ;;
+        *) [ "$wt" != ' ' ] && real=1 ;;
+      esac
+    fi
+    if [ "$real" = 1 ]; then
+      REAL=$((REAL + 1))
+      [ $REAL -le 5 ] && REAL_LIST="$REAL_LIST $path"
+    else
+      # Nothing at stake: either a listed noise path or a diff that evaporates once
+      # CR at line ends and the $Id$ keywords are ignored. Counted so REAL + NOISE +
+      # UNTRACKED always equals the porcelain line count the owner can reproduce.
+      NOISE=$((NOISE + 1))
+    fi
+  done <<EOF
+$DIRTY
+EOF
+  return 0
+}
+
+report_dirt() {
+  P dirt "$REAL|$NOISE|$UNTRACKED"
+  [ -n "$REAL_LIST" ] && P dirt_paths "$(printf '%s' "$REAL_LIST" | cut -c1-300)"
+  return 0
+}
+"""
+
+_DRAFT_SCRIPT = _DIRTY_GATE + r"""
 # Report one draft branch read-only: tip, commits, touched files, and how far it
 # sits ahead of trunk. POSIX sh, runs on the build server. Nothing here writes:
 # no fetch, no checkout, no ref updates.
@@ -1155,7 +1238,9 @@ esac
 P current "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
 P trunk_head "$(git rev-parse --short=10 refs/remotes/origin/trunk 2>/dev/null)"
 if git ls-files --error-unmatch AGENTS.md >/dev/null 2>&1; then P index ok; else P index missing; fi
-if [ -z "$(git status --porcelain 2>/dev/null | head -5)" ]; then P clean ok; else P clean dirty; fi
+assess_dirt
+if [ "$REAL" = 0 ]; then P clean ok; else P clean dirty; fi
+report_dirt
 if ! git rev-parse --verify "refs/heads/$BR" >/dev/null 2>&1; then
   P absent "$BR"
   exit 0
@@ -1252,6 +1337,14 @@ def draft_state(bug: dict, base_ref: str = "") -> DraftState:
             out.index_ok = value == "ok"
         elif tag == "clean":
             out.clean = value == "ok"
+        elif tag == "dirt":
+            # "<real>|<noise>|<untracked>" -- see _DIRTY_GATE for what counts as which.
+            bits = (value.split("|") + ["0", "0", "0"])[:3]
+            out.dirty_real = int(bits[0] or 0)
+            out.dirty_noise = int(bits[1] or 0)
+            out.dirty_untracked = int(bits[2] or 0)
+        elif tag == "dirt_paths":
+            out.dirty_paths = value.strip()
         elif tag == "err":
             out.error = value
 
@@ -1274,6 +1367,10 @@ class Checkout:
     action: str = ""          # created | switched | already
     base: str = ""
     tip: str = ""
+    dirty_real: int = 0
+    dirty_noise: int = 0
+    dirty_untracked: int = 0
+    dirty_paths: str = ""
     error: str = ""
     raw: str = ""
 
@@ -1281,14 +1378,20 @@ class Checkout:
         if self.error:
             return self.error
         words = {"created": "已从", "switched": "已切到", "already": "本来就停在"}
+        swept = ""
+        if self.dirty_noise or self.dirty_untracked:
+            swept = (f"（已忽略本镜像的结构性噪音：{self.dirty_noise} 条 .trae/INSTALL 类 + "
+                     f"{self.dirty_untracked} 条未跟踪）")
         if self.action == "created":
-            return f"已创建并切到 {self.branch}（基线 {self.base}），当前 {self.tip}"
-        return f"{words.get(self.action, '已切到')} {self.branch}，当前 {self.tip}"
+            return f"已创建并切到 {self.branch}（基线 {self.base}），当前 {self.tip}{swept}"
+        return f"{words.get(self.action, '已切到')} {self.branch}，当前 {self.tip}{swept}"
 
 
-_CHECKOUT_SCRIPT = r"""
+_CHECKOUT_SCRIPT = _DIRTY_GATE + r"""
 # Put the mirror onto one bug's draft branch, creating it from trunk when needed.
-# Refuses to move a dirty working tree: that tree may belong to another session.
+# Refuses to move a working tree that holds somebody's real edit -- that edit may
+# belong to another session. The mirror's permanent noise is counted, not refused
+# (see _DIRTY_GATE), otherwise this guard would block every bug forever.
 # POSIX sh, runs on the build server. Local git only -- no fetch, no push, no svn.
 export LC_ALL=C LANG=C
 set -f
@@ -1312,8 +1415,10 @@ if [ "$CUR" = "$BR" ]; then
   P done ok
   exit 0
 fi
-if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-  P err "镜像工作区在 $CUR 上有未提交改动，不替你 stash / checkout：先让那条会话收口"
+assess_dirt
+report_dirt
+if [ "$REAL" -gt 0 ]; then
+  P err "镜像工作区在 $CUR 上有 $REAL 处真实未提交改动（$REAL_LIST），不替你 stash / checkout：先让那条会话收口"
   exit 1
 fi
 if git rev-parse --verify "refs/heads/$BR" >/dev/null 2>&1; then
@@ -1375,6 +1480,13 @@ def checkout_draft(bug: dict, base: str = "") -> Checkout:
             out.base = value
         elif tag == "tip":
             out.tip = value
+        elif tag == "dirt":
+            bits = (value.split("|") + ["0", "0", "0"])[:3]
+            out.dirty_real = int(bits[0] or 0)
+            out.dirty_noise = int(bits[1] or 0)
+            out.dirty_untracked = int(bits[2] or 0)
+        elif tag == "dirt_paths":
+            out.dirty_paths = value.strip()
         elif tag == "done":
             out.ok = True
         elif tag == "err":

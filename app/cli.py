@@ -669,7 +669,11 @@ def cmd_mirror(args: argparse.Namespace) -> None:
         "files": [f.split(" ", 1)[-1] for f in state.files],
         "mirror_head": state.current, "trunk_head": state.trunk_head,
         "mirror_ready": state.ready, "index_ok": state.index_ok,
-        "worktree_clean": state.clean,
+        # worktree_clean now means "no real local edit", not "porcelain is empty":
+        # these mirrors carry a permanent baseline of structural noise (§1.5).
+        "worktree_clean": state.clean, "dirty_real": state.dirty_real,
+        "dirty_noise": state.dirty_noise, "dirty_untracked": state.dirty_untracked,
+        "dirty_paths": state.dirty_paths,
         "summary": state.summary(), "error": state.error,
     })
 
@@ -691,6 +695,8 @@ def cmd_checkout(args: argparse.Namespace) -> None:
         "ok": bool(result.ok), "action": "checkout", "zentao_id": bug["zentao_id"],
         "branch": result.branch, "mode": result.action, "base": result.base,
         "tip": result.tip, "status": "fixing" if result.ok else bug["status"],
+        "dirty_real": result.dirty_real, "dirty_noise": result.dirty_noise,
+        "dirty_untracked": result.dirty_untracked, "dirty_paths": result.dirty_paths,
         "summary": result.summary(), "error": result.error,
     })
 
