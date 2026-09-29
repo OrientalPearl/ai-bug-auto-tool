@@ -6,14 +6,18 @@ without scraping human oriented text.
 Examples
 --------
     python -m app.cli init
-    python -m app.cli sync
+    python -m app.cli sync --kinds bug,task
     python -m app.cli tasks --limit 5
     python -m app.cli claim 1024
-    python -m app.cli branch 1024
+    python -m app.cli plan T5417 --question "需求理解+修改细则" --options "..." --advice "..."
+    python -m app.cli claim T5417
     python -m app.cli note 1024 --summary "修复空指针" --verify "打开页面 A" --files a.py,b.py
     python -m app.cli commit 1024 --message "修复空指针导致的崩溃"
     python -m app.cli block 1024 --question "该走方案A还是方案B" --options "A:...;B:..." --advice "建议A"
     python -m app.cli report
+
+A bare number is a Zentao **bug**; a task is written ``T<id>`` (``T5417``), because
+Zentao numbers bugs and tasks in two independent sequences.
 """
 
 from __future__ import annotations
@@ -34,12 +38,29 @@ def _out(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
-def _bug_ref(ref: str) -> dict:
-    """Resolve an argument as either a Zentao id or a local bug id."""
-    bug = db.get_bug_by_zentao_id(int(ref)) or db.get_bug(int(ref))
-    if bug is None:
-        raise SystemExit(json.dumps({"ok": False, "error": f"bug not found: {ref}"}, ensure_ascii=False))
-    return bug
+def _item_ref(ref: str) -> dict:
+    """Resolve an argument as ``41468`` (bug) or ``T5417`` (task), or a local id."""
+    target, zentao_id = db.parse_ref(ref)
+    text = str(ref).strip()
+    item = db.get_item_by_zentao_id(zentao_id, target)
+    if item is None and text.isdigit():
+        # A bare number is a Zentao id first; only fall back to the local row id so
+        # an old script keeps working without ever mixing the two kinds up.
+        item = db.get_item(int(text), target)
+    if item is None:
+        raise SystemExit(json.dumps(
+            {"ok": False, "error": f"{target} not found: {ref}",
+             "hint": "任务请写成 T5417；缺陷直接写数字"}, ensure_ascii=False))
+    return item
+
+
+# Kept as the bug-flavoured name: most commands speak of "the bug" internally.
+_bug_ref = _item_ref
+
+
+def _subject_prefix(item: dict) -> str:
+    """``fix`` for a bug, ``feat`` for a task -- what the commit line starts with."""
+    return "feat" if item.get("target") == "task" else "fix"
 
 
 # ---------------------------------------------------------------------------
@@ -51,20 +72,35 @@ def cmd_init(_args: argparse.Namespace) -> None:
     _out({"ok": True, "action": "init", "db": str(path), "tables": list(db.BUG_STATUSES)})
 
 
+def _kinds(raw: str | None) -> tuple[str, ...]:
+    """Parse ``--kinds bug,task`` (default: both) into validated item kinds."""
+    items = [k.strip().lower() for k in str(raw or "").split(",") if k.strip()]
+    if not items:
+        return tuple(db.ITEM_KINDS)
+    unknown = [k for k in items if k not in db.ITEM_KINDS]
+    if unknown:
+        raise SystemExit(json.dumps(
+            {"ok": False, "error": f"未知条目类型：{', '.join(unknown)}（可用 bug / task）"},
+            ensure_ascii=False))
+    return tuple(dict.fromkeys(items))
+
+
 def cmd_sync(args: argparse.Namespace) -> None:
-    result = sync.sync_now()
+    kinds = _kinds(getattr(args, "kinds", None))
+    result = sync.sync_now(kinds=kinds)
     # Optionally enrich the queue so screenshots/notes are on disk before the AI
-    # reasons about a bug; `--details -1` means every queued bug.
+    # reasons about an item; `--details -1` means every queued item.
     if args.details:
         if args.details < 0:
-            summary = sync.pull_details(limit=None)
+            summary = sync.pull_details(limit=None, targets=kinds)
             result["details"] = [summary]
         else:
             enriched = []
             for task in db.fetch_task_queue(limit=args.details):
-                item = sync.refresh_detail(task["zentao_id"])
+                item = sync.refresh_detail(task["zentao_id"], target=task["target"])
                 enriched.append({
                     "zentao_id": item.get("zentao_id"),
+                    "kind": item.get("target"),
                     "ok": item.get("ok"),
                     "images_saved": item.get("images_saved"),
                     "comments": item.get("comments"),
@@ -76,25 +112,28 @@ def cmd_sync(args: argparse.Namespace) -> None:
 
 def cmd_tasks(args: argparse.Namespace) -> None:
     db.ensure_db()
-    tasks = db.fetch_task_queue(limit=args.limit)
+    kinds = _kinds(getattr(args, "kinds", None))
+    tasks = db.fetch_task_queue(limit=args.limit, targets=kinds)
     _out({"ok": True, "action": "tasks", "count": len(tasks), "tasks": tasks})
 
 
 def cmd_claim(args: argparse.Namespace) -> None:
     bug = _bug_ref(args.ref)
-    updated = db.set_bug_status(bug["id"], "fixing")
-    _out({"ok": True, "action": "claim", "bug": updated})
+    updated = db.set_item_status(bug["id"], "fixing", target=bug["target"])
+    _out({"ok": True, "action": "claim", "zentao_id": bug["zentao_id"],
+          "kind": bug["target"], "bug": updated})
 
 
 def cmd_branch(args: argparse.Namespace) -> None:
-    """Create/switch the bugfix branch in the repository that owns this bug."""
+    """Create/switch the bugfix branch in the repository that owns this item."""
     bug = _bug_ref(args.ref)
     target = svn_client.resolve_target(bug=bug)
-    branch_name = f"{target.branch_prefix}{bug['zentao_id']}"
-    db.set_bug_status(bug["id"], "fixing", branch=branch_name)
+    branch_name = db.draft_branch(bug["zentao_id"], bug["target"], target.branch_prefix)
+    db.set_item_status(bug["id"], "fixing", target=bug["target"], branch=branch_name)
     report = {
         "ok": True,
         "action": "branch",
+        "kind": bug["target"],
         "branch": branch_name,
         "product_id": bug.get("product_id"),
         "product_name": bug.get("product_name") or "",
@@ -115,8 +154,10 @@ def cmd_branch(args: argparse.Namespace) -> None:
               "reason": f"产品 {bug.get('product_id')} 未绑定代码库且 SVN_REPO_URL 为空，"
                         f"请执行 python -m app.cli bind-repo {bug.get('product_id')} <仓库地址>"})
         return
-    url = svn_client.create_branch(str(bug["zentao_id"]), target=target,
-                                   message=f"branch for zentao bug #{bug['zentao_id']}")
+    url = svn_client.create_branch(db.item_slug(bug["zentao_id"], bug["target"]),
+                                   target=target,
+                                   message=f"branch for zentao {bug['target']} "
+                                           f"#{bug['zentao_id']}")
     _out({**report, "svn": url})
 
 
@@ -201,7 +242,8 @@ def _write_analysis(bug: dict, payload: dict[str, Any], kind: str) -> dict:
     """Persist a normalized analysis payload."""
     gates = payload.pop("_gates", {}) or {}
     author = str(payload.pop("author", "") or "") or get_settings().zentao_account or "ai"
-    return db.add_analysis(bug["id"], payload, kind=kind, gates=gates, author=author)
+    return db.add_analysis(bug["id"], payload, kind=kind, gates=gates, author=author,
+                           target=bug["target"])
 
 
 # ---------------------------------------------------------------------------
@@ -275,10 +317,10 @@ def _load_json_handoff(path: str, label: str) -> dict[str, Any]:
 
 
 def _require_analysis_or_die(bug: dict, payload: dict[str, Any] | None) -> None:
-    """When REQUIRE_ANALYSIS is on, a bug cannot be committed without a written analysis."""
+    """When REQUIRE_ANALYSIS is on, an item cannot be committed without a written analysis."""
     if payload is not None or not get_settings().require_analysis:
         return
-    if db.has_analysis(bug["id"]):
+    if db.has_analysis(bug["id"], bug["target"]):
         return
     raise SystemExit(json.dumps({
         "ok": False,
@@ -289,8 +331,28 @@ def _require_analysis_or_die(bug: dict, payload: dict[str, Any] | None) -> None:
     }, ensure_ascii=False))
 
 
+def _plan_gate_or_die(bug: dict, action: str) -> None:
+    """A task may not be implemented until the owner approved its plan (G13).
+
+    Checked here and not only in the rules: an unattended run that mis-reads the
+    queue must still be physically unable to write code on an unapproved task.
+    """
+    if bug.get("target") != "task":
+        return
+    reason = db.plan_gate_reason(bug)
+    if not reason:
+        return
+    raise SystemExit(json.dumps({
+        "ok": False, "action": action, "zentao_id": bug["zentao_id"],
+        "error": reason,
+        "hint": f"python -m app.cli plan T{bug['zentao_id']} "
+                "--question \"<需求理解与修改细则>\" --options \"<可选做法>\" "
+                "--advice \"<建议>\"",
+    }, ensure_ascii=False))
+
+
 def cmd_analyze(args: argparse.Namespace) -> None:
-    """Store the executor's written analysis for one bug."""
+    """Store the executor's written analysis for one item."""
     bug = _bug_ref(args.ref)
     payload = _normalized_analysis(args)
     if payload is None:
@@ -301,7 +363,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         }, ensure_ascii=False))
     saved = _write_analysis(bug, payload, args.kind)
     _out({"ok": True, "action": "analyze", "zentao_id": bug["zentao_id"],
-          "analysis_id": saved["id"], "kind": saved["kind"], "gates": saved["gates"],
+          "kind": bug["target"], "analysis_id": saved["id"], "record_kind": saved["kind"],
+          "gates": saved["gates"],
           "handoff_removed": consume_handoff(args), "analysis": saved})
 
 
@@ -315,20 +378,29 @@ def cmd_note(args: argparse.Namespace) -> None:
         fields["verify_steps"] = args.verify
     if files:
         fields["files_changed"] = files
-    updated = db.set_bug_status(bug["id"], bug["status"], **fields)
+    updated = db.set_item_status(bug["id"], bug["status"], target=bug["target"], **fields)
     payload = _normalized_analysis(args)
     saved = _write_analysis(bug, payload, "manual") if payload else None
     _out({"ok": True, "action": "note", "analysis_id": (saved or {}).get("id"),
           "handoff_removed": consume_handoff(args), "bug": updated})
 
 
+def _close_need_ref(ref: str) -> dict | None:
+    """Close one need given as ``12`` (bug) or ``T12`` (task)."""
+    target, need_id = db.parse_ref(ref)
+    return db.close_need(need_id, target)
+
+
 def cmd_commit(args: argparse.Namespace) -> None:
     bug = _bug_ref(args.ref)
+    _plan_gate_or_die(bug, "commit")
     payload = _normalized_analysis(args)
     _require_analysis_or_die(bug, payload)
     target = svn_client.resolve_target(bug=bug)
-    branch = bug.get("branch") or f"{target.branch_prefix}{bug['zentao_id']}"
-    message = f"fix #{bug['zentao_id']} {args.message or bug['title']}".strip()
+    branch = bug.get("branch") or db.draft_branch(bug["zentao_id"], bug["target"],
+                                                  target.branch_prefix)
+    message = (f"{_subject_prefix(bug)} #{bug['zentao_id']} "
+               f"{args.message or bug['title']}").strip()
     files = [f.strip() for f in (args.files or "").split(",") if f.strip()]
 
     revision = args.revision
@@ -347,7 +419,8 @@ def cmd_commit(args: argparse.Namespace) -> None:
 
     db.add_revision(bug["id"], revision, branch=branch, message=message,
                     author=args.author or get_settings().svn_username or "ai",
-                    files=files or (bug.get("files_changed") or []))
+                    files=files or (bug.get("files_changed") or []),
+                    target=bug["target"])
     fields: dict[str, Any] = {"branch": branch}
     if args.summary:
         fields["fix_summary"] = args.summary
@@ -355,7 +428,7 @@ def cmd_commit(args: argparse.Namespace) -> None:
         fields["verify_steps"] = args.verify
     if files:
         fields["files_changed"] = files
-    db.set_bug_status(bug["id"], "await_review", **fields)
+    db.set_item_status(bug["id"], "await_review", target=bug["target"], **fields)
 
     # The written analysis travels with the commit so the review page has something to read.
     analysis_id = None
@@ -363,14 +436,17 @@ def cmd_commit(args: argparse.Namespace) -> None:
         analysis_id = _write_analysis(bug, payload, "commit")["id"]
 
     comment = sync.comment_commit(bug["zentao_id"], branch, revision,
-                                 extra=args.extra or "")
+                                  extra=args.extra or "", target=bug["target"])
     if args.need_done:
-        for need_id in args.need_done:
-            db.close_need(int(need_id))
+        for need_ref in args.need_done:
+            db.log_sync("update", bug["zentao_id"],
+                        {"action": "need-done", "kind": bug["target"],
+                         "need": _close_need_ref(need_ref)})
     _out({
         "ok": True,
         "action": "commit",
         "zentao_id": bug["zentao_id"],
+        "kind": bug["target"],
         "revision": revision,
         "branch": branch,
         "repo": target.repo_url or "(未配置)",
@@ -430,7 +506,8 @@ def cmd_i18n_commit(args: argparse.Namespace) -> None:
     """Commit translation files straight to SVN (AUTO_LOOP.md G12)."""
     bug, target = _i18n_target(args)
     files = [f.strip() for f in (args.files or "").split(",") if f.strip()]
-    message = f"fix #{bug['zentao_id']} {args.message or '同步多语言词条'}".strip()
+    message = (f"{_subject_prefix(bug)} #{bug['zentao_id']} "
+               f"{args.message or '同步多语言词条'}").strip()
     try:
         result = svn_client.i18n_commit(files, message, target=target,
                                         dry_run=bool(args.dry_run))
@@ -447,15 +524,18 @@ def cmd_i18n_commit(args: argparse.Namespace) -> None:
             message=message,
             author=args.author or get_settings().svn_username or "ai",
             files=result.get("committed_files") or [],
+            target=bug["target"],
         )
         comment = sync.comment_commit(
             bug["zentao_id"], "i18n 直连提交", f"r{revision}",
             extra=args.extra or "多语言词条已单独提交 SVN（G12），不涉及代码版本",
+            target=bug["target"],
         )
     _out({
         "ok": True,
         "action": "i18n-commit",
         "zentao_id": bug["zentao_id"],
+        "kind": bug["target"],
         "revision": f"r{revision}" if revision else "",
         "committed_files": result.get("committed_files") or [],
         "skipped_unchanged": result.get("skipped_unchanged") or [],
@@ -470,8 +550,8 @@ def cmd_i18n_commit(args: argparse.Namespace) -> None:
     })
 
 
-def cmd_block(args: argparse.Namespace) -> None:
-    """Register a blocker that needs the owner's decision.
+def _need_command(args: argparse.Namespace, need_kind: str) -> None:
+    """Shared body of ``block`` and ``plan``: register one question for the owner.
 
     Long Chinese text is painful to pass through a shell, so the same payload may
     live in a JSON file given with `--block-file`; the command ingests it and then
@@ -490,41 +570,79 @@ def cmd_block(args: argparse.Namespace) -> None:
         raise SystemExit(json.dumps(
             {"ok": False, "error": "必须给出 --question，或在 --block-file 里写 question 字段"},
             ensure_ascii=False))
+    if need_kind == "plan" and bug["target"] != "task":
+        raise SystemExit(json.dumps(
+            {"ok": False, "action": "plan",
+             "error": f"#{bug['zentao_id']} 是缺陷，缺陷没有「先给方案」这一步；"
+                      "能修就修，修不动用 block"}, ensure_ascii=False))
     payload = _normalized_analysis(args)
-    need = db.create_need(bug["id"], question, options, advice)
-    db.set_bug_status(bug["id"], "need_solution")
-    comment = sync.comment_block(bug["zentao_id"], question, options, advice)
-    analysis = _write_analysis(bug, payload, "block") if payload else None
-    _out({"ok": True, "action": "block", "need": need, "status": "need_solution",
+    need = db.create_need(bug["id"], question, options, advice,
+                          target=bug["target"], need_kind=need_kind)
+    db.set_item_status(bug["id"], "need_solution", target=bug["target"])
+    if need_kind == "plan":
+        comment = sync.comment_plan(bug["zentao_id"], question, options, advice)
+    else:
+        comment = sync.comment_block(bug["zentao_id"], question, options, advice,
+                                     target=bug["target"])
+    record_kind = "plan" if need_kind == "plan" else "block"
+    analysis = _write_analysis(bug, payload, record_kind) if payload else None
+    _out({"ok": True, "action": record_kind, "kind": bug["target"],
+          "zentao_id": bug["zentao_id"], "need": need, "status": "need_solution",
           "analysis_id": (analysis or {}).get("id"),
           "handoff_removed": consume_handoff(args), "zentao_comment": comment})
 
 
+def cmd_block(args: argparse.Namespace) -> None:
+    """Register a blocker that needs the owner's decision."""
+    _need_command(args, "block")
+
+
+def cmd_plan(args: argparse.Namespace) -> None:
+    """Register a task's change proposal; no code is written until it is approved.
+
+    This is the only first-round output a task may produce (AUTO_LOOP.md G13), and
+    the mirror commands refuse a task that has no approved plan, so skipping it is
+    not an option an unattended run can take by accident.
+    """
+    _need_command(args, "plan")
+
+
 def cmd_need_done(args: argparse.Namespace) -> None:
-    _out({"ok": True, "action": "need-done", "need": db.close_need(int(args.need_id))})
+    _out({"ok": True, "action": "need-done", "need": _close_need_ref(args.need_id)})
 
 
 def cmd_comment(args: argparse.Namespace) -> None:
     bug = _bug_ref(args.ref)
-    _out({"ok": True, "action": "comment", "result": sync.push_comment(bug["zentao_id"], args.text)})
+    _out({"ok": True, "action": "comment", "kind": bug["target"],
+          "result": sync.push_comment(bug["zentao_id"], args.text,
+                                      target=bug["target"])})
 
 
 def cmd_report(_args: argparse.Namespace) -> None:
     counts = db.counts_by_status()
     queue = db.fetch_task_queue(limit=1000)
     sweepable, unregistered = _handoff_leftovers()
+    def _ids(sql: str) -> list[str]:
+        found = []
+        for target in db.ITEM_KINDS:
+            rows = db.query_all(sql.replace("{item}", db.tables_for(target).item))
+            found.extend(db.item_slug(r["zentao_id"], target) for r in rows)
+        return found
     _out({
         "ok": True,
         "action": "report",
         "counts": counts,
-        "submitted_await_review": [b["zentao_id"] for b in db.query_all(
-            "SELECT zentao_id FROM bugs WHERE status='await_review' ORDER BY pri")],
-        "need_owner_solution": [b["zentao_id"] for b in db.query_all(
-            "SELECT zentao_id FROM bugs WHERE status='need_solution' ORDER BY pri")],
-        "resumed_after_reply": [n["id"] for n in db.query_all(
-            "SELECT id FROM need_solution WHERE status='replied'")],
+        "submitted_await_review": _ids(
+            "SELECT zentao_id FROM {item} WHERE status='await_review' ORDER BY pri"),
+        "need_owner_solution": _ids(
+            "SELECT zentao_id FROM {item} WHERE status='need_solution' ORDER BY pri"),
+        "resumed_after_reply": ([n["id"] for n in db.query_all(
+            "SELECT id FROM need_solution WHERE status='replied'")]
+            + [f"T{n['id']}" for n in db.query_all(
+                "SELECT id FROM task_needs WHERE status='replied'")]),
         "remaining_queue": [
-            {"zentao_id": t["zentao_id"], "kind": t["queue_kind"], "title": t["title"]}
+            {"zentao_id": t["zentao_id"], "kind": t["target"],
+             "queue_kind": t["queue_kind"], "title": t["title"]}
             for t in queue
         ],
         "remaining_work": len(queue),
@@ -537,7 +655,7 @@ def cmd_report(_args: argparse.Namespace) -> None:
 
 def cmd_status(args: argparse.Namespace) -> None:
     bug = _bug_ref(args.ref)
-    _out({"ok": True, "action": "status", "bug": bug})
+    _out({"ok": True, "action": "status", "kind": bug["target"], "bug": bug})
 
 
 def cmd_svn_check(args: argparse.Namespace) -> None:
@@ -547,7 +665,7 @@ def cmd_svn_check(args: argparse.Namespace) -> None:
 
 
 def cmd_repos(_args: argparse.Namespace) -> None:
-    """List products seen in bugs plus their repository bindings."""
+    """List products seen in bugs/tasks plus their repository bindings."""
     bound = {r["product_id"]: r for r in db.list_product_repos()}
     rows = []
     for item in db.products_in_use():
@@ -558,6 +676,8 @@ def cmd_repos(_args: argparse.Namespace) -> None:
             "product_name": item["product_name"] or (repo or {}).get("product_name", ""),
             "bugs": item["bugs"],
             "pending": item["pending"],
+            "tasks": item.get("tasks", 0),
+            "task_pending": item.get("task_pending", 0),
             "bound": repo is not None,
             "repo_url": target.repo_url or "",
             "effective_source": target.source,
@@ -633,24 +753,27 @@ def cmd_config(_args: argparse.Namespace) -> None:
 
 
 def cmd_detail(args: argparse.Namespace) -> None:
-    """Pull screenshots, notes and attachments: one bug, or the whole queue."""
+    """Pull screenshots, notes and attachments: one item, or the whole queue."""
     bulk = bool(args.all) or (args.ref is None and bool(args.limit))
     if args.ref is None and not bulk:
         raise SystemExit(json.dumps(
-            {"ok": False, "error": "请给出禅道ID，或使用 --all / --limit N 批量抓取"},
+            {"ok": False, "error": "请给出禅道ID（任务写 T5417），或使用 --all / --limit N 批量抓取"},
             ensure_ascii=False))
+    kinds = _kinds(getattr(args, "kinds", None))
     if bulk:
         limit = None if args.all else int(args.limit)
-        summary = sync.pull_details(limit=limit, download=not args.no_images)
+        summary = sync.pull_details(limit=limit, download=not args.no_images,
+                                    targets=kinds)
         _out({"ok": bool(summary.get("ok")), "action": "detail-all", **summary})
         return
     bug = _bug_ref(args.ref)
-    result = sync.refresh_detail(bug["zentao_id"], download=not args.no_images)
+    result = sync.refresh_detail(bug["zentao_id"], download=not args.no_images,
+                                 target=bug["target"])
     _out({"action": "detail", **result})
 
 
 def cmd_mirror(args: argparse.Namespace) -> None:
-    """Read-only look at one bug's draft branch inside the mirror.
+    """Read-only look at one item's draft branch inside the mirror.
 
     The executor is meant to ask the mirror questions through this command rather
     than typing ``ssh ... git ...`` itself: one allow-listed entry point keeps an
@@ -662,6 +785,7 @@ def cmd_mirror(args: argparse.Namespace) -> None:
     state = svn_promote.draft_state(bug, base_ref=args.base or "")
     _out({
         "ok": not state.error, "action": "mirror", "zentao_id": bug["zentao_id"],
+        "kind": bug["target"],
         "status": bug["status"], "branch": state.branch, "present": state.present,
         "tip": state.short_tip, "subject": state.subject, "author": state.author,
         "when": state.when, "base": state.base, "base_source": state.base_source,
@@ -681,7 +805,7 @@ def cmd_mirror(args: argparse.Namespace) -> None:
 
 
 def cmd_checkout(args: argparse.Namespace) -> None:
-    """Put the mirror onto this bug's draft branch (create it from trunk if new).
+    """Put the mirror onto this item's draft branch (create it from trunk if new).
 
     The mirror's readiness gates (trunk ref present, index checked out) are
     checked by the same call, so the executor gets one command instead of three
@@ -690,11 +814,13 @@ def cmd_checkout(args: argparse.Namespace) -> None:
     from . import svn_promote
 
     bug = _bug_ref(args.ref)
+    _plan_gate_or_die(bug, "checkout")
     result = svn_promote.checkout_draft(bug, base=args.base or "")
     if result.ok:
-        db.set_bug_status(bug["id"], "fixing", branch=result.branch)
+        db.set_item_status(bug["id"], "fixing", target=bug["target"], branch=result.branch)
     _out({
         "ok": bool(result.ok), "action": "checkout", "zentao_id": bug["zentao_id"],
+        "kind": bug["target"],
         "branch": result.branch, "mode": result.action, "base": result.base,
         "tip": result.tip, "status": "fixing" if result.ok else bug["status"],
         "dirty_real": result.dirty_real, "dirty_noise": result.dirty_noise,
@@ -742,7 +868,7 @@ def _dirt_info(result: Any) -> dict:
 
 
 def cmd_draft(args: argparse.Namespace) -> None:
-    """Stage the listed files and commit them on the bug's draft branch.
+    """Stage the listed files and commit them on the item's draft branch.
 
     Same reason as ``mirror``: the executor should never type a raw
     ``ssh ... git commit``, because that is exactly the kind of command the IDE
@@ -751,8 +877,9 @@ def cmd_draft(args: argparse.Namespace) -> None:
     from . import svn_promote
 
     bug = _bug_ref(args.ref)
+    _plan_gate_or_die(bug, "draft")
     message = str(args.message or "").strip()
-    want = f"fix #{bug['zentao_id']}"
+    want = f"{_subject_prefix(bug)} #{bug['zentao_id']}"
     if not message.startswith(want):
         raise SystemExit(json.dumps(
             {"ok": False, "error": f"提交说明必须以 {want} 开头（闸门 G8），收到: {message[:60]}"},
@@ -767,14 +894,16 @@ def cmd_draft(args: argparse.Namespace) -> None:
     except svn_promote.PromoteError as exc:
         _out({"ok": False, "action": "draft", "error": str(exc)})
         return
+    slug = db.item_slug(bug["zentao_id"], bug["target"])
     _out({
         "ok": bool(result.ok and not result.nothing), "action": "draft",
-        "zentao_id": bug["zentao_id"], "branch": result.branch,
+        "zentao_id": bug["zentao_id"], "kind": bug["target"],
+        "branch": result.branch,
         "commit": result.short_tip, "subject": result.subject,
         "staged": result.staged, "nothing": result.nothing,
         "lock": _lock_info(result),
         "summary": result.summary(), "error": result.error,
-        "next": (f"python -m app.cli commit {bug['zentao_id']} --message \"<一句话根因>\" "
+        "next": (f"python -m app.cli commit {slug} --message \"<一句话根因>\" "
                  f"--files {','.join(result.staged or files)} --no-svn "
                  f"--revision git:{result.short_tip} --analysis-file a.json"),
     })
@@ -782,8 +911,12 @@ def cmd_draft(args: argparse.Namespace) -> None:
 
 def cmd_reconcile(args: argparse.Namespace) -> None:
     """Compare the database with the draft branches that exist on the mirrors."""
-    ref = int(args.ref) if args.ref else None
-    result = sync.reconcile_drafts(apply=args.apply, zentao_id=ref)
+    zentao_id = None
+    kinds = _kinds(getattr(args, "kinds", None))
+    if args.ref:
+        target, zentao_id = db.parse_ref(args.ref)
+        kinds = (target,)
+    result = sync.reconcile_drafts(apply=args.apply, zentao_id=zentao_id, targets=kinds)
     _out({"ok": True, "action": "reconcile", **result})
 
 
@@ -942,15 +1075,19 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("init", help="创建 SQLite 数据库与全部表")
     p.set_defaults(func=cmd_init)
 
-    p = sub.add_parser("sync", help="从禅道拉取指派给我的 active bug")
+    p = sub.add_parser("sync",
+                       help="从禅道拉取指派给我的 active bug 与未关闭 task"
+                            "（编号前加 T 表示任务）")
     p.add_argument("--details", type=int, default=0, metavar="N",
                    help="同步后再抓队列前 N 条的详情（截图/备注/附件）")
+    p.add_argument("--kinds", default="", help="要同步的条目类型：bug / task / bug,task（默认两种）")
     p.set_defaults(func=cmd_sync)
 
-    p = sub.add_parser("detail", help="抓 bug 的截图、备注、附件并入库（不给 ID 时用 --all 全量）")
+    p = sub.add_parser("detail", help="抓条目的截图、备注、附件并入库（不给 ID 时用 --all 全量）")
     p.add_argument("ref", nargs="?", default=None)
-    p.add_argument("--all", action="store_true", help="全量抓取队列内所有 bug 的详情")
+    p.add_argument("--all", action="store_true", help="全量抓取队列内所有条目的详情")
     p.add_argument("--limit", type=int, default=0, help="只抓前 N 条（按 pri/severity 排序）")
+    p.add_argument("--kinds", default="", help="批量时只抓某类：bug / task（默认两种）")
     p.add_argument("--no-images", action="store_true", help="只取文字，不下载附件")
     p.set_defaults(func=cmd_detail)
 
@@ -968,15 +1105,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_tmp_clean)
 
     p = sub.add_parser("mirror",
-                       help="只读探测某条 bug 的草稿分支（tip / 领先几笔 / 改了哪些文件）；"
+                       help="只读探测某条目的草稿分支（tip / 领先几笔 / 改了哪些文件）；"
                             "看镜像一律走这条，不要自己拼 ssh + git 命令")
     p.add_argument("ref")
     p.add_argument("--base", default="", help="增量基准，默认取上一轮推入的草稿提交")
     p.set_defaults(func=cmd_mirror)
 
     p = sub.add_parser("checkout",
-                       help="把镜像切到这条 bug 的草稿分支（没有就从 origin/trunk 建）；"
-                            "顺带做镜像就绪判定，执行器不用自己拼 ssh + git checkout")
+                       help="把镜像切到这条目的草稿分支（没有就从 origin/trunk 建）；"
+                            "顺带做镜像就绪判定，执行器不用自己拼 ssh + git checkout。"
+                            "任务若没有已确认的方案，本命令直接拒绝（G13）")
     p.add_argument("ref")
     p.add_argument("--base", default="", help="建分支的基线，默认 refs/remotes/origin/trunk")
     p.set_defaults(func=cmd_checkout)
@@ -985,7 +1123,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="在镜像的 bugfix 分支上落草稿提交（只 add --files 列出的文件）；"
                             "执行器不要自己拼 ssh + git commit，那会卡在授权弹窗上")
     p.add_argument("ref")
-    p.add_argument("--message", required=True, help="提交说明，必须以 fix #<禅道ID> 开头（G8）")
+    p.add_argument("--message", required=True,
+                   help="提交说明，缺陷以 fix #<禅道ID> 开头、任务以 feat #<禅道ID> 开头（G8）")
     p.add_argument("--files", required=True,
                    help="逗号分隔的改动文件（镜像内相对路径）；不做整仓 add")
     p.set_defaults(func=cmd_draft)
@@ -993,15 +1132,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("reconcile",
                        help="对账：镜像上已有草稿提交、库里却没登记的条目；"
                             "--apply 认领为 git:<哈希> 并转待审查")
-    p.add_argument("ref", nargs="?", default=None, help="只查某一条（禅道ID）")
+    p.add_argument("ref", nargs="?", default=None, help="只查某一条（缺陷ID / T<任务ID>）")
     p.add_argument("--apply", action="store_true", help="真的认领（默认只报告）")
+    p.add_argument("--kinds", default="", help="只查某类：bug / task（默认两种）")
     p.set_defaults(func=cmd_reconcile)
 
-    p = sub.add_parser("tasks", help="读取待处理队列（pri 升序 / severity 降序）")
+    p = sub.add_parser("tasks",
+                       help="读取待处理队列（缺陷与任务合并排序：pri 升序 / severity 降序）")
     p.add_argument("--limit", type=int, default=get_settings().batch_size)
+    p.add_argument("--kinds", default="", help="只取某类：bug / task（默认两种）")
     p.set_defaults(func=cmd_tasks)
 
-    p = sub.add_parser("claim", help="把 bug 标记为 fixing")
+    p = sub.add_parser("claim", help="把条目标记为 fixing")
     p.add_argument("ref")
     p.set_defaults(func=cmd_claim)
 
@@ -1010,10 +1152,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_branch)
 
-    p = sub.add_parser("analyze", help="写入这条 bug 的分析结论（根因/证据/影响面/闸门逐条/未验证项）")
+    p = sub.add_parser("analyze",
+                       help="写入这条目的分析结论（根因/证据/影响面/闸门逐条/未验证项）")
     p.add_argument("ref")
-    p.add_argument("--kind", choices=list(db.ANALYSIS_KINDS), default="manual",
-                   help="这条分析的场合：commit=修复完成 block=卡点 manual=随手记")
+    p.add_argument("--kind", choices=list(db.TASK_ANALYSIS_KINDS), default="manual",
+                   help="这条分析的场合：commit=修复完成 block=卡点 plan=任务方案"
+                        "（仅任务） manual=随手记")
     _add_analysis_args(p)
     p.set_defaults(func=cmd_analyze)
 
@@ -1027,14 +1171,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("commit", help="提交 SVN、记录修订号、置为 await_review 并回写禅道评论")
     p.add_argument("ref")
-    p.add_argument("--message", help="修复说明，最终 commit message 为 fix #<ID> <说明>")
+    p.add_argument("--message", help="修复说明，最终 commit message 为 fix #<ID> <说明>"
+                                     "（任务为 feat #<ID> <说明>）")
     p.add_argument("--files")
     p.add_argument("--revision", help="外部已提交时直接指定修订号")
     p.add_argument("--summary")
     p.add_argument("--verify")
     p.add_argument("--author")
     p.add_argument("--extra", help="附加到禅道评论的补充说明")
-    p.add_argument("--need-done", type=int, nargs="*", help="提交后关闭这些 need_solution 记录")
+    p.add_argument("--need-done", nargs="*",
+                   help="提交后关闭这些需方案记录：缺陷写数字、任务写 T<id>")
     p.add_argument("--no-svn", action="store_true", help="不调用 svn，只登记记录")
     _add_analysis_args(p)
     p.set_defaults(func=cmd_commit)
@@ -1058,7 +1204,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="只做白名单/改动校验与 svn update，不提交")
     p.set_defaults(func=cmd_i18n_commit)
 
-    p = sub.add_parser("block", help="登记需方案并置为 need_solution，同时回写禅道评论")
+    p = sub.add_parser("block",
+                       help="登记需方案（卡点）并置为 need_solution，同时回写禅道评论")
     p.add_argument("ref")
     p.add_argument("--question", help="卡在哪一步（也可写进 --block-file 的 question）")
     p.add_argument("--block-file",
@@ -1069,7 +1216,22 @@ def build_parser() -> argparse.ArgumentParser:
     _add_analysis_args(p)
     p.set_defaults(func=cmd_block)
 
-    p = sub.add_parser("need-done", help="把某条 need_solution 标记为 done")
+    p = sub.add_parser("plan",
+                       help="任务首轮的唯一产出：登记「方案 / 修改细则」并等主人确认（G13）；"
+                            "方案没被确认前，checkout / draft / commit 对这条任务一律拒绝")
+    p.add_argument("ref", help="任务编号，写成 T<禅道ID>，例：T5417")
+    p.add_argument("--question",
+                   help="需求理解 + 修改细则（要动哪些文件/入口/口径），也可写进 --plan-file")
+    p.add_argument("--plan-file", dest="block_file",
+                   help="JSON 文件：一次性写入 question / options / advice（长文本免转义），"
+                        "命令成功后由本系统回收")
+    p.add_argument("--options", default="", help="可选做法 A/B/C")
+    p.add_argument("--advice", default="", help="AI 建议走哪条、为什么")
+    _add_analysis_args(p)
+    p.set_defaults(func=cmd_plan)
+
+    p = sub.add_parser("need-done",
+                       help="把某条需方案记录标记为 done（缺陷写数字、任务写 T<id>）")
     p.add_argument("need_id")
     p.set_defaults(func=cmd_need_done)
 
@@ -1078,7 +1240,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text", required=True)
     p.set_defaults(func=cmd_comment)
 
-    p = sub.add_parser("status", help="查看某个 bug 的完整信息")
+    p = sub.add_parser("status", help="查看某条条目（缺陷/任务）的完整信息")
     p.add_argument("ref")
     p.set_defaults(func=cmd_status)
 

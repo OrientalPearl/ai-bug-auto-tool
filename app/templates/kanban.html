@@ -3,11 +3,20 @@
 {% set BADGE = {'pending':'grey','fixing':'blue','need_solution':'yellow','await_review':'orange',
                 'rejected':'red','merged':'green','closed':'dark-green'} %}
 <div class="page-head">
-  <h2>Bug 看板</h2>
-  <span class="muted">三类行块 · 点标题折叠 · pri 升序 / severity 降序 · 点击卡片弹窗看详情</span>
+  <h2>禅道条目看板</h2>
+  <span class="muted">缺陷 + 任务 · 三类行块 · 点标题折叠 · pri 升序 / severity 降序 · 点击卡片弹窗看详情</span>
   <form class="inline right" method="post" action="{{ url_for('sync_run') }}">
+    <input type="hidden" name="kinds" value="bug,task">
     <button class="btn-primary" type="submit">立即同步禅道</button>
   </form>
+</div>
+
+<div class="inline" style="margin:6px 0 10px">
+  {% for k, label in [('all', '全部条目'), ('bug', '只看缺陷'), ('task', '只看任务')] %}
+  <a class="btn {{ 'btn-primary' if (kind_filter or 'all') == k }}"
+     href="{{ url_for('kanban', kind=k) }}">{{ label }}</a>
+  {% endfor %}
+  <span class="hint">任务编号在系统里一律写成 <code>T&lt;禅道ID&gt;</code>；任务首轮只出方案（G13）。</span>
 </div>
 
 <div class="board">
@@ -32,18 +41,26 @@
           <span class="muted">{{ g.count }} 条</span></h4>
         <div class="cards">
           {% for bug in g.bugs %}
-          <article class="card st-{{ bug.status }}" data-bug-id="{{ bug.id }}">
-            <div class="zt">禅道 #{{ bug.zentao_id }}
+          {% set ref = ('T' ~ bug.zentao_id) if bug.target == 'task' else bug.zentao_id %}
+          <article class="card st-{{ bug.status }}{% if bug.target == 'task' %} card-task{% endif %}"
+                   data-bug-id="{{ bug.id }}" data-target="{{ bug.target }}">
+            <div class="zt">禅道 #{{ ref }}
+              {% if bug.target == 'task' %}<span class="badge badge-task">任务</span>{% endif %}
               <span class="badge badge-{{ BADGE[bug.status] }}">{{ status_labels[bug.status] }}</span>
-              {% if bug.need_open %}<span class="badge badge-yellow">需方案</span>{% endif %}
+              {% if bug.need_open %}
+              <span class="badge badge-yellow">{{ '待确认方案' if bug.target == 'task' else '需方案' }}</span>
+              {% endif %}
             </div>
             <div class="title">{{ bug.title or '(无标题)' }}</div>
             <div class="meta">
               {% if bug.product_name or bug.product_id %}
               <span class="badge badge-blue">{{ bug.product_name or ('产品 ' ~ bug.product_id) }}</span>
               {% endif %}
+              {% if bug.target == 'task' and bug.project_name %}
+              <span class="badge badge-grey">{{ bug.project_name }}</span>
+              {% endif %}
               <span>PRI {{ bug.pri }}</span>
-              <span>S{{ bug.severity }}</span>
+              {% if bug.severity %}<span>S{{ bug.severity }}</span>{% endif %}
               <span>{{ bug.updated_at }}</span>
             </div>
           </article>

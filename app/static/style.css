@@ -145,6 +145,11 @@ main { padding: 18px; }
 .badge-green { background: var(--merged); }
 .badge-dark-green { background: var(--closed); }
 .badge-grey { background: var(--pending); }
+/* A Zentao task runs the same pipeline as a bug; the badge is what tells them
+   apart on every list, and the left border marks the whole card/panel. */
+.badge-task { background: #5b3fd6; }
+.card.card-task { border-left-color: #5b3fd6; border-left-width: 4px; }
+.panel.panel-task { border-left: 4px solid #5b3fd6; }
 
 /* ---- dialog (bug detail / bind form) ---- */
 .dialog { position: fixed; inset: 0; z-index: 60; }

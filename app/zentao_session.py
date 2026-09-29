@@ -51,6 +51,11 @@ MY_BUG_TYPE_BY_BROWSE = {"assigntome": "assignedTo", "assignedtome": "assignedTo
                          "active": "assignedTo", "closedbyme": "closed",
                          "resolvedbyme": "resolved"}
 
+# Same idea for `my->task()`; Zentao names the mode after the person field.
+MY_TASK_TYPE_BY_BROWSE = {"assigntome": "assignedTo", "assignedtome": "assignedTo",
+                          "active": "assignedTo", "unclosed": "assignedTo",
+                          "closedbyme": "closedBy", "finishedbyme": "finishedBy"}
+
 # Endpoints worth probing, in the order a Zentao 12.x install usually answers.
 BUG_URL_CANDIDATES = (
     "/my-bug.json",
@@ -59,11 +64,34 @@ BUG_URL_CANDIDATES = (
     "/bug-browse-assigntome.html",
     "/my-index.json",
 )
+TASK_URL_CANDIDATES = (
+    "/my-task.json",
+    "/my-task.html",
+    "/task-browse-assigntome.json",
+    "/task-view-1.json",
+)
 PRODUCT_URL_CANDIDATES = (
     "/product-index.json",
     "/product-browse.json",
     "/product-index.html",
 )
+
+
+# Zentao answers a refused or malformed write with an HTTP 200 page that redirects
+# the browser instead (`self.location='/user-deny-task-comment.html'`). Trusting the
+# status line alone reported a comment that was never written, so the caller could
+# not tell a delivery from a refusal.
+_DENY_PATTERNS = (
+    re.compile(r"user-deny", re.I),
+    re.compile(r"self\.location\s*=\s*['\"]?/user-", re.I),
+    re.compile(r"(权限不足|无权限|拒绝访问)"),
+)
+
+
+def looks_refused(text: str) -> bool:
+    """True when a 2xx Zentao body is actually a denial page."""
+    head = (text or "")[:600]
+    return any(p.search(head) for p in _DENY_PATTERNS)
 
 
 def _dump_dir() -> Path:
@@ -407,6 +435,104 @@ class ZentaoSessionClient:
                       key=lambda b: (b["pri"], -b["severity"], b["zentao_id"]))
 
     # ------------------------------------------------------------------
+    # tasks
+    # ------------------------------------------------------------------
+    def fetch_assigned_tasks(self, product_ids: Any = None, *, with_detail: bool = True,
+                             max_pages: int = 20) -> list[dict]:
+        """Page through `/my-task-assignedTo-...json` and keep what is mine.
+
+        The list row has no product and only an empty `desc`; the requirement text
+        and the product (which decides the repository) come from `/task-view-*`, so
+        `with_detail` is what makes a task usable at all.
+        """
+        settings = get_settings()
+        self.login()
+        mode = MY_TASK_TYPE_BY_BROWSE.get(settings.zentao_browse_type, "assignedTo")
+        wanted = {int(p) for p in (product_ids or []) if str(p).isdigit()}
+        keep = {s.strip() for s in str(settings.zentao_task_status or "").split(",")
+                if s.strip()}
+        collected: dict[int, dict] = {}
+        for page in range(1, max_pages + 1):
+            path = f"/my-task-{mode}-pri_asc-0-{PER_PAGE}-{page}.json"
+            data = self._json_data(path)
+            rows = data.get("tasks") or []
+            if isinstance(rows, dict):
+                rows = [v for v in rows.values() if isinstance(v, dict)]
+            for row in rows:
+                if not isinstance(row, dict) or str(row.get("deleted") or "0") != "0":
+                    continue
+                task = self.normalize_task(row)
+                if not task["zentao_id"]:
+                    continue
+                if task["assigned_to"] and task["assigned_to"].lower() != self.account.lower():
+                    continue
+                if keep and task["zentao_status"] and task["zentao_status"] not in keep:
+                    continue
+                collected[task["zentao_id"]] = task
+            pager = data.get("pager") or {}
+            total_pages = int(pager.get("pageTotal") or page)
+            if not rows or page >= total_pages:
+                break
+        if with_detail:
+            names = {}
+            try:
+                names = {p["id"]: p["name"] for p in self.list_products()}
+            except ZentaoError:
+                names = {}
+            for zid, task in list(collected.items()):
+                try:
+                    detail = self.get_task_detail(zid, download=False)
+                except ZentaoError:
+                    continue
+                merged = dict(task)
+                for key, value in detail.items():
+                    if key == "raw_json":
+                        merged["raw"] = value
+                    elif value not in (None, "", 0):
+                        merged[key] = value
+                if not merged.get("product_name") and merged.get("product_id"):
+                    merged["product_name"] = names.get(int(merged["product_id"]), "")
+                collected[zid] = merged
+        if wanted:
+            # A task without a resolvable product cannot be routed to a repository,
+            # so filtering it out here is honest; silently keeping it would let the
+            # executor commit a task's change into whichever repo happens to be next.
+            collected = {zid: t for zid, t in collected.items()
+                         if int(t.get("product_id") or 0) in wanted}
+        return sorted(collected.values(),
+                      key=lambda t: (t["pri"], -int(t.get("story_id") or 0), t["zentao_id"]))
+
+    def normalize_task(self, raw: dict) -> dict:
+        """Map a `/my-task-*` row onto the internal task shape."""
+        deadline = str(raw.get("deadline") or "")
+        if deadline.startswith("0000"):
+            deadline = ""
+        return {
+            "zentao_id": int(raw.get("id") or 0),
+            "title": _strip_html(str(raw.get("name") or ""))[:500],
+            "pri": int(raw.get("pri") or 3),
+            "steps": _strip_html(str(raw.get("desc") or "")),
+            # Zentao uses module id 0 for "no module"; keeping the digit would show
+            # up as a module named "0" on the card.
+            "module": "" if str(raw.get("module") or "0") == "0" else str(raw.get("module")),
+            "project_id": int(raw.get("project") or raw.get("projectID") or 0),
+            "project_name": _clean_name(raw.get("projectName") or ""),
+            "story_id": int(raw.get("storyID") or raw.get("story") or 0),
+            "story_title": _strip_html(str(raw.get("storyTitle") or "")),
+            "assigned_to": str(raw.get("assignedTo") or ""),
+            "assigned_to_name": _clean_name(raw.get("assignedToRealName") or ""),
+            "opened_by": str(raw.get("openedBy") or ""),
+            "opened_date": str(raw.get("openedDate") or ""),
+            "zentao_status": str(raw.get("status") or ""),
+            "deadline": deadline,
+            "estimate": str(raw.get("estimate") or ""),
+            "need_confirm": bool(raw.get("needConfirm")),
+            "product_id": int(raw.get("product") or 0) if str(raw.get("product") or "").isdigit() else 0,
+            "product_name": "",
+            "raw": raw,
+        }
+
+    # ------------------------------------------------------------------
     # bug detail: screenshots, notes, attachments
     # ------------------------------------------------------------------
     def get_bug_detail(self, zentao_id: int, *, download: bool | None = None) -> dict:
@@ -424,24 +550,49 @@ class ZentaoSessionClient:
         if download:
             self.download_attachments(zentao_id, detail["attachments"])
         # Point the inline markers at the local copy so the AI can open them.
-        for item in detail["attachments"]:
+        self._repoint_images(detail)
+        return detail
+
+    def get_task_detail(self, zentao_id: int, *, download: bool | None = None) -> dict:
+        """Fetch `/task-view-{id}.json`: story spec text, notes, attachments, product."""
+        self.login()
+        node = self._json_data(f"/task-view-{zentao_id}.json")
+        detail = parse.build_task_detail(node, zentao_id)
+        if download is None:
+            download = get_settings().download_attachments
+        if download:
+            from .db import item_slug
+            self.download_attachments(zentao_id, detail["attachments"],
+                                      slug=item_slug(zentao_id, "task"))
+        self._repoint_images(detail)
+        return detail
+
+    @staticmethod
+    def _repoint_images(detail: dict) -> None:
+        """Swap a remote file URL for the local copy, so the reader can open it."""
+        for item in detail.get("attachments") or []:
             web = item.get("web_path")
             url = item.get("url")
             if web and url:
                 detail["steps"] = detail["steps"].replace(url, web)
-        return detail
 
-    def download_attachments(self, bug_id: int, attachments: list[dict]) -> list[dict]:
-        """Save screenshots/uploads under `attachments/zentao-<id>/`."""
+    def download_attachments(self, bug_id: int, attachments: list[dict],
+                             slug: str | None = None) -> list[dict]:
+        """Save screenshots/uploads under `attachments/zentao-<slug>/`.
+
+        A task and a bug may share a Zentao number, so the folder is keyed on a
+        slug the caller chooses (`T5417` for a task) instead of the bare number.
+        """
         settings = get_settings()
-        target = Path(settings.attachment_dir) / f"zentao-{bug_id}"
+        folder = str(slug if slug is not None else bug_id)
+        target = Path(settings.attachment_dir) / f"zentao-{folder}"
         for item in attachments:
             url = str(item.get("url") or "")
             if not url:
                 continue
             filename = str(item.get("filename") or f"{item.get('file_id')}.bin")
             dest = target / filename
-            item["web_path"] = f"/files/{bug_id}/{filename}"
+            item["web_path"] = f"/files/{folder}/{filename}"
             if dest.exists() and dest.stat().st_size > 0:
                 item["local_path"] = str(dest)
                 item["size"] = dest.stat().st_size
@@ -485,19 +636,38 @@ class ZentaoSessionClient:
     # ------------------------------------------------------------------
     # writes
     # ------------------------------------------------------------------
-    def add_comment(self, bug_id: int, comment: str, *, extra: dict | None = None) -> dict:
-        """Post one comment. Deliberately NOT retried: a lost 5xx response may
-        still have been applied, and a duplicate comment on a tracked bug is
-        worse than the caller reporting a failed push."""
+    def add_comment(self, bug_id: int, comment: str, *, extra: dict | None = None,
+                    target: str = "bug") -> dict:
+        """Post one comment on a bug or a task.
+
+        Deliberately NOT retried: a lost 5xx response may still have been applied,
+        and a duplicate comment on a tracked item is worse than the caller
+        reporting a failed push.
+        """
         del extra
         self.login()
-        candidates = [f"/bug-comment-{bug_id}.json", f"/bug-comment-{bug_id}.html"]
+        settings = get_settings()
+        page = "task" if target == "task" else "bug"
+        candidates = []
+        override = (settings.zentao_task_comment_path if target == "task"
+                    else settings.zentao_comment_path)
+        if override:
+            candidates.append(override.format(item_id=bug_id, bug_id=bug_id, task_id=bug_id))
+        candidates.append(f"/{page}-comment-{bug_id}.json")
+        if target == "task":
+            # Zentao's comment page needs the action row the note hangs under; the
+            # bug route defaults it, the task route answers the bare form with a
+            # `user-deny` page, so the numbered form is tried right after it.
+            action_id = self.latest_action_id(bug_id)
+            if action_id:
+                candidates.append(f"/{page}-comment-{bug_id}-{action_id}.json")
+        candidates.append(f"/{page}-comment-{bug_id}.html")
         errors: list[str] = []
         for path in candidates:
             try:
                 resp = self.session.post(
                     f"{self.base_url}{path}", data={"comment": comment}, timeout=self.timeout,
-                    headers={"Referer": f"{self.base_url}/bug-view-{bug_id}.html",
+                    headers={"Referer": f"{self.base_url}/{page}-view-{bug_id}.html",
                              "Origin": self.base_url,
                              "X-Requested-With": "XMLHttpRequest",
                              "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
@@ -505,10 +675,28 @@ class ZentaoSessionClient:
             except requests.RequestException as exc:
                 errors.append(f"{path}: {exc}")
                 continue
-            if resp.status_code < 400 and "locate" not in (resp.text or "")[:400]:
-                return {"endpoint": path, "result": (resp.text or "")[:200]}
-            errors.append(f"{path}: HTTP {resp.status_code} {(resp.text or '')[:120]}")
+            body = resp.text or ""
+            if resp.status_code >= 400:
+                errors.append(f"{path}: HTTP {resp.status_code} {body[:120]}")
+                continue
+            if "locate" in body[:400] and "user-login" in body:
+                raise ZentaoError("会话已失效（评论被要求重新登录）：请重新粘贴 ZENTAO_COOKIE")
+            if looks_refused(body):
+                errors.append(f"{path}: 禅道拒收（返回拒绝页）")
+                continue
+            return {"endpoint": path, "result": body[:200]}
         raise ZentaoError("会话评论写入失败：" + " | ".join(errors))
+
+    def latest_action_id(self, task_id: int) -> int:
+        """The newest action row of a task, which is what a note hangs under."""
+        try:
+            node = self._json_data(f"/task-view-{task_id}.json")
+        except ZentaoError:
+            return 0
+        actions = node.get("actions")
+        rows = list(actions.values()) if isinstance(actions, dict) else (actions or [])
+        ids = [int(r.get("id") or 0) for r in rows if isinstance(r, dict)]
+        return max([i for i in ids if i] or [0])
 
     # ------------------------------------------------------------------
     # helpers

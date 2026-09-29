@@ -202,6 +202,92 @@ def build_detail(node: dict, zentao_id: int | None = None) -> dict:
     }
 
 
+def build_task_detail(node: dict, zentao_id: int | None = None) -> dict:
+    """Expand a `/task-view-*` payload into the columns the `tasks` table stores.
+
+    A task carries almost nothing itself: its real requirement text sits in the
+    linked story's spec, and the product (which decides the repository) only shows
+    up on the action rows and the module path. Both are folded in here so the
+    executor sees one readable body and a product id it can bind a repo to.
+    """
+    task = node.get("task") if isinstance(node.get("task"), dict) else node
+    desc_html = str(task.get("desc") or "")
+    spec_html = str(task.get("storySpec") or "")
+    parts: list[str] = []
+    if _has_body(desc_html):
+        parts.append(desc_html)
+    if _has_body(spec_html):
+        parts.append("<p>[需求说明 storySpec]</p>" + spec_html)
+    steps_html = "\n".join(parts)
+    images = extract_images(steps_html)
+    assigned = str(task.get("assignedTo") or "")
+    project = node.get("project") if isinstance(node.get("project"), dict) else {}
+    product = node.get("product") if isinstance(node.get("product"), dict) else {}
+    deadline = str(task.get("deadline") or "")
+    if deadline.startswith("0000"):
+        deadline = ""
+    return {
+        "zentao_id": int(task.get("id") or zentao_id or 0),
+        "title": _plain(str(task.get("name") or ""))[:500],
+        "pri": int(task.get("pri") or 3),
+        "steps": steps_to_text(steps_html),
+        "steps_html": steps_html,
+        "comments": actions_to_comments(node.get("actions")),
+        "attachments": files_to_attachments(task.get("files"), images),
+        "module": module_path_names(node.get("modulePath")),
+        "project_id": int(task.get("project") or project.get("id") or 0),
+        "project_name": _plain(str(project.get("name") or task.get("projectName") or "")),
+        "story_id": int(task.get("storyID") or task.get("story") or 0),
+        "story_title": _plain(str(task.get("storyTitle") or "")),
+        "product_id": task_product_id(node, task),
+        "product_name": _plain(str(product.get("name") or "")),
+        "assigned_to": assigned,
+        "assigned_to_name": realname(node.get("users"), assigned),
+        "opened_by": str(task.get("openedBy") or ""),
+        "opened_date": str(task.get("openedDate") or ""),
+        "zentao_status": str(task.get("status") or ""),
+        "deadline": deadline,
+        "estimate": str(task.get("estimate") or ""),
+        "need_confirm": bool(task.get("needConfirm")),
+        "raw_json": task,
+    }
+
+
+def task_product_id(node: dict, task: dict) -> int:
+    """Which product a task belongs to, i.e. which repository must carry the fix.
+
+    Zentao keeps it off the task row: the action log records it as `",25,"` and the
+    module path records the story tree's root, which is the same product id.
+    """
+    items = node.get("actions")
+    rows = items.values() if isinstance(items, dict) else (items or [])
+    for action in rows:
+        if not isinstance(action, dict):
+            continue
+        for digits in re.findall(r"\d+", str(action.get("product") or "")):
+            if int(digits) > 0:
+                return int(digits)
+    path = node.get("modulePath")
+    nodes = path.values() if isinstance(path, dict) else (path or [])
+    for module in nodes:
+        if isinstance(module, dict) and str(module.get("root") or "").isdigit():
+            return int(module["root"])
+    return int(task.get("product") or 0) if str(task.get("product") or "").isdigit() else 0
+
+
+def module_path_names(path: object) -> str:
+    """"对象 / URL识别" from Zentao's `modulePath` list; "" when there is none."""
+    nodes = path.values() if isinstance(path, dict) else (path or [])
+    names = [_plain(str(node.get("name"))).strip()
+             for node in nodes if isinstance(node, dict) and node.get("name")]
+    return " / ".join([n for n in names if n][-2:])
+
+
+def _has_body(html: str) -> bool:
+    """True when an editor field holds something a human would read."""
+    return bool(_plain(html or "").strip())
+
+
 def _plain(text: str) -> str:
     """Drop tags and decode entities; Zentao escapes names twice ("A&amp;amp;B")."""
     clean = re.sub(r"<[^>]+>", " ", text or "")

@@ -20,7 +20,7 @@ from app.web import app
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="禅道 Bug 自动修复闭环系统 Web 控制台")
+    parser = argparse.ArgumentParser(description="禅道 Bug / 任务 自动修复闭环系统 Web 控制台")
     parser.add_argument("--host", default=None, help="覆盖 WEB_HOST")
     parser.add_argument("--port", type=int, default=None, help="覆盖 WEB_PORT")
     parser.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
 
     db.init_db()
     print("=" * 62)
-    print(" 禅道 Bug 自动修复闭环系统")
+    print(" 禅道 Bug / 任务 自动修复闭环系统")
     print(f"   数据库 : {db.db_path()}")
     print(f"   访问地址: {url}")
     print(f"   禅道   : {settings.zentao_base_url or '未配置（请编辑 .env）'}")

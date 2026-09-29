@@ -2,7 +2,7 @@
 {% block content %}
 <div class="page-head">
   <h2>SVN 提交记录</h2>
-  <span class="muted">按 bug 分组，同一 bug 的多次提交连续排列，便于回溯</span>
+  <span class="muted">按条目（缺陷 / 任务）分组，同一条目的多次提交连续排列，便于回溯；任务编号带 T 前缀</span>
   <span class="right">
     <a class="btn" href="{{ url_for('svn_check') }}">当前仓库自检</a>
     <a class="btn" href="{{ url_for('svn_check', all=1) }}">全部仓库自检</a>
@@ -45,13 +45,15 @@
 
 {% if groups %}
   {% for g in groups %}
-  <div class="panel">
-    <h3>禅道 #{{ g.zentao_id }} · {{ g.title }}
-      <span class="badge badge-{{ {'pending':'grey','fixing':'blue','need_solution':'yellow','await_review':'orange','rejected':'red','merged':'green','closed':'dark-green'}[g.bug_status] }}">
-        {{ status_labels[g.bug_status] }}
+  {% set ref = ('T' ~ g.zentao_id) if g.target == 'task' else g.zentao_id %}
+  <div class="panel{% if g.target == 'task' %} panel-task{% endif %}">
+    <h3>禅道 #{{ ref }} · {{ g.title }}
+      {% if g.target == 'task' %}<span class="badge badge-task">任务</span>{% endif %}
+      <span class="badge badge-{{ {'pending':'grey','fixing':'blue','need_solution':'yellow','await_review':'orange','rejected':'red','merged':'green','closed':'dark-green'}[g.item_status] }}">
+        {{ status_labels[g.item_status] }}
       </span>
       <span class="muted" style="font-weight:400;font-size:12px">分支 <code>{{ g.branch or '-' }}</code></span>
-      <a class="btn" style="float:right" href="#/bug/{{ g.bug_id }}">弹窗看完整详情</a>
+      <a class="btn" style="float:right" href="#/item/{{ g.target }}/{{ g.item_id }}">弹窗看完整详情</a>
     </h3>
     <table class="grid">
       <thead><tr><th style="width:110px">提交号</th><th style="width:150px">时间</th><th style="width:110px">作者</th><th>提交说明 / 修改文件</th></tr></thead>

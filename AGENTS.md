@@ -4,7 +4,10 @@
 
 ## 系统位置与工具
 
-- 数据库：`bug_system.db`（项目根目录，表：`bugs` / `analyses` / `need_solution` / `svn_revisions` / `reviews` / `sync_log` / `product_repos` / `meta`）
+- 数据库：`bug_system.db`（项目根目录）。缺陷一套表、任务一套表，流程一样、编号各自独立：
+  `bugs` / `tasks`，子表按父表分开放 —— `analyses`+`task_analyses`、`need_solution`+`task_needs`、
+  `svn_revisions`+`task_revisions`、`reviews`+`task_reviews`，另有 `sync_log` / `product_repos` / `meta`；
+  任务表里 `task_needs.need_kind` 取 `plan`（等主人确认的修改细则）或 `block`（实现中卡住）
 - 配置：`.env`（禅道地址、账号、密码、`ZENTAO_AUTH_MODE`，SVN 客户端与全局回落仓库）；
   里面的 `SVN_USERNAME` / `SVN_PASSWORD` 是**给主人的回灌动作用的**，执行器不得拿它们做任何远端写入
 - 禅道通道：`ZENTAO_AUTH_MODE=session`（本机 api.php 被网关拦截，走会话登录 + `/xxx.json` 内部接口）；
@@ -16,33 +19,41 @@
 - 执行器命令（全部输出 JSON，直接读结果，不要猜）：
 
 ```
-python -m app.cli sync                 # 拉取禅道指派给我的 active bug（文字部分）
+python -m app.cli sync                 # 拉取禅道指派给我的 active bug 与未关闭 task（文字部分）
+python -m app.cli sync --kinds task    # 只拉任务；--kinds bug 只拉缺陷（默认两种都拉）
 python -m app.cli sync --details 5     # 顺便把队首 5 条的截图/备注/附件也抓下来
-python -m app.cli sync --details -1    # 全量：所有未关闭 bug 的截图/备注/附件
+python -m app.cli sync --details -1    # 全量：所有未关闭条目的截图/备注/附件
 python -m app.cli detail --all         # 全量补抓详情（同上，独立执行）
 python -m app.cli detail --limit 20    # 只补抓优先级最高的 20 条
-python -m app.cli tasks --limit 5      # 取本轮待处理队列
-python -m app.cli detail <禅道ID>       # 抓单条 bug 的截图、备注、附件（下载到 attachments/）
-python -m app.cli status <禅道ID>       # 读 bug 全文 + 历史 SVN + owner_reply + 所属产品
-python -m app.cli repos                # 看每个产品实际用哪个仓库、工作副本在哪
+python -m app.cli detail --kinds task --no-images   # 只补任务详情（正文挂在关联需求上，必须抓才有需求）
+python -m app.cli tasks --limit 5      # 取本轮待处理队列（缺陷与任务合并排序，每条带 kind / queue_kind）
+python -m app.cli detail <禅道ID|T任务ID>  # 抓单条条目的截图、备注、附件（下载到 attachments/zentao-<编号>/）
+python -m app.cli status <禅道ID|T任务ID>  # 读全文 + 历史提交 + owner_reply + 所属产品；任务还看 plan_approved
+python -m app.cli repos                # 看每个产品实际用哪个仓库、工作副本在哪、各有几条缺陷/任务
 python -m app.cli bind-repo <产品ID> <仓库地址> --name "产品名" --working-copy "<镜像目录>" --svn-working-copy "<正式SVN工作副本>" --build "编译命令" --test "测试命令"
-python -m app.cli claim <禅道ID>          # 占住任务（置 fixing），防止重复领
-python -m app.cli i18n-up <禅道ID> [--files a.po,b.mo]
+python -m app.cli claim <编号>         # 占住任务（置 fixing），防止重复领
+python -m app.cli plan T<任务ID> --question "<需求理解 + 修改细则>" --options "方案A：…；方案B：…" --advice "建议A，因为…"
+                                       # 【任务第一轮的唯一产出】登记待确认方案（G13）；确认前不许落码
+python -m app.cli i18n-up <编号> [--files a.po,b.mo]
                                           # 改多语言文件前先 svn update（G12：只碰白名单词条文件）
-python -m app.cli i18n-commit <禅道ID> --files a.po,b.mo --message "补充 xx 词条"
-                                          # 多语言文件单独、立即提交 SVN（G12），真实 r 号自动登记；不改 bug 状态
-python -m app.cli branch <禅道ID>          # 【托管 svn 方式】在该产品仓库里建/切分支；默认不用（见「职责边界」）
-python -m app.cli note <禅道ID> --summary "修复说明" --verify "验证步骤" --files a.py,b.py
-python -m app.cli analyze <禅道ID> --kind commit --analysis-file a.json
+python -m app.cli i18n-commit <编号> --files a.po,b.mo --message "补充 xx 词条"
+                                          # 多语言文件单独、立即提交 SVN（G12），真实 r 号自动登记；不改条目状态
+python -m app.cli branch <编号>        # 【托管 svn 方式】在该产品仓库里建/切分支；默认不用（见「职责边界」）
+python -m app.cli note <编号> --summary "修复说明" --verify "验证步骤" --files a.py,b.py
+python -m app.cli analyze <编号> --kind commit --analysis-file a.json
                                           # 写入分析结论（根因/证据/链路/影响面/验证/未验证/闸门逐条）
-python -m app.cli commit <禅道ID> --message "空指针未判空导致崩溃" --files a.py,b.py --no-svn --revision git:1a2b3c4 --analysis-file a.json
+python -m app.cli commit <编号> --message "空指针未判空导致崩溃" --files a.py,b.py --no-svn --revision git:1a2b3c4 --analysis-file a.json
                                           # 默认写法：分析 + 登记本地 git 哈希 + await_review + 回写禅道评论
-python -m app.cli block <禅道ID> --question "卡在哪一步" --options "方案A：...；方案B：..." --advice "建议A，因为..."
-python -m app.cli need-done <need_id>      # 关闭已答复的阻塞项
+python -m app.cli block <编号> --question "卡在哪一步" --options "方案A：...；方案B：..." --advice "建议A，因为..."
+python -m app.cli need-done <need_id|T<need_id>>   # 关闭已答复的阻塞项/方案（T 前缀=任务那张表）
 python -m app.cli svn-check --all          # 逐仓库只读自检（客户端/可达/trunk/工作副本）
-python -m app.cli report                   # 汇总报告
+python -m app.cli report                   # 汇总报告（缺陷与任务合在一起，任务编号带 T）
 python -m app.cli doctor                   # 禅道通道分步诊断
 ```
+
+**编号写法只有一条规则**：缺陷写纯数字（`41468`），任务写 `T` + 禅道任务号（`T5417`）。
+禅道给两者各发一套独立序列，`bug 5417` 与 `task 5417` 可以同时存在，所以分表存放、命令按前缀分流；
+把任务号写成纯数字，命令会明确回「找不到条目」而不是猜。
 
 `commit --no-svn --revision <号>` 一条命令会完成：写 `svn_revisions` → 置 `await_review` → 回写禅道评论
 （`<号>` 用 `git:<短哈希>` 表示「已本地提交、未进正式库」，用 `r<号>` 表示主人已真实提交；
@@ -51,10 +62,15 @@ python -m app.cli doctor                   # 禅道通道分步诊断
 
 ## 启动流程
 
-1. 同步禅道：调用禅道 API，拉取指派给我的待修复 bug，写入 bugs 表（status=pending）
-2. 从数据库读取 status in (pending, replied) 的 bug，按优先级排序（pri 升序、severity 降序）
+1. 同步禅道：调用禅道接口，拉取指派给我的待修复 bug（active）与我的任务（未关闭，默认 `wait,doing`），
+   分别写入 `bugs` / `tasks` 表（status=pending）；任务的产品归属从 `/task-view-<id>.json` 的动作记录里取，
+   取不到产品的任务不入库（没有产品就没有可落码的仓库）
+2. 从数据库读取 status in (pending, replied) 的条目，按优先级排序（pri 升序、severity 降序；任务无 severity）
 3. 每批最多处理 5 个，处理完自动取下一批
-4. 下达方式、可复制的主循环与子任务指令、**提交闸门 G1–G12** 见 `AUTO_LOOP.md`
+4. **两种条目差一道闸门**：缺陷可以直接进入实现；任务第一轮只出方案（`plan T<id>`），
+   主人在「需方案」页确认之后（队列里 `queue_kind=plan_approved`）才允许 `checkout` / 改码 / `draft` / `commit`
+   —— 这不是建议而是硬拦，未确认时上面几条命令会直接拒绝（`AUTO_LOOP.md` G13）
+5. 下达方式、可复制的主循环与子任务指令、**提交闸门 G1–G13** 见 `AUTO_LOOP.md`
 
 ## 职责边界（先读这条）
 
@@ -187,9 +203,10 @@ python -m app.cli doctor                   # 禅道通道分步诊断
    报冲突就转 `block`）→ 在 `svn_working_copy` 那份正式副本里只改这些词条文件 →
    `python -m app.cli i18n-commit <禅道ID> --files <同一批文件> --message "<说明>"` 立即单独提交。
    词条不进镜像、不跟代码混进同一次 `git commit` / `svn ci`，也不允许攒到这条 bug 收尾之后
-9. **逐条核对提交闸门**（`AUTO_LOOP.md` §2 的 G1–G12：详情与截图看过、根因明确、改动范围与产品仓库一致、
+9. **逐条核对提交闸门**（`AUTO_LOOP.md` §2 的 G1–G13：详情与截图看过、根因明确、改动范围与产品仓库一致、
    构建通过、状态矩阵自审、文案与 i18n 同步、目标是 bugfix 分支非 trunk、message 规范无敏感串、
-   未验证路径已标注、所需授权已取得、**远端写入留给主人**、**多语言词条走直连通道**）
+   未验证路径已标注、所需授权已取得、**远端写入留给主人**、**多语言词条走直连通道**、
+   **任务是编号带 T 的条目时方案必须已被主人确认**）
 10. 闸门全过 → **`python -m app.cli draft <禅道ID> --message "fix #<禅道ID> <一句话根因>" --files a.c,b.c`**
     （镜像里的本地提交：只 add 列出的这几个路径，返回短哈希当登记的修订号；说明不以 `fix #<ID>`
     开头、清单为空、HEAD 不在这条分支上、暂存无变化，它都会直接拒），
@@ -202,7 +219,7 @@ python -m app.cli doctor                   # 禅道通道分步诊断
 11. **写分析结论**（这是 bug 完成的必交付物，`REQUIRE_ANALYSIS=true` 时没分析 commit 会被直接拒绝）：
     把结果写成 JSON 文件（字段：`symptom` 现象、`root_cause` 根因、`evidence` 真实读过的文件:行/日志、
     `call_chain` 链路、`change_desc` 改动、`impact` 影响面与同构路径自审、`verify` 验证方式与实际结果、
-    `unverified` 未验证项、`rollback` 回退、`conclusion` 一句话结论、`gates` G1–G12 逐条结论），
+    `unverified` 未验证项、`rollback` 回退、`conclusion` 一句话结论、`gates` G1–G13 逐条结论），
     词条那次 `r<号>` 要写进 `change_desc`，规范见 `AUTO_LOOP.md` §2.2；
     **写完不用你去删那个文件** —— 命令入库成功后会把它回收（见禁止事项 32）
 12. 回到本系统登记（一条命令同时写入分析与修订号：存 `analyses` → 写 `svn_revisions` →
@@ -262,6 +279,29 @@ python -m app.cli block <禅道ID> --question "..." --options "..." --advice "..
    新的修订号会自动追加到同一个 bug 名下而不是覆盖
 4. 更新 bugs 表 status=await_review
 
+## 任务（task）处理流程：第一轮只出方案，确认后才实现
+
+禅道任务与缺陷走**同一条流水线**（排队 → 草稿提交 → 待审查 → 主人推 SVN），只多一道 **G13** 闸门：
+任务第一轮**只交「需求理解 + 修改细则」**，主人才是拍板的人；没拍板之前不许动一行代码。
+
+1. `python -m app.cli status T<任务ID>` —— 返回里的 `plan_approved` 决定这一轮做什么：
+   - `false`（第一轮，或方案还没被确认）→ **只做第 2 步然后结束这一条**
+   - `true`（主人已确认/已改细则）→ 从第 3 步往下走缺陷那套流程
+   - 任务正文常是空的：真正的需求挂在**关联需求**上（返回里的 `steps` 带 `[需求说明 storySpec]` 一段，
+     截图同一条通道拉回本地），只读 `desc` 会漏掉整个需求
+2. 出方案：`python -m app.cli plan T<任务ID> --question "<需求理解 + 要动的文件/入口/口径 + 边界与回滚>"
+   --options "方案A：…；方案B：…" --advice "<建议与理由>" --conclusion "<一句话方案结论>"
+   --impact "<预计影响面>"`（长文本写 JSON 用 `--plan-file` 交，命令入库后自己回收该文件）
+   → 落 `task_needs(need_kind='plan', status='awaiting')` + 条目置 `need_solution` + 禅道任务下留言，
+   然后**立即继续下一条**，不空等主人
+3. 已确认的任务（`queue_kind=plan_approved`）：完全按「单个 bug 处理流程」第 3~12 步做，
+   实现口径以 `owner_reply` 的**原文**为准；实现过程中发现确认的方案不成立（要改口径、要动别的模块、
+   需求本身缺条件）→ 不要静默改口径，`block`（`need_kind='block'`）写清哪里与方案冲突，回到等主人
+4. 草稿分支是 `bugfix/zentao-T<任务ID>`（缺陷是 `bugfix/zentao-<禅道ID>`，同一镜像里不会撞车）；
+   提交说明用 `feat #<任务ID> <说明>`（缺陷是 `fix #<禅道ID> <说明>`，G8）
+5. 未确认时 `checkout` / `draft` / `commit` 会被命令直接拒绝并回指 `plan` —— 这是设计，
+   不许重试、不许换裸 git 绕、更不许把 `plan` 的内容当已批准去实现
+
 ## 禁止事项
 
 1. 禁止合入 trunk / merge 到主分支
@@ -279,7 +319,7 @@ python -m app.cli block <禅道ID> --question "..." --options "..." --advice "..
 9. 一次只处理一个 bug 的代码改动，改动文件必须通过 `--files` 登记，供人工审查
 10. 禁止把 bug 提交到不属于它所在产品的仓库；仓库没绑定就问主人要地址，不要拿别的产品的工作副本凑
 11. 禁止绕过目标代码库自己的提交细则执行 svn（包括它规定的 SSH 通道、只读白名单、需显式同意的写操作）
-12. 禁止在提交闸门 G1–G12 未逐条核对通过的情况下提交；不过就 `block`，不「先提交再说」
+12. 禁止在提交闸门 G1–G13 未逐条核对通过的情况下提交；不过就 `block`，不「先提交再说」
 13. 禁止把 `--revision PENDING` 当已完成：它只是待人工提交的占位，必须在 `--extra` 与回报里写明
 14. 禁止没有分析结论就 `commit`（`REQUIRE_ANALYSIS=true` 时系统直接拒绝）；分析里禁止写没真正读过的文件路径
 15. **禁止任何远端写入**：`git svn dcommit`、`git push`、`svn ci`、`svn copy`、merge 到 trunk 一律由主人做。
@@ -343,10 +383,14 @@ python -m app.cli block <禅道ID> --question "..." --options "..." --advice "..
     跑完统一 `python -m app.cli tmp-clean` 报告、`--apply` 回收，`report` 也会列出遗留。
     `tmp-clean` 只认项目根下 `a_<数字>.json` / `blk_<数字>.json` / `py_<数字>.py` / `_tmp_*` 这些命名，
     且**分析没入库的 `a_<ID>.json` 它会留着只报告**，不吞掉唯一一份结论
+33. **禁止把任务当缺陷做**：任务（`T<任务ID>`）第一轮只许 `plan` 出「需求理解 + 修改细则」，
+    主人没确认之前不许 `checkout` / 改码 / `draft` / `commit`（G13，命令也会直接拒绝你）；
+    也不许把 `plan` 里自己写的建议当成已批准 —— 批准只来自主人答复（`owner_reply`）。
+    反过来也不许给缺陷瞎出方案：缺陷没有 `plan` 这一步，能修就修、修不动就 `block`
 
 ## 停止条件
 
-1. 所有 pending 和 replied 的 bug 都已处理完（`tasks --limit 1` 返回空）
+1. 所有 pending 和 replied 的条目（缺陷 + 已确认的任务）都已处理完（`tasks --limit 1` 返回空）
 2. 收口前跑一次 `python -m app.cli reconcile`：镜像上有草稿提交、库里没登记的（子任务崩在收口前），
    它按条点名 —— 别靠记忆，也别让那条永远停在 `fixing`
 3. 收口时跑一次 `python -m app.cli tmp-clean --apply` 回收本次留下的交接文件；

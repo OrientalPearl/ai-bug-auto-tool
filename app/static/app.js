@@ -1,5 +1,5 @@
-// Shared UI: bug / form dialogs driven by the URL hash (so "back" always works),
-// plus collapsible kanban bands.
+// Shared UI: item (bug / task) and form dialogs driven by the URL hash (so "back"
+// always works), plus collapsible kanban bands.
 (function () {
   const LABELS = {
     pending: "待处理", fixing: "修复中", need_solution: "需方案",
@@ -25,7 +25,7 @@
     ["影响面", "impact"], ["验证方式与结果", "verify"], ["未验证项", "unverified"],
     ["回退方式", "rollback"]
   ];
-  const KIND_LABELS = { commit: "修复完成时", block: "卡点时", manual: "人工补记" };
+  const KIND_LABELS = { commit: "修复完成时", block: "卡点时", plan: "给方案时", manual: "人工补记" };
 
   function renderAnalysis(a) {
     if (!a) return "";
@@ -58,12 +58,19 @@
   }
 
   // AUTO_LOOP.md G8 shape for the real svn log message; the owner edits it before
-  // pushing, so it is only a starting point that already carries the bug number.
+  // pushing, so it is only a starting point that already carries the item number.
+  // A task's line starts with feat, a bug's with fix.
   function pushMessage(b) {
     const a = b.analysis || {};
     const one = String(a.conclusion || b.fix_summary || b.title || "")
       .split("\n")[0].trim();
-    return `fix #${b.zentao_id} ${one}`.slice(0, 200).trim();
+    const verb = b.target === "task" ? "feat" : "fix";
+    return `${verb} #${b.zentao_id} ${one}`.slice(0, 200).trim();
+  }
+
+  function action(path, b) {
+    // Every per-item route defaults to "bug"; a task has to say which table to open.
+    return `/bug/${b.id}/${path}?kind=${b.target || "bug"}`;
   }
 
   function renderBug(b) {
@@ -71,7 +78,8 @@
       `<li><b>${esc(revLabel(r.revision))}</b> · ${esc(r.created_at)} · ${esc(r.branch || b.branch || "")}<br>${esc(r.message)}</li>`
     ).join("");
     const needs = (b.needs || []).map(n => `
-      <li><b>[${esc(LABELS[n.status] || n.status)}]</b> ${esc(n.question)}
+      <li><b>[${esc(LABELS[n.status] || n.status)}]</b>${n.need_kind === "plan" ? " <b>方案</b>" : ""}
+        ${esc(n.question)}
         ${n.ai_options ? `<br>可选方案：${esc(n.ai_options)}` : ""}
         ${n.ai_advice ? `<br>AI 建议：${esc(n.ai_advice)}` : ""}
         ${n.owner_reply ? `<br><span style="color:#188038">主人答复：${esc(n.owner_reply)}</span>` : ""}
@@ -97,20 +105,29 @@
                         : esc(a.name || a.filename)}
        <span class="muted">${a.size ? (a.size / 1024).toFixed(0) + "KB" : ""}</span></li>`).join("");
 
+    const isTask = b.target === "task";
+    const slug = isTask ? `T${b.zentao_id}` : `${b.zentao_id}`;
     let html = `
-      <h4>缺陷描述 / 复现步骤</h4>
-      <pre>${esc(b.steps || "(禅道未提供描述，或尚未同步详情)")}</pre>`;
+      <h4>${isTask ? "需求描述（任务正文 + 关联需求的 SPEC）" : "缺陷描述 / 复现步骤"}</h4>
+      <pre>${esc(b.steps || (isTask ? "（禅道这条任务没有描述，也没有关联需求）"
+                                    : "(禅道未提供描述，或尚未同步详情)"))}</pre>`;
+
+    if (isTask && !b.plan_approved) {
+      html += `<p class="hint" style="color:#b3261e">这条任务还没有已确认的方案：`
+        + `AI 只能先出方案（<code>python -m app.cli plan ${esc(slug)}</code>），`
+        + `确认前 checkout / draft / commit 会被命令拒绝（AUTO_LOOP.md G13）。</p>`;
+    }
 
     if (!b.detail_synced_at) {
       html += `
-        <form method="post" action="/bug/${b.id}/detail" class="row-actions"
-              data-confirm="将从禅道拉取该 bug 的完整描述、截图和备注，确认？">
+        <form method="post" action="${action("detail", b)}" class="row-actions"
+              data-confirm="将从禅道拉取这条${isTask ? "任务的正文、截图和备注" : " bug 的完整描述、截图和备注"}，确认？">
           <button class="btn btn-primary" type="submit">拉取截图 / 备注 / 附件</button>
           <span class="hint">列表同步只带回了文字描述，截图与备注需要按条拉取。</span>
         </form>`;
     } else {
       html += `<p class="hint">详情更新于 ${esc(b.detail_synced_at)}；
-        <form method="post" action="/bug/${b.id}/detail" style="display:inline">
+        <form method="post" action="${action("detail", b)}" style="display:inline">
           <button class="btn" type="submit">重新拉取</button>
         </form></p>`;
     }
@@ -127,7 +144,10 @@
 
     html += `
       <h4>基本信息</h4>
-      <pre>模块：${esc(b.module || "-")}    产品：${esc(b.product_name || "-")}    指派给：${esc(b.assigned_to_name || b.assigned_to || "-")}    提交人：${esc(b.opened_by || "-")}    迭代：${esc(b.opened_build || "-")}
+      <pre>${isTask
+        ? `模块：${esc(b.module || "-")}    产品：${esc(b.product_name || "-")}    迭代/项目：${esc(b.project_name || "-")}    关联需求：${b.story_id ? "#" + esc(b.story_id) + " " + esc(b.story_title || "") : "-"}
+指派给：${esc(b.assigned_to_name || b.assigned_to || "-")}    提交人：${esc(b.opened_by || "-")}    截止：${esc(b.deadline || "-")}    预估：${esc(b.estimate || "-")}`
+        : `模块：${esc(b.module || "-")}    产品：${esc(b.product_name || "-")}    指派给：${esc(b.assigned_to_name || b.assigned_to || "-")}    提交人：${esc(b.opened_by || "-")}    迭代：${esc(b.opened_build || "-")}`}
 禅道状态：${esc(b.zentao_status || "-")}    分支：${esc(b.branch || "尚未建分支")}    最近同步：${esc(b.synced_at || "-")}</pre>`;
 
     if (b.fix_summary || b.verify_steps) {
@@ -149,7 +169,7 @@
     }
     if (!(b.analyses || []).length && ["await_review", "merged", "closed"].indexOf(b.status) >= 0) {
       html += `<h4>分析结论</h4><p class="hint" style="color:#b3261e">（缺失：要求执行器补
-        <code>python -m app.cli analyze ${esc(b.zentao_id)} --analysis-file a.json</code>）</p>`;
+        <code>python -m app.cli analyze ${esc(slug)} --analysis-file a.json</code>）</p>`;
     }
     if (files) html += `<h4>修改文件</h4><ul class="tight">${files}</ul>`;
     html += `<h4>SVN 提交记录</h4>` + (revs ? `<ul class="tight">${revs}</ul>` : `<p class="muted">无</p>`);
@@ -159,7 +179,7 @@
     if (b.status === "await_review") {
       html += `
         <h4>推入 SVN（正式进库，只有主人能做）</h4>
-        <form method="post" action="/bug/${esc(b.id)}/svn-push" data-json="1">
+        <form method="post" action="${action("svn-push", b)}" data-json="1">
           <textarea name="message" rows="3" style="width:100%">${esc(pushMessage(b))}</textarea>
           <div class="row-actions">
             <button class="btn" type="submit" name="mode" value="dry"
@@ -177,14 +197,14 @@
     if (b.status === "await_review" || b.status === "rejected") {
       html += `
         <h4>拒绝这次修改（两种处置，都不会碰 trunk）</h4>
-        <form method="post" action="/review/${esc(b.id)}/reject"
+        <form method="post" action="/review/${esc(b.id)}/reject?kind=${esc(b.target || "bug")}"
               data-confirm="确认打回？改动不回滚：AI 下一轮在原分支 ${esc(b.branch || '（未建分支）')} 上继续改，最终几轮改动一起推入 SVN。">
           <div class="row-actions">
             <input type="text" name="reject_reason" placeholder="错在哪里（必填，AI 会照着改）" style="flex:1">
             <button class="btn btn-reject" type="submit">打回重做（保留草稿）</button>
           </div>
         </form>
-        <form method="post" action="/bug/${esc(b.id)}/reject-rollback" data-json="1">
+        <form method="post" action="${action("reject-rollback", b)}" data-json="1">
           <div class="row-actions">
             <input type="text" name="reject_reason" placeholder="拒绝原因（必填，会进留痕与禅道）" style="flex:1">
             <button class="btn btn-reject" type="submit"
@@ -201,7 +221,7 @@
     if (CLOSEABLE.indexOf(b.status) >= 0) {
       if (b.status === "merged") {
         html += `
-        <form method="post" action="/bug/${b.id}/close" class="row-actions">
+        <form method="post" action="${action("close", b)}" class="row-actions">
           <button class="btn" type="submit">标记已结案</button>
           <span class="hint">仅更新本地状态并在禅道留言，禅道结案状态由主人手动确认。</span>
         </form>`;
@@ -209,7 +229,7 @@
         const opts = CLOSE_RESOLUTIONS.map(r => `<option value="${esc(r)}">${esc(r)}</option>`).join("");
         html += `
         <h4>这条不修了？直接结案</h4>
-        <form method="post" action="/bug/${b.id}/close">
+        <form method="post" action="${action("close", b)}">
           <div class="row-actions">
             <select name="resolution" style="width:auto">${opts}</select>
             <input type="text" name="reason" placeholder="补充说明（可空，进留痕与禅道评论）" style="flex:1">
@@ -225,7 +245,7 @@
       const landedText = real.length ? esc("已入库 r" + real.join("/r")) : esc("只有本地草稿，未进正式库");
       html += `
         <h4>修得不完全？重开入队列</h4>
-        <form method="post" action="/bug/${esc(b.id)}/reopen" data-json="1">
+        <form method="post" action="${action("reopen", b)}" data-json="1">
           <div class="row-actions">
             <input type="text" name="reject_reason" placeholder="哪里不完全（必填，会和上一轮的结论一起下发给 AI）" style="flex:1">
             <button class="btn btn-reject" type="submit"
@@ -246,6 +266,7 @@
   const dialogBody = dialog.querySelector(".dialog-body");
   const initialHash = location.hash;
   let currentBug = null;
+  let currentKind = "bug";
 
   function mount(title) {
     dialogTitle.textContent = title;
@@ -259,6 +280,7 @@
     dialog.hidden = true;
     dialogBody.innerHTML = "";
     currentBug = null;
+    currentKind = "bug";
     document.body.classList.remove("dialog-open");
   }
 
@@ -283,15 +305,18 @@
     location.hash = hash;
   }
 
-  function loadBug(bugId, note, bad) {
+  function loadBug(bugId, note, bad, kind) {
+    const target = kind === "task" ? "task" : "bug";
     currentBug = bugId;
-    mount("Bug 详情");
+    currentKind = target;
+    mount(target === "task" ? "任务详情" : "Bug 详情");
     dialogBody.innerHTML = '<p class="muted">加载中…</p>';
-    return fetch(`/api/bug/${bugId}`)
+    return fetch(`/api/bug/${bugId}?kind=${target}`)
       .then(resp => resp.json())
       .then(function (data) {
         if (currentBug !== bugId) return;
-        const title = `禅道 #${data.zentao_id || "-"} · ${data.title || "(无标题)"}`;
+        const slug = data.target === "task" ? `T${data.zentao_id}` : data.zentao_id;
+        const title = `禅道 #${slug || "-"} · ${data.title || "(无标题)"}`;
         const color = bad ? "#b3261e" : "#188038";
         const tip = note ? `<p class="hint" style="color:${color};white-space:pre-wrap">${esc(note)}</p>` : "";
         mount(title);
@@ -339,6 +364,12 @@
   }
 
   function route() {
+    const item = /^#\/item\/(bug|task)\/(\d+)$/.exec(location.hash || "");
+    if (item) {
+      loadBug(Number(item[2]), null, false, item[1]);
+      return;
+    }
+    // `#/bug/<id>` stays valid (it is a bug); old links and bookmarks keep working.
     const bug = /^#\/bug\/(\d+)$/.exec(location.hash || "");
     if (bug) {
       loadBug(Number(bug[1]));
@@ -417,7 +448,7 @@
     if (!card) return;
     if (event.target.closest("a") || event.target.closest("button") || event.target.closest("form")) return;
     event.preventDefault();
-    openAt(`#/bug/${card.dataset.bugId}`);
+    openAt(`#/item/${card.dataset.target || "bug"}/${card.dataset.bugId}`);
   });
 
   document.addEventListener("keydown", function (event) {
@@ -482,6 +513,7 @@
     if (!form.closest(".dialog-body")) return;
     event.preventDefault();
     const bugId = currentBug;
+    const kind = currentKind;
     const json = form.dataset.json === "1";
     mount("处理中…");
     dialogBody.innerHTML = json
@@ -492,7 +524,7 @@
       .then(function (resp) {
         if (json) {
           return resp.json().then(function (data) {
-            if (bugId) loadBug(bugId, noteOf(data || {}), !data || !data.ok);
+            if (bugId) loadBug(bugId, noteOf(data || {}), !data || !data.ok, kind);
           });
         }
         if (form.dataset.reload) {
@@ -502,14 +534,14 @@
           return undefined;
         }
         if (bugId) {
-          loadBug(bugId, "操作已提交，上方内容已刷新。");
+          loadBug(bugId, "操作已提交，上方内容已刷新。", false, kind);
           return undefined;
         }
         location.reload();
         return undefined;
       })
       .catch(function (err) {
-        if (bugId) loadBug(bugId, `请求失败：${err.message}`, true);
+        if (bugId) loadBug(bugId, `请求失败：${err.message}`, true, kind);
         else location.reload();
       });
   });

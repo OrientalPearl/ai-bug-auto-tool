@@ -70,6 +70,11 @@ class Settings:
         ]
     )
     zentao_bug_status: str = field(default_factory=lambda: _env_str("ZENTAO_BUG_STATUS", "active"))
+    # Zentao task states are a different list (wait/doing/pause/done/closed); only
+    # these are pulled into the queue.
+    zentao_task_status: str = field(
+        default_factory=lambda: _env_str("ZENTAO_TASK_STATUS", "wait,doing")
+    )
     zentao_browse_type: str = field(default_factory=lambda: _env_str("ZENTAO_BROWSE_TYPE", "assigntome"))
     zentao_verify_ssl: bool = field(default_factory=lambda: _env_bool("ZENTAO_VERIFY_SSL", False))
     zentao_timeout: int = field(default_factory=lambda: _env_int("ZENTAO_TIMEOUT", 20))
@@ -88,6 +93,10 @@ class Settings:
     lock_stale_minutes: int = field(default_factory=lambda: _env_int("LOCK_STALE_MINUTES", 5))
     # Override when a Zentao build exposes comment endpoints on another path.
     zentao_comment_path: str = field(default_factory=lambda: _env_str("ZENTAO_COMMENT_PATH"))
+    # Same for tasks; `/task-comment-<id>.json` is the usual shape.
+    zentao_task_comment_path: str = field(
+        default_factory=lambda: _env_str("ZENTAO_TASK_COMMENT_PATH")
+    )
     zentao_http_proxy: str = field(default_factory=lambda: _env_str("ZENTAO_HTTP_PROXY"))
     # Manual token: pasted from the browser, skips password login (REST mode).
     zentao_token: str = field(default_factory=lambda: _env_str("ZENTAO_TOKEN"))
@@ -205,6 +214,7 @@ class Settings:
             "zentao_account": self.zentao_account or "(未配置)",
             "zentao_password": "******" if self.zentao_password else "(未配置)",
             "zentao_product_ids": ", ".join(map(str, self.zentao_product_ids)) or "(自动发现)",
+            "zentao_task_status": self.zentao_task_status or "(不过滤)",
             "svn_repo_url": self.svn_repo_url or "(未配置)",
             "svn_working_copy": str(self.svn_working_copy),
             "i18n_direct_commit": "true" if self.i18n_direct_commit else "false",

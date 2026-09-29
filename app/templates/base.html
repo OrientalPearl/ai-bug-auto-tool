@@ -3,17 +3,17 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}禅道 Bug 自动修复闭环系统{% endblock %}</title>
+  <title>{% block title %}禅道 Bug / 任务 自动修复闭环系统{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
 <header class="topbar">
-  <div class="brand">禅道 Bug 自动修复闭环系统</div>
+  <div class="brand">禅道 Bug / 任务 自动修复闭环系统</div>
   <nav>
     <a href="{{ url_for('kanban') }}" class="{{ 'active' if request.endpoint == 'kanban' }}">看板</a>
     <a href="{{ url_for('dispatch_page') }}" class="{{ 'active' if request.endpoint == 'dispatch_page' }}">下达任务</a>
     <a href="{{ url_for('sync_page') }}" class="{{ 'active' if request.endpoint == 'sync_page' }}">禅道同步</a>
-    <a href="{{ url_for('need_page') }}" class="{{ 'active' if request.endpoint == 'need_page' }}">需方案清单
+    <a href="{{ url_for('need_page') }}" class="{{ 'active' if request.endpoint == 'need_page' }}">需方案 / 待确认方案
       {% if counts.need_solution %}<span class="badge badge-yellow">{{ counts.need_solution }}</span>{% endif %}</a>
     <a href="{{ url_for('review_page') }}" class="{{ 'active' if request.endpoint == 'review_page' }}">审查清单
       {% if counts.await_review %}<span class="badge badge-orange">{{ counts.await_review }}</span>{% endif %}</a>
@@ -21,7 +21,7 @@
     <a href="{{ url_for('repos_page') }}" class="{{ 'active' if request.endpoint == 'repos_page' }}">产品仓库</a>
     <a href="{{ url_for('config_page') }}" class="{{ 'active' if request.endpoint == 'config_page' }}">配置</a>
   </nav>
-  <div class="topmeta">Bug 总数 {{ total_bugs }} · 待处理 {{ counts.pending }}</div>
+  <div class="topmeta">条目总数 {{ total_bugs }} · 待处理 {{ counts.pending }}</div>
 </header>
 
 {% with messages = get_flashed_messages(with_categories=true) %}

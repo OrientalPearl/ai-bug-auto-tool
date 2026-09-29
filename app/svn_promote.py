@@ -833,6 +833,38 @@ def _parse(text: str, carrier: Promotion) -> Promotion:
     return carrier
 
 
+def require_plan(bug: dict, action: str) -> None:
+    """Refuse to write code on a task whose plan the owner has not approved (G13).
+
+    Enforced here as well as in the CLI: this module is the last place that knows
+    it is about to change a mirror, so a caller that skipped the CLI still cannot
+    land a draft on an unapproved task.
+    """
+    from . import db
+
+    if str(bug.get("target") or "bug") != "task":
+        return
+    reason = db.plan_gate_reason(bug)
+    if reason:
+        raise PromoteError(f"{action} 被拒绝（G13）：{reason}")
+
+
+def draft_branch_of(bug: dict) -> str:
+    """The mirror branch this item's work belongs on.
+
+    A bug is ``bugfix/zentao-<ID>`` (unchanged, so every existing branch keeps
+    working) and a task is ``bugfix/zentao-T<ID>``: Zentao numbers the two kinds in
+    separate sequences, and both ``41468`` may exist.
+    """
+    from . import db
+
+    stored = str(bug.get("branch") or "").strip()
+    if stored:
+        return stored
+    return db.draft_branch(bug.get("zentao_id") or bug.get("id"),
+                           bug.get("target") or "bug")
+
+
 def promoted_commit(bug: dict) -> str:
     """The draft commit this bug last really landed in SVN, if the system pushed it.
 
@@ -1219,10 +1251,8 @@ def draft_commit(bug: dict, message: str, files: list[str]) -> DraftCommit:
     Refuses to run unless the mirror already sits on this bug's branch, because
     switching branches there would move a working tree somebody else may be using.
     """
-    branch = str(bug.get("branch") or "").strip()
-    if not branch:
-        zentao = bug.get("zentao_id") or bug.get("id")
-        branch = f"bugfix/zentao-{zentao}"
+    branch = draft_branch_of(bug)
+    require_plan(bug, "落草稿提交")
     text = str(message or "").strip()
     if not text:
         raise PromoteError("提交说明不能为空（G8：fix #<禅道ID> <一句话根因>）")
@@ -1542,10 +1572,7 @@ def draft_state(bug: dict, base_ref: str = "") -> DraftState:
     ``python -m app.cli`` call, which keeps the unattended run inside the set of
     commands that need no approval.
     """
-    branch = str(bug.get("branch") or "").strip()
-    if not branch:
-        zentao = bug.get("zentao_id") or bug.get("id")
-        branch = f"bugfix/zentao-{zentao}"
+    branch = draft_branch_of(bug)
     from . import svn_client
 
     mirror_dir = svn_client.resolve_target(bug=bug).working_copy
@@ -1773,10 +1800,8 @@ def checkout_draft(bug: dict, base: str = "") -> Checkout:
     ``ssh ... git checkout``, which is the kind of command that stops an
     unattended run dead on an approval prompt.
     """
-    branch = str(bug.get("branch") or "").strip()
-    if not branch:
-        zentao = bug.get("zentao_id") or bug.get("id")
-        branch = f"bugfix/zentao-{zentao}"
+    branch = draft_branch_of(bug)
+    require_plan(bug, "开/切草稿分支")
     from . import svn_client
 
     mirror_dir = svn_client.resolve_target(bug=bug).working_copy

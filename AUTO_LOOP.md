@@ -14,6 +14,11 @@
 
 本文档只管「怎么下达任务」；执行协议本体在 `AGENTS.md`，接口细节在 `CAPABILITIES.md`。
 
+**处理对象有两种**：禅道**缺陷（bug）**与禅道**任务（task）**，走同一条流水线（排队 → 落码 → 本地草稿提交 →
+待审查 → 主人推 SVN），只多一道闸门 —— 任务第一轮**只出方案与修改细则**，主人确认后才实现（G13）。
+因为禅道给两者各发一套独立编号（`bug 5417` 与 `task 5417` 可以同时存在），系统里分表存放，
+**任务一律写成 `T<禅道ID>`**，缺陷写纯数字。
+
 ---
 
 ## 0. 最短下达语（直接粘）
@@ -23,11 +28,17 @@
 已经填好产品 ID、镜像目录与串行要求的下达语**——一个目录一条，粘给一个主对话。顶部另有开跑前检查清单。
 
 ```
-读 AGENTS.md 与 AUTO_LOOP.md，无人值守处理禅道 bug，按 AUTO_LOOP.md 的【提交闸门 G1–G12】判定可否提交：
-1) python -m app.cli sync --details -1     （同步 + 全量抓截图/备注/附件）
+读 AGENTS.md 与 AUTO_LOOP.md，无人值守处理禅道 bug 与任务，按 AUTO_LOOP.md 的【提交闸门 G1–G13】判定可否提交：
+1) python -m app.cli sync --details -1     （同步 + 全量抓截图/备注/附件；缺陷与任务一起拉，任务状态白名单见 ZENTAO_TASK_STATUS）
 2) python -m app.cli tasks --limit 5       （按镜像 working_copy 分组：共用同一镜像的产品并入同一条串行队列，
-   只有镜像互不相同的组之间才并行）
-3) 每条 bug 起一个独立子任务，用 AUTO_LOOP.md §3.2 模板，只替换禅道ID
+   只有镜像互不相同的组之间才并行；返回里 kind=task 的是任务、kind=bug 的是缺陷）
+2.5) 任务编号一律写成 T<禅道ID>（例：T5417），缺陷写纯数字 —— 禅道给两者各发一套号，同号可以同时存在；
+   任务的 queue_kind=plan_needed 表示还欠方案：这一轮**只准**
+   `python -m app.cli plan T<禅道ID> --question "<需求理解与要动的文件/入口/口径>" --options "<A/B/C>" --advice "<建议与理由>"`
+   登记方案与修改细则（可加 --plan-file 交长文本），登记完立刻继续下一条，不许 checkout、不许改一行码；
+   只有 queue_kind=plan_approved（主人在「需方案」页确认过）的任务才进入下面第 5 步起的实现流程；
+   没确认之前 `checkout` / `draft` / `commit` 会被本系统直接拒绝（G13），别试着绕
+3) 每条条目起一个独立子任务，用 AUTO_LOOP.md §3.2 模板，只替换条目编号（任务保留 T 前缀）
 4) 落码位置是 git-svn 镜像（AUTO_LOOP.md §1.5）；镜像未就绪就不许改码，也不许动正式 SVN 工作副本
    看镜像、开分支、落草稿一律走本系统命令：`mirror` / `checkout` / `draft`（§1.8）——
    它们内部就是 SSH 侧带 `-c core.ignorecase=false` 的 git，Windows 侧那份只读代码不跑 git
@@ -36,7 +47,8 @@
    → 先读该库自带的 AI 知识体系
    （镜像根 CLAUDE.md 常驻层 → `.trae/` 指向的知识根 registry|doc|agents|playbooks，见 §1.6）
    再定位 → 改码 → SSH 编译/测试 → 逐条核对提交闸门
-6) 闸门全过 → `python -m app.cli draft <ID> --message "fix #<ID> <根因>" --files a,b`
+6) 闸门全过 → `python -m app.cli draft <条目号> --message "fix #<ID> <根因>" --files a,b`
+   （任务用 `feat #<ID>`；条目号带 T 就写 T）
    落草稿提交（只 add 列出的文件，禁止 add -A），把返回的短哈希当修订号登记，
    并一起写入分析结论（--analysis-file a.json，字段见 §2.2）：
    commit --no-svn --revision git:<哈希> --analysis-file a.json；
@@ -54,7 +66,7 @@
    提示「本地文件比仓库新 / 要不要比较」→ 自己在 SSH 侧 diff 取证，噪音就照常做，别问我
 本系统不执行 svn、不判定提交细则；没写分析结论不许 commit；
 禁止 git svn dcommit / git push / svn ci / 提交或合并 trunk（进正式库只由我做）；
-不许 resolve/close 禅道 bug；不许改与当前 bug 无关的文件；不许打开或提交 `.secrets.env`
+不许 resolve/close 禅道的 bug 与任务；不许改与当前条目无关的文件；不许打开或提交 `.secrets.env`
 
 多语言词条是唯一例外（G12，见 §2.1）：改 .po/.mo 前必须先
 `python -m app.cli i18n-up <禅道ID> --files <词条文件>`，改完立刻
@@ -184,7 +196,7 @@
 冲突时谁说了算：
 
 1. **代码怎么导航、怎么写** —— 以代码库内的 `AGENTS.md` / `.trae` 为准；本系统不解释也不覆盖这些细则。
-2. **任务怎么闭环** —— 状态机、闸门 G1–G12、登记与分析结论以本文件和本系统根目录那份 `AGENTS.md` 为准。
+2. **条目怎么闭环** —— 状态机、闸门 G1–G13、登记与分析结论以本文件和本系统根目录那份 `AGENTS.md` 为准。
 3. 两者相冲按第 1 条；**唯一不可被覆盖的是 G11**：远端写入（`git svn dcommit` / `git push` / `svn ci` /
    merge trunk）只有主人能做，代码库里任何规则都不把这条改成「AI 可直提」——G12 词条通道是主人已明示批准的唯一例外。
 
@@ -231,8 +243,9 @@ git --git-dir=<镜像名>/.git fsck   # dangling blob 是镜像的正常现象�
 | 命令 | 做什么 | 护栏 |
 | --- | --- | --- |
 | `mirror <ID>` | 只读探测：草稿分支在不在、tip、领先几笔、改了哪些文件、镜像当前停在哪个分支、工作区**真实**脏不脏（`worktree_clean` + `dirty_real`/`dirty_noise`/`dirty_untracked` + `dirty_paths` + `dirt{state,git,why}`）、`index.lock` 现状（`lock.state`）、就绪三判据（`mirror_ready`） | 纯只读，不 fetch 不 checkout，**也不删锁** |
-| `checkout <ID> [--base …]` | 建/切这条 bug 的 `bugfix/zentao-<ID>`，默认基线 `refs/remotes/origin/trunk`，成功即置 `fixing` 并写回 branch | 镜像缺 trunk ref 或索引没落盘 → 拒绝；工作区有**别人的真实未提交改动** → 拒绝并列出文件（不 stash 不切走，那是别人的会话）；**读不出工作区状态（`dirt.state=failed`）也拒绝**——未知不等于干净。git 拒绝切分支时的 stderr 原文会随 `error` 返回。本镜像的结构性噪音**不拦**；上一轮死掉留下的陈锁**自动回收**（见下） |
-| `draft <ID> --message "fix #<ID> …" --files a,b` | 只 `git add` 列出的文件并提交，返回短哈希 | 同上：陈锁自动回收后才动手；说明必须以 `fix #<禅道ID>` 开头（G8）；`--files` 必填、必须是镜像内相对路径、不许 `..`/绝对路径/`.git`；分支不存在就报错让你先 `checkout`；HEAD 不在这条分支上就拒绝；暂存为空 → 不造空提交 |
+| `checkout <ID> [--base …]` | 建/切这条条目的 `bugfix/zentao-<ID>`（任务写成 `T<ID>`，落在 `bugfix/zentao-T<ID>`），默认基线 `refs/remotes/origin/trunk`，成功即置 `fixing` 并写回 branch | **任务没有已确认方案 → 直接拒绝（G13）**；镜像缺 trunk ref 或索引没落盘 → 拒绝；工作区有**别人的真实未提交改动** → 拒绝并列出文件（不 stash 不切走，那是别人的会话）；**读不出工作区状态（`dirt.state=failed`）也拒绝**——未知不等于干净。git 拒绝切分支时的 stderr 原文会随 `error` 返回。本镜像的结构性噪音**不拦**；上一轮死掉留下的陈锁**自动回收**（见下） |
+| `draft <ID> --message "fix #<ID> …" --files a,b` | 只 `git add` 列出的文件并提交，返回短哈希 | 同上：任务未确认方案先被 G13 拒绝；陈锁自动回收后才动手；说明必须以 `fix #<禅道ID>` 开头（G8，任务是 `feat #<ID>`）；`--files` 必填、必须是镜像内相对路径、不许 `..`/绝对路径/`.git`；分支不存在就报错让你先 `checkout`；HEAD 不在这条分支上就拒绝；暂存为空 → 不造空提交 |
+| `plan T<ID> --question … --options … --advice …` | **任务第一轮的唯一产出**：把「需求理解 + 修改细则」登记成待确认方案（`task_needs.need_kind='plan'`）、状态置 `need_solution`、并在禅道任务下留言 | 只对 `T<ID>` 开放（缺陷用 `block`）；登记后 `checkout`/`draft`/`commit` 对这条任务仍然一律拒绝，直到主人在「需方案」页确认（G13） |
 | `reconcile [ID] [--apply]` | 对账：镜像上有草稿提交、库里却没登记（执行器跑完没收口 / 崩在收口前） | 默认只报告；`--apply` 才登记 `git:<哈希>` 并转 `await_review`，分析里写明「结论来自 git 提交信息，未验证」 |
 | `tmp-clean [--apply]` | 回收跑完留在项目根的交接文件（`a_<ID>.json`、`blk_<ID>.json`、`py_<ID>.py`、`_tmp_*.py`） | 只认上面这几种命名；分析**没**入库的 `a_<ID>.json` 一律留着只报告；默认 dry-run，`--apply` 才删；`.env`、库文件、源码都不在候选里 |
 
@@ -294,6 +307,7 @@ false。所以：**`dirt.state=failed` 时不许当成干净继续，`error` 里
 | G10 | 提交所需的授权已按代码库规程取得（如 SSH 写操作需显式同意） | 无（属代码库规则；本系统只要求拿到真实修订号再登记） |
 | G11 | **远端写入留给主人**：执行器只做本地动作（`git commit` / 改工作副本不 `ci`），绝不 `git svn dcommit`、`git push`、`svn ci`、merge 到 trunk。主人那一侧走审查详情弹窗的「正式推入 SVN」（§3.3，`app/svn_promote.py`），执行器不许调用该接口。**唯一例外是 G12 的多语言通道**，其余任何文件都不适用 | 无（本系统不检测，靠禁止事项 + 登记形态 `git:<哈希>` 让审查页一眼可辨） |
 | G12 | **多语言词条走独立快车道**：词条文件不与代码一起提交，改前先 up、改完立即单独 `svn ci` 进正式库（详见 §2.1） | `i18n-up` / `i18n-commit` 两条命令；`repos` 的 `svn_working_copy`（正式 SVN 工作副本）没配就无法执行 |
+| G13 | **禅道任务（`T<禅道ID>`）第一轮只许出方案**：`plan` 登记「需求理解 + 修改细则」后置 `need_solution`，不许落码；只有主人在「需方案」页确认过（队列里 `queue_kind=plan_approved`）的任务才可以走 G1–G12 的实现与提交流程。缺陷没有这一步 | `checkout` / `draft` / `commit` 与 `app/svn_promote.py` 都会先查 `task_needs` 里那条 `need_kind='plan'` 是否 `replied` 且有主人原话，未确认直接拒绝并回指 `plan` 命令 |
 
 > G5 / G6 / G10 这三类是**代码库自己的细则**，本系统不复制也不解释它们，只在闸门清单里点名要求 ——
 > 细则原文以目标仓库工作区的 `CLAUDE.md` 与其下层 `registry/playbooks` 为唯一权威。
@@ -396,9 +410,11 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
 角色：你是调度器，不亲自改代码。工作目录 <项目目录>。
 循环直到退出条件满足：
   a. python -m app.cli tasks --limit 5；返回 0 条则跳到「收工」
+     （每条带 kind=bug|task 与 queue_kind；task 且 queue_kind=plan_needed 的**只能**出方案）
   b. 按镜像分组（python -m app.cli repos 看每个产品的 working_copy）：共用同一 working_copy 的产品
      合并成一条串行队列，严格做完一条才动下一条；只有 working_copy 互不相同的组之间才并行开子任务
-  c. 每条 bug 起一个子任务，用 §3.2 模板，只替换 <禅道ID>
+  c. 每条条目起一个子任务，用 §3.2 模板，只替换 <条目编号>（任务保留 T 前缀，例 T5417）；
+     任务里 G13 那一支先判：没有已确认方案就只跑 plan 然后结束子任务，不要往里塞实现
   d. 收集子任务返回的 JSON，按 zentao_id 记账；一条失败不影响下一条
   e. 回到 a，不等待我确认
   f. 撞上 §3.4 那三类情况自己处理：限流就等 5 分钟重试（最多 3 次）后继续，
@@ -416,7 +432,8 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
 ### 3.2 子任务指令（每条 bug 一份，无上下文也能独立执行）
 
 ```
-你只处理禅道 bug #<禅道ID>，做完立即结束，禁止顺带处理其他 bug。
+你只处理禅道条目 #<条目编号>（缺陷是纯数字、任务写成 T<禅道ID>），做完立即结束，
+禁止顺带处理其他条目。
 任务管理命令的工作目录：<项目目录>
 落码位置：镜像仓库 <镜像路径>（见 §1.5）；正式 SVN 工作副本只读，禁止在里面改码
         —— 唯一例外：多语言词条文件按 G12 走 §2.1 的通道，改前先 up、改完立刻单独提交
@@ -437,7 +454,17 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
    → `images_skipped` 里的图（1x1 之类的占位图）模型读不了，硬喂会换来一个 400 把整条任务打断：
      跳过它，按文字描述与代码取证继续，并在分析的 unverified 里写明「某张截图不可读」
    → 若 attachments 为空且没抓过详情：python -m app.cli detail <禅道ID>
-2) python -m app.cli claim <禅道ID>        # 占住任务，置 fixing，避免被别的子任务重复领
+1.5) 【只在这一条是任务（编号带 T）时做】闸门 G13：
+   `python -m app.cli status T<禅道ID>` 的返回里 `plan_approved` 是 false 时，本轮**只准出方案**：
+   python -m app.cli plan T<禅道ID> --question "<需求理解 + 要动的文件/入口/口径 + 边界与回滚>" \
+     --options "方案A：…；方案B：…" --advice "<建议与理由>" --conclusion "<一句话方案结论>" \
+     --impact "<预计影响面>" [--analysis-file a.json]
+   （长文本写成 JSON 用 --plan-file 交，命令入库后自己回收该文件）
+   → 登记完这条就结束了：不许 claim 之后的 checkout / 改码 / draft / commit，直接回报
+   → `plan_approved=true`（主人已确认）才继续第 2 步往下做，实现时以 owner_reply 的原文为准，
+     与方案冲突的地方在分析的 unverified 里点名，不要静默改口径
+   → 缺陷（纯数字编号）没有这一步，直接从第 2 步开始
+2) python -m app.cli claim <条目编号>      # 占住任务，置 fixing，避免被别的子任务重复领
 3) 先读这条 bug 所在代码库自带的 AI 知识体系（§1.6），再动手定位：
    镜像根 `CLAUDE.md`（常驻层：硬门禁 + 触发指针）→ 命中哪条就读 `<LOCAL_KNOWLEDGE_ROOT>` 下哪个
    `registry/` / `doc/` / `agents/` / `playbooks/`（实测镜像里 `.trae` 已是指向知识根的符号链接，
@@ -461,7 +488,7 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
    在正式 SVN 工作副本里只改这些词条文件，改完立即单独提交（不许攒、不许跟代码混一次提交）：
    python -m app.cli i18n-commit <禅道ID> --files <同一批文件> --message "<一句话说明>"
    → 输出里的 r<号> 就是词条的真实修订号，稍后写进分析结论的 change_desc / evidence
-6) 提交判定（§2 的 G1–G12）
+6) 提交判定（§2 的 G1–G13；能走到这一步说明任务的方案已被主人确认，G13 在这一轮是既成事实）
    - 全过：先做知识回写，再落草稿提交（§1.8，短哈希在它的返回里，不用再自己 rev-parse）
      本次若得出可复用、且已被代码或配置验证的结论 → 追加进
      `.trae/agents/<改动目录>/AGENT.md`（§1.6 的知识回写）；它是知识根那个独立仓的内容，
@@ -485,6 +512,7 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
 8) 回报字段：zentao_id / product / 分支名 / 改了哪些文件 / git 短哈希 / 词条修订号 r<号>（若有）/
    闸门逐条结论 / analysis_id / action(commit|pending-commit|block) / revision 或 need_id
 禁止：没写分析就 commit（REQUIRE_ANALYSIS 会直接拒绝）；git svn dcommit / git push / svn ci / 提交或合并 trunk；
+任务方案没被主人确认就 checkout / 改码 / draft / commit（G13 —— 命令也会拒绝你，但别拿拒绝当试错）；
 在正式工作副本里改码（词条文件除外，且必须走 i18n-up / i18n-commit 两条命令）；
 把词条文件留在镜像分支里不提交、或用 i18n-commit 夹带任何非词条文件；
 resolve/close 禅道 bug；改无关文件；把 .env 内容写进任何输出；问我是否继续；
@@ -707,9 +735,11 @@ python -m app.cli branch <禅道ID> --dry-run        # 确认 repo_source=produc
 ## 7. 跑起来后你在看什么
 
 ```
-Web /sync     同步与详情抓取留痕（含禅道评论是否写入成功）
+Web /sync     同步与详情抓取留痕（含禅道评论是否写入成功）；缺陷与任务分开勾选、分别计数
 Web /         看板：pending 变少、fixing/await_review/need_solution 变多就是在正常推进
-Web /need     要你给方案（答复后自动回到 AI 队列最前）
+              （卡片上的紫色「任务」徽标 = 禅道任务，编号写成 T<禅道ID>，草稿分支 bugfix/zentao-T<ID>）
+Web /need     两类都在这页：缺陷的「AI 卡点」等你给决策；任务的「修改细则待确认」等你拍板
+              （任务只有在这页确认过，AI 才被允许落码 —— G13；也可一键「确认按 AI 建议做」）
 Web /review   待你审查：AI 分析结论 + 闸门逐条 + files_changed / fix_summary / verify_steps / 修订号
               （修订号形态：git:<哈希>=已本地提交未进正式库；r<号>=已进正式库；PENDING=还没提交；
                 branch=i18n-direct 的那条是词条已单独提交 SVN（G12），不代表代码已回灌；
@@ -751,6 +781,9 @@ Web /repos    各产品用哪个仓库、镜像在哪、正式 SVN 工作副本�
 | 模型或接口报限流（`rate limit` / `429` / `overloaded` / `quota` / 「稍后再试」/ 502、503） | **不许中止整轮**：等 5 分钟重试同一步，总共 3 次（`.env` 的 `RETRY_WAIT` / `RETRY_MAX`；本系统读禅道那侧已内置，会打印 `[retry] …等 N 秒后重试`）。3 次用完才 `block` 写「上游限流未恢复（已等 X 分钟重试 N 次）」，然后继续下一条。写类动作（评论、`i18n-commit`）不重试，失败就如实登记 |
 | 模型报截图尺寸不合规（`400 invalid_parameter_error` / `must be larger than 10` / `height:1 or width:1`） | 那是禅道发的 1x1 占位图，不是你的错也不该中止：本系统已在下载时把它标 `unreadable` 并挪进 `images_skipped`（§3.4 四），执行器跳过它按文字继续即可；库里已有的历史附件跑一次 `python -m app.cli img-gate` 重量一遍 |
 | 任务其实跑完了、镜像上有 `bugfix/zentao-<ID>` 提交，库里却还停在 `fixing`（子任务崩在收口前 / 忘了 `commit`） | `python -m app.cli reconcile` 点名所有这种条目；核对无误后 `reconcile <ID> --apply` 认领：登记 `git:<哈希>`（带真实哈希）、写回分支与文件清单、转 `await_review`，并在分析里标明「结论来自 git 提交信息，未验证」。不 apply 就只报告，什么都不改 |
+| `checkout` / `draft` / `commit` 报「G13：任务方案未确认」 | 不是故障，是闸门：这条任务的方案还没被主人确认（或你把它当成缺陷处理了）。先 `status T<禅道ID>` 看 `plan_approved`；false 就只跑 `plan T<禅道ID> ...` 登记方案然后结束这条，**不许重试实现动作**。确认过的任务里 `queue_kind` 会变成 `plan_approved`，那时再 `checkout` |
+| `status` 报「找不到条目」但禅道里明明有 | 十有八九是**编号写错了种类**：任务是 `T5417`、缺陷是 `5417`，两套号独立且可能同号并存；纯数字只查缺陷表。`sync --kinds task` 先把任务拉进库（任务列表不带产品号，详情抓不到所属产品的任务不会入库，`/sync` 页会说明原因） |
+| 任务正文空空如也 / 看不到需求 | 禅道任务的正文挂在**关联需求**上（`storySpec`），任务本身 `desc` 常是空的：跑 `detail T<禅道ID>`（或 `sync --details -1`）把详情与截图拉回来，`steps` 里会带 `[需求说明 storySpec]` 一段 |
 | 某一步需要授权（SSH 要密码、IDE 命令审批、沙箱越权、`sudo`、yes/no 交互、要人点「继续」） | **禁止出现，也禁止等**：本系统 svn 已 `--non-interactive`、SSH 只走免密 key（参数见该库 `CLAUDE.local.yaml`）；看镜像 / 开分支 / 落草稿 / 对账一律用 §1.8 的 `mirror` / `checkout` / `draft` / `reconcile`，别自己拼裸 `ssh … git …`。真绕不开就 `block` 写清「要主人做什么授权 / 为什么 / 影响面 / 怎么回滚」，立刻做下一条；不许调 `AskUserQuestion` 之类的提问工具 |
 | 弹「删除文件」的授权确认（清理 `a_<ID>.json` / 临时脚本 / `__pycache__`） | 实测最常见的卡死点，而且全是**没必要的删除**：分析长文本交给 `--analysis-file`、需方案文本交给 `--block-file`，命令入库成功后自己回收（返回里的 `handoff_removed`），想留着看就加 `--keep-handoff`；一批跑完 `python -m app.cli tmp-clean --apply` 统一清场。执行器侧一律不许出现删除动作（§1.8、§3.4 二） |
 | 提示「本地文件比仓库新，是否比较」 | 执行器自己按 §3.4 第三步取证（SSH 侧 `status` + `diff --ignore-cr-at-eol`）：只剩 CRLF / `$Id$` / 大小写对偶 / `.trae/**` 就当已知噪音照常做；是别人写的真实改动就**不覆盖不 stash 不 revert**，`block` 写「<文件> 有一份不是我改的改动：<摘要>」；都不许停下来问人 |
@@ -775,16 +808,22 @@ python -m app.cli repos                       # 确认该产品已 bound、worki
 
 # AI（自动）
 sync --details -1 → tasks → 每条一个子任务
+   缺陷（纯数字）：
    （mirror 验镜像就绪 → status → claim → checkout 开/切 bugfix/zentao-<ID> → 改 → SSH 编译测试
      → 改了词条就 i18n-up → 改词条 → i18n-commit（单独进 SVN，拿 r<号>）
-     → 闸门 G1–G12 → draft（只 add 列出的文件，只本地提交，返回短哈希）
+     → 闸门 G1–G13 → draft（只 add 列出的文件，只本地提交，返回短哈希）
      → commit --no-svn --revision git:<哈希> --analysis-file a.json）
+   任务（T<禅道ID>）第一轮只出方案（G13）：
+   （status T<ID> → 没有已确认方案就 plan T<ID> --question "<需求理解+修改细则>" --options ... --advice ...
+     → 登记完立即结束这条，不许 checkout / 改码；`queue_kind` 从此是 need_solution，等主人确认）
+   任务被确认之后（queue_kind=plan_approved）：走上面缺陷那条完整流程，按 owner_reply 的口径实现，
+   草稿分支是 bugfix/zentao-T<ID>，提交说明是 feat #<ID> <说明>
    → 下一条 → report → reconcile（点名跑完没收口的条目）
    注：镜像的读与草稿提交都在 mirror / checkout / draft 三条命令里（§1.8），
    执行器不再自己拼 ssh + git；只有编译测试与定位取证仍按该库规程走 SSH
 
 # 你（收尾）
-/need 答复 → /review 逐条看分析与闸门 → 同样在 SSH 侧 git -c core.ignorecase=false log/diff 审改动
+/need 答复（缺陷=给决策，任务=确认或改方案；确认后任务才允许落码）→ /review 逐条看分析与闸门 → 同样在 SSH 侧 git -c core.ignorecase=false log/diff 审改动
    → 通过后自己执行 git svn dcommit（或出 patch 打到正式副本再 svn ci）→ 拿到真实 r 号后回填：
 python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.c --no-svn --revision r<真实号>
    → 是否 merge 到 trunk 由你决定 → merged 卡片点「标记已结案」

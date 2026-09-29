@@ -5,26 +5,36 @@
   <span class="muted">AI 只提交到分支；要正式进库就在「弹窗看完整详情」里写提交说明后点「正式推入 SVN」（可先「预检」），合入 trunk 与禅道结案由你完成</span>
 </div>
 
+<div class="inline" style="margin:0 0 12px">
+  {% for k, label in [('all', '全部条目'), ('bug', '只看缺陷'), ('task', '只看任务')] %}
+  <a class="btn {{ 'btn-primary' if (kind_filter or 'all') == k }}"
+     href="{{ url_for('review_page', kind=k) }}">{{ label }}</a>
+  {% endfor %}
+</div>
+
 {% if queue %}
 <div class="grid-cards">
   {% for bug in queue %}
-  <div class="panel">
-    <h3>禅道 #{{ bug.zentao_id }} · {{ bug.title }}
+  {% set ref = ('T' ~ bug.zentao_id) if bug.target == 'task' else bug.zentao_id %}
+  <div class="panel{% if bug.target == 'task' %} panel-task{% endif %}">
+    <h3>禅道 #{{ ref }} · {{ bug.title }}
+      {% if bug.target == 'task' %}<span class="badge badge-task">任务</span>{% endif %}
       <span class="badge badge-orange">待审查</span>
-      <a class="btn" style="float:right" href="#/bug/{{ bug.id }}">弹窗看完整详情</a>
+      <a class="btn" style="float:right" href="#/item/{{ bug.target }}/{{ bug.id }}">弹窗看完整详情</a>
     </h3>
     <p class="hint">
-      pri {{ bug.pri }} / S{{ bug.severity }} · 分支 <code>{{ bug.branch or '未记录' }}</code> ·
+      pri {{ bug.pri }}{% if bug.severity %} / S{{ bug.severity }}{% endif %} ·
+      分支 <code>{{ bug.branch or '未记录' }}</code> ·
       更新时间 {{ bug.updated_at }}
     </p>
 
-    <h4 class="hint" style="color:#23272f;font-weight:600">修复说明</h4>
+    <h4 class="hint" style="color:#23272f;font-weight:600">{{ '实现说明' if bug.target == 'task' else '修复说明' }}</h4>
     <div style="white-space:pre-wrap">{{ bug.fix_summary or '（AI 未填写，可用 svn log 查看提交说明）' }}</div>
 
     {% set analysis = bug.analysis %}
     {% set owner_notes = bug.owner_notes %}
     {% set show_missing = true %}
-    {% set zentao_id = bug.zentao_id %}
+    {% set zentao_id = ref %}
     {% include "_analysis.html" %}
 
     <h4 class="hint" style="color:#23272f;font-weight:600">验证步骤</h4>
@@ -44,7 +54,7 @@
     </ul>
     {% else %}<p class="muted">（无提交记录）</p>{% endif %}
 
-    <h4 class="hint" style="color:#23272f;font-weight:600">复现步骤（禅道原文）</h4>
+    <h4 class="hint" style="color:#23272f;font-weight:600">{{ '需求描述（禅道原文）' if bug.target == 'task' else '复现步骤（禅道原文）' }}</h4>
     <pre style="white-space:pre-wrap; max-height:160px; overflow:auto; background:#f7f8fa; padding:8px; border:1px solid #e3e6ec; border-radius:4px; font-size:12px">{{ bug.steps or '（无）' }}</pre>
 
     {% if bug.images %}
@@ -70,7 +80,7 @@
     </ul>
     {% endif %}
 
-    <form method="post" action="{{ url_for('review_pass', bug_id=bug.id) }}"
+    <form method="post" action="{{ url_for('review_pass', bug_id=bug.id, kind=bug.target) }}"
           data-confirm="确认审查通过？合入 trunk 后请把 trunk 修订号填入下方。">
       <div class="row-actions">
         <input type="text" name="merged_revision" placeholder="合入 trunk 的 SVN 号（可稍后补填）" style="width:260px">
@@ -78,7 +88,7 @@
       </div>
     </form>
 
-    <form method="post" action="{{ url_for('review_reject', bug_id=bug.id) }}"
+    <form method="post" action="{{ url_for('review_reject', bug_id=bug.id, kind=bug.target) }}"
           data-confirm="确认打回？改动不回滚：AI 下一轮在原分支上继续改，最终几轮改动一起推入 SVN。">
       <div class="row-actions">
         <input type="text" name="reject_reason" placeholder="打回原因（必填）" style="flex:1">
@@ -86,7 +96,7 @@
       </div>
     </form>
 
-    <form method="post" action="{{ url_for('bug_reject_rollback', bug_id=bug.id) }}"
+    <form method="post" action="{{ url_for('bug_reject_rollback', bug_id=bug.id, kind=bug.target) }}"
           data-confirm="确认拒绝并回滚？这会删除镜像里的草稿分支 {{ bug.branch or '（无分支）' }}（提交先存进 refs/rejected 以便取回），并把这条置为已结案。trunk 不受影响。">
       <div class="row-actions">
         <input type="text" name="reject_reason" placeholder="拒绝原因（必填）" style="flex:1">
@@ -97,7 +107,7 @@
   {% endfor %}
 </div>
 {% else %}
-<div class="panel"><p class="muted">没有待审查的 bug。</p></div>
+<div class="panel"><p class="muted">没有待审查的条目。</p></div>
 {% endif %}
 
 <div class="panel">
@@ -109,6 +119,7 @@
     上一轮的结论与改动文件会作为 <code>prior_fix</code> 一起交给 AI，下一轮推送只带新增的改动。
     <b>需方案</b>的答复也可以是「不修了」：在需方案清单或详情弹窗里选「无法重现 / 不是缺陷 / 重复单 / 禅道已关闭」直接<b>结案</b>，
     这条不再下发给 AI，未答复的阻塞项一并标记为已处理；已建的草稿分支与提交原样保留，之后想修还能「重开补修」。
+    任务与缺陷走的是同一条审查流程，区别只在任务多一道「先确认方案」（G13）。
   </p>
 </div>
 {% endblock %}

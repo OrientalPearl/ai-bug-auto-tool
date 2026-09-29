@@ -15,7 +15,8 @@
     <button class="btn right" type="button" data-copy="sel-1">复制这段</button>
   </h3>
   <p class="hint">
-    产品 <b>{{ selected.ids }}</b>（{{ selected.names }}）· 待办 {{ selected.pending }} / 共 {{ selected.bugs }} ·
+    产品 <b>{{ selected.ids }}</b>（{{ selected.names }}）· 待办 {{ selected.pending }} / 共 {{ selected.bugs }}
+    {% if selected.tasks %}· 任务 {{ selected.task_pending }} / {{ selected.tasks }}{% endif %} ·
     落码目录 <code class="wc">{{ selected.working_copy }}</code><br>
     <b>{{ selected.serial }}</b>{% if selected.mixed %}
     —— 上面这段里已经写了「只做与本目录相关的部分」，跨目录的产品请各生成一条分别下达。{% endif %}
@@ -34,7 +35,7 @@
                {% if selected and r.product_id|string in selected.ids.replace(', ', '').split(',') %}checked{% endif %}>
         <span class="pick-id">#{{ r.product_id }}</span>
         <span class="pick-name">{{ r.product_name or '(无名)' }}</span>
-        <span class="pick-meta">待办 {{ r.pending }} / {{ r.bugs }} ·
+        <span class="pick-meta">待办 {{ r.pending }} / {{ r.bugs }}{% if r.tasks %} · 任务 {{ r.task_pending }} / {{ r.tasks }}{% endif %} ·
           {% if r.source == 'product' %}<span class="badge badge-green">已绑定</span>{% else %}<span class="badge badge-red">未绑定</span>{% endif %}
         </span>
         <span class="wc pick-wc">{{ r.effective_wc }}</span>
@@ -59,7 +60,8 @@
         <th style="width:36px">#</th>
         <th style="width:110px">产品 ID</th>
         <th>落码目录（一个目录 = 一条串行队列）</th>
-        <th style="width:90px">待办 / 总数</th>
+        <th style="width:110px">待办 / 总数</th>
+        <th style="width:90px">任务</th>
         <th style="width:250px">并行性</th>
         <th style="width:170px">下达语</th>
       </tr>
@@ -147,7 +149,7 @@
 {% endif %}
 
 <div class="panel">
-  <h3>下一条会被处理的 bug（前 10 · 已答复 &gt; 已打回 &gt; 待处理）</h3>
+  <h3>下一条会被处理的条目（前 10 · 已答复/已确认方案 &gt; 已打回 &gt; 待处理）</h3>
   {% if queue %}
   <table class="grid">
     <thead>
@@ -156,23 +158,33 @@
         <th>标题</th>
         <th style="width:150px">产品</th>
         <th style="width:70px">PRI/S</th>
-        <th style="width:120px">入队原因</th>
+        <th style="width:130px">入队原因</th>
       </tr>
     </thead>
     <tbody>
       {% for b in queue %}
+      {% set ref = ('T' ~ b.zentao_id) if b.target == 'task' else b.zentao_id %}
       <tr>
-        <td><a href="#/bug/{{ b.id }}">{{ b.zentao_id }}</a></td>
+        <td><a href="#/item/{{ b.target }}/{{ b.id }}">{{ ref }}</a>
+          {% if b.target == 'task' %}<span class="badge badge-task">任务</span>{% endif %}</td>
         <td>{{ b.title or '(无标题)' }}</td>
         <td>{{ b.product_name or ('产品 ' ~ b.product_id) }}</td>
-        <td>{{ b.pri }} / S{{ b.severity }}</td>
-        <td>{{ {'replied': '已答复待处理', 'rejected': '打回重做', 'stale': '跑挂回收·重跑', 'pending': '待处理'}[b.queue_kind] or b.queue_kind }}</td>
+        <td>{{ b.pri }}{% if b.severity %} / S{{ b.severity }}{% endif %}</td>
+        <td>{{ {
+          'replied': '已答复待处理',
+          'plan_approved': '方案已确认·可落码',
+          'plan_needed': '欠方案·只许出方案',
+          'rejected': '打回重做',
+          'reopened': '重开补修',
+          'stale': '跑挂回收·重跑',
+          'pending': '待处理'
+        }[b.queue_kind] or b.queue_kind }}</td>
       </tr>
       {% endfor %}
     </tbody>
   </table>
   {% else %}
-  <p class="muted">队列为空：没有 pending / rejected / 已答复的 bug，执行器现在无事可做。</p>
+  <p class="muted">队列为空：没有 pending / rejected / 已答复的条目，执行器现在无事可做。</p>
   {% endif %}
 </div>
 {% endblock %}

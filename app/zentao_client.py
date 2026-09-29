@@ -375,23 +375,138 @@ class ZentaoClient:
         return sorted(collected.values(), key=lambda b: (b["pri"], -b["severity"], b["zentao_id"]))
 
     # ------------------------------------------------------------------
+    # tasks
+    # ------------------------------------------------------------------
+    def list_product_tasks(self, product_id: int, *, page: int = 1,
+                           limit: int = 100) -> list[dict]:
+        payload = self._request(
+            "GET", f"/api.php/v1/products/{product_id}/tasks",
+            params={"page": page, "limit": limit},
+        )
+        return _as_list(payload, "tasks", "taskList", "data")
+
+    def fetch_task_raw(self, task_id: int) -> dict:
+        payload = self._request("GET", f"/api.php/v1/tasks/{task_id}")
+        if isinstance(payload, dict) and isinstance(payload.get("task"), dict):
+            return payload["task"]
+        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+            return payload["data"]
+        return payload if isinstance(payload, dict) else {}
+
+    def get_task_detail(self, task_id: int, *, download: bool | None = None) -> dict:
+        """Expanded detail for one task.
+
+        Deliberately the same field shape as the session channel so the sync layer
+        never has to know which transport produced a task.
+        """
+        del download
+        self.login()
+        return parse.build_task_detail({"task": self.fetch_task_raw(task_id)}, task_id)
+
+    def fetch_assigned_tasks(self, product_ids: Iterable[int] | None = None,
+                             *, with_detail: bool = True,
+                             max_pages: int = 10) -> list[dict]:
+        """Collect tasks assigned to the configured account, in the given products.
+
+        REST v1 has no "assigntome" filter for tasks, so this pulls per product and
+        filters here -- and drops anything whose product cannot be resolved, since a
+        task with no product has no repository to fix.
+        """
+        settings = get_settings()
+        if product_ids is None:
+            product_ids = settings.zentao_product_ids or [p["id"] for p in self.list_products()]
+        keep = {s.strip() for s in str(settings.zentao_task_status or "").split(",") if s.strip()}
+        collected: dict[int, dict] = {}
+        for pid in product_ids:
+            for page in range(1, max_pages + 1):
+                rows = self.list_product_tasks(int(pid), page=page)
+                if not rows:
+                    break
+                for raw in rows:
+                    task = self.normalize_task(raw, product_id=int(pid))
+                    if task["assigned_to"].lower() != self.account.lower():
+                        continue
+                    if keep and task["zentao_status"] and task["zentao_status"] not in keep:
+                        continue
+                    collected[task["zentao_id"]] = task
+                if len(rows) < 100:
+                    break
+        if with_detail:
+            for zid, task in list(collected.items()):
+                try:
+                    detail = self.get_task_detail(zid)
+                except ZentaoError:
+                    continue
+                merged = dict(task)
+                for key, value in detail.items():
+                    if key == "raw_json":
+                        merged["raw"] = value
+                    elif value not in (None, "", 0):
+                        merged[key] = value
+                collected[zid] = merged
+        return sorted(collected.values(),
+                      key=lambda t: (t["pri"], -int(t.get("story_id") or 0), t["zentao_id"]))
+
+    def normalize_task(self, raw: dict, product_id: int | None = None) -> dict:
+        """Map a raw Zentao task payload onto our internal task shape."""
+        if not raw:
+            return {}
+        tid = _pick(raw, "id", "taskID", "task_id")
+        deadline = str(_pick(raw, "deadline", default="") or "")
+        if deadline.startswith("0000"):
+            deadline = ""
+        project = raw.get("project")
+        project_id = project if str(project or "").isdigit() else _pick(raw, "projectID", default=0)
+        return {
+            "zentao_id": int(tid) if tid is not None else 0,
+            "title": _strip_html(str(_pick(raw, "name", "title", default="")))[:500],
+            "pri": int(_pick(raw, "pri", "priority", default=3) or 3),
+            "steps": _strip_html(str(_pick(raw, "desc", "steps", default=""))),
+            "module": str(_pick(raw, "module", "moduleName", default="") or ""),
+            "project_id": int(project_id or 0),
+            "project_name": str(_pick(raw, "projectName", default="") or ""),
+            "story_id": int(_pick(raw, "storyID", "story", default=0) or 0),
+            "story_title": str(_pick(raw, "storyTitle", default="") or ""),
+            "assigned_to": str(_pick(raw, "assignedTo", "assigned_to", default="") or ""),
+            "opened_by": str(_pick(raw, "openedBy", default="") or ""),
+            "opened_date": str(_pick(raw, "openedDate", default="") or ""),
+            "zentao_status": str(_pick(raw, "status", "taskStatus", default="") or ""),
+            "deadline": deadline,
+            "estimate": str(_pick(raw, "estimate", default="") or ""),
+            "need_confirm": bool(_pick(raw, "needConfirm", default=False)),
+            "product_id": (int(product_id) if product_id
+                           else int(_pick(raw, "product", default=0) or 0)),
+            "product_name": "",
+            "raw": raw,
+        }
+
+    # ------------------------------------------------------------------
     # writes (comment only)
     # ------------------------------------------------------------------
-    def add_comment(self, bug_id: int, comment: str, *, extra: dict | None = None) -> dict:
-        """Append a comment to a bug. Never resolves or closes it."""
+    def add_comment(self, bug_id: int, comment: str, *, extra: dict | None = None,
+                    target: str = "bug") -> dict:
+        """Append a comment to a bug or a task. Never resolves or closes it."""
         self.login()
         settings = get_settings()
         body: dict[str, Any] = {"comment": comment}
         if extra:
             body.update(extra)
+        override = (settings.zentao_task_comment_path if target == "task"
+                    else settings.zentao_comment_path)
         candidates = []
-        if settings.zentao_comment_path:
-            candidates.append(settings.zentao_comment_path.format(bug_id=bug_id))
-        candidates += [
-            f"/api.php/v1/bugs/{bug_id}/comments",
-            f"/api.php/v1/bugs/{bug_id}/comment",
-            f"/api.php/v1/products/0/bugs/{bug_id}/comments",
-        ]
+        if override:
+            candidates.append(override.format(bug_id=bug_id, item_id=bug_id, task_id=bug_id))
+        if target == "task":
+            candidates += [
+                f"/api.php/v1/tasks/{bug_id}/comments",
+                f"/api.php/v1/tasks/{bug_id}/comment",
+            ]
+        else:
+            candidates += [
+                f"/api.php/v1/bugs/{bug_id}/comments",
+                f"/api.php/v1/bugs/{bug_id}/comment",
+                f"/api.php/v1/products/0/bugs/{bug_id}/comments",
+            ]
         errors: list[str] = []
         for path in candidates:
             try:
@@ -399,7 +514,8 @@ class ZentaoClient:
                 return {"endpoint": path, "result": result}
             except ZentaoError as exc:
                 errors.append(str(exc))
-        raise ZentaoError("禅道评论写入失败，可尝试设置 ZENTAO_COMMENT_PATH。原始错误:\n" + "\n".join(errors))
+        raise ZentaoError("禅道评论写入失败，可尝试设置 ZENTAO_COMMENT_PATH / "
+                          "ZENTAO_TASK_COMMENT_PATH。原始错误:\n" + "\n".join(errors))
 
     # ------------------------------------------------------------------
     # helpers

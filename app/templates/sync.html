@@ -2,7 +2,10 @@
 {% block content %}
 <div class="page-head">
   <h2>禅道同步</h2>
-  <form class="inline right" method="post" action="{{ url_for('sync_run') }}" data-confirm="将调用禅道 API 拉取指派给我的 active bug，确认执行？">
+  <form class="inline right" method="post" action="{{ url_for('sync_run') }}"
+        data-confirm="将调用禅道拉取指派给我的 active bug 与未关闭 task，确认执行？">
+    <label class="hint"><input type="checkbox" name="kinds" value="bug" checked> 缺陷</label>
+    <label class="hint"><input type="checkbox" name="kinds" value="task" checked> 任务</label>
     <button class="btn-primary" type="submit">立即同步</button>
     <a class="btn" href="{{ url_for('sync_doctor') }}">一键诊断禅道</a>
     <a class="btn" href="{{ url_for('sync_page') }}">刷新</a>
@@ -44,7 +47,8 @@
 <div class="stat">
   <div><b>{{ summary.created_today }}</b><span class="muted">今日新增</span></div>
   <div><b>{{ summary.updated_today }}</b><span class="muted">今日更新</span></div>
-  <div><b>{{ summary.total_bugs }}</b><span class="muted">库内 bug 总数</span></div>
+  <div><b>{{ summary.total_bugs }}</b><span class="muted">库内条目总数（含任务）</span></div>
+  <div><b>{{ summary.total_tasks }}</b><span class="muted">其中任务 task</span></div>
   <div><b>{{ summary.pending }}</b><span class="muted">待处理 pending</span></div>
   <div><b>{{ summary.details_missing }} / {{ summary.details_total }}</b><span class="muted">详情（图片/备注）待抓</span></div>
   <div><b>{{ summary.last_sync.created_at if summary.last_sync else '尚未同步' }}</b><span class="muted">最近同步时间</span></div>
@@ -54,28 +58,35 @@
   <h3>批量抓取详情（图片 / 备注 / 附件）</h3>
   <p class="hint">
     列表同步只带回标题和简要字段，<b>截图、备注、附件</b>要逐条抓详情才能看到（AI 修复前必须先看到这些）。
-    抓取按 <code>pri 升序 + severity 降序</code> 排队，条数填 <code>0</code> 表示<b>全量</b>（未关闭的 bug 全部抓一遍）。
+    抓取按 <code>pri 升序</code> 排队，条数填 <code>0</code> 表示<b>全量</b>（未关闭的条目全部抓一遍）。
+    任务的正文其实挂在关联需求上，详情抓取会把它一并读回来。
   </p>
   <form class="inline" method="post" action="{{ url_for('sync_details') }}"
         data-confirm="将逐条访问禅道详情页并下载截图，全量可能需要几分钟，确认执行？">
     <label for="limit">抓取条数</label>
     <input type="number" id="limit" name="limit" value="0" min="0" step="1" style="width:110px">
+    <label class="hint"><input type="checkbox" name="kinds" value="bug" checked> 缺陷</label>
+    <label class="hint"><input type="checkbox" name="kinds" value="task" checked> 任务</label>
     <button class="btn-primary" type="submit">开始抓取（0 = 全量）</button>
-    <span class="muted">当前还有 {{ summary.details_missing }} 条未抓详情（共 {{ summary.details_total }} 条未关闭 bug）</span>
+    <span class="muted">当前还有 {{ summary.details_missing }} 条未抓详情（共 {{ summary.details_total }} 条未关闭条目）</span>
   </form>
 </div>
 
 <div class="panel">
   <h3>同步规则</h3>
   <p class="hint">
-    1. 先取产品列表（<code>GET /api.php/v1/products</code>），若设置了 <code>ZENTAO_PRODUCT_IDS</code> 则只取指定产品；<br>
-    2. 逐产品取 <code>GET /api.php/v1/products/{id}/bugs?status=active</code>，本地过滤 <code>assignedTo == 我</code>（等价 browseType=assigntome）；<br>
-    3. 每条 bug 落库字段：zentao_id / title / steps / severity / pri / module / assignedTo / openedBuild；<br>
-    4. 已存在的 bug 只更新禅道侧字段，<b>不会覆盖本地工作流状态</b>（pending / fixing / await_review …）。
+    1. 先取产品列表（会话通道 <code>/product-index.json</code>），若设置了 <code>ZENTAO_PRODUCT_IDS</code> 则只取指定产品；<br>
+    2. 缺陷：逐产品 / <code>/my-bug-assignedTo-*.json</code> 取 <code>status=active</code> 且 <code>assignedTo == 我</code>；<br>
+    3. 任务：<code>/my-task-assignedTo-*.json</code> 取指派给我的任务，再逐条 <code>/task-view-&lt;id&gt;.json</code>
+    补回正文（含关联需求的 SPEC）、截图、备注与<b>所属产品</b> —— 任务列表本身不带产品号，
+    产品号决定它落到哪个代码库，取不到产品的任务不会入库；状态白名单见 <code>ZENTAO_TASK_STATUS</code>（默认 wait,doing）；<br>
+    4. 每条落库字段：zentao_id / title / steps / pri / module / assignedTo（任务另有 project / story / deadline）；<br>
+    5. 已存在的条目只更新禅道侧字段，<b>不会覆盖本地工作流状态</b>（pending / fixing / await_review …）；<br>
+    6. 缺陷号与任务号是两套独立序列，同号可以同时存在，所以分表存放；系统里任务一律写成 <code>T&lt;禅道ID&gt;</code>。
   </p>
   <p class="hint">
     当前配置：产品ID <b>{{ settings_view.zentao_product_ids }}</b>，账号 <b>{{ settings_view.zentao_account }}</b>，
-    地址 <b>{{ settings_view.zentao_base_url }}</b>。
+    地址 <b>{{ settings_view.zentao_base_url }}</b>，任务状态 <b>{{ settings_view.zentao_task_status }}</b>。
     {% if not zentao_ready %}<span style="color:#d93025">禅道账号未配置，请先编辑 .env</span>{% endif %}
   </p>
 </div>

@@ -58,6 +58,8 @@
         <th style="width:150px">产品名</th>
         <th style="width:60px">Bug</th>
         <th style="width:60px">待处理</th>
+        <th style="width:60px">任务</th>
+        <th style="width:70px">待出方案</th>
         <th style="width:90px">仓库来源</th>
         <th>实际生效的 trunk / 镜像 / 多语言工作副本</th>
         <th style="width:120px">操作</th>
@@ -70,6 +72,8 @@
         <td>{{ r.product_name or '(无名)' }}</td>
         <td>{{ r.bugs }}</td>
         <td>{{ r.pending }}</td>
+        <td>{{ r.tasks }}</td>
+        <td>{{ r.task_pending }}</td>
         <td>
           {% if r.error %}<span class="badge badge-red">配置异常</span>
           {% elif r.source == 'product' %}<span class="badge badge-green">产品绑定</span>

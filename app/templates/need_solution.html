@@ -1,35 +1,52 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="page-head">
-  <h2>需方案清单</h2>
+  <h2>需方案清单（阻塞项 + 任务方案）</h2>
   <div class="inline">
     {% for s in ['awaiting', 'replied', 'done', 'all'] %}
-      <a class="btn {{ 'btn-primary' if current == s }}" href="{{ url_for('need_page', status=s) }}">
+      <a class="btn {{ 'btn-primary' if current == s }}"
+         href="{{ url_for('need_page', status=s, kind=kind_filter or 'all') }}">
         {{ {'awaiting':'待我答复','replied':'已答复待AI处理','done':'已处理','all':'全部'}[s] }}
       </a>
     {% endfor %}
   </div>
 </div>
 
+<div class="inline" style="margin:0 0 12px">
+  {% for k, label in [('all', '全部'), ('bug', '只看缺陷阻塞'), ('task', '只看任务方案')] %}
+  <a class="btn {{ 'btn-primary' if (kind_filter or 'all') == k }}"
+     href="{{ url_for('need_page', status=current, kind=k) }}">{{ label }}</a>
+  {% endfor %}
+  <span class="hint">任务的第一轮只出方案：你在这里确认（或改细则）之后，AI 才被允许落码；
+    没确认之前 checkout / draft / commit 会被命令直接拒绝（AUTO_LOOP.md G13）。</span>
+</div>
+
 {% if needs %}
 <div class="grid-cards">
   {% for n in needs %}
-  <div class="panel">
+  {% set ref = ('T' ~ n.zentao_id) if n.target == 'task' else n.zentao_id %}
+  <div class="panel{% if n.target == 'task' %} panel-task{% endif %}">
     <h3>
-      禅道 #{{ n.zentao_id }} · {{ n.title }}
+      禅道 #{{ ref }} · {{ n.title }}
+      {% if n.target == 'task' %}<span class="badge badge-task">任务</span>{% endif %}
+      <span class="badge {{ 'badge-blue' if n.need_kind == 'plan' else 'badge-yellow' }}">
+        {{ '修改细则待确认' if n.need_kind == 'plan' else 'AI 卡点' }}
+      </span>
       <span class="badge badge-{{ {'awaiting':'yellow','replied':'blue','done':'green'}[n.status] }}">
         {{ {'awaiting':'待答复','replied':'已答复','done':'已处理'}[n.status] }}
       </span>
-      <a class="btn" style="float:right" href="#/bug/{{ n.bug_id }}">弹窗看完整详情</a>
+      <a class="btn" style="float:right" href="#/item/{{ n.target }}/{{ n.item_id }}">弹窗看完整详情</a>
     </h3>
     <p class="hint">
-      bug 状态：<b>{{ status_labels[n.bug_status] }}</b> ·
-      pri {{ n.pri }} / S{{ n.severity }} ·
+      条目状态：<b>{{ status_labels[n.item_status] }}</b> ·
+      pri {{ n.pri }}{% if n.severity %} / S{{ n.severity }}{% endif %} ·
       分支 <code>{{ n.branch or '未建' }}</code> ·
       提问时间 {{ n.created_at }}{% if n.replied_at %} · 答复时间 {{ n.replied_at }}{% endif %}
     </p>
 
-    <h4 class="hint" style="color:#23272f;font-weight:600">AI 卡在哪一步（question）</h4>
+    <h4 class="hint" style="color:#23272f;font-weight:600">
+      {{ '需求理解与修改细则（question）' if n.need_kind == 'plan' else 'AI 卡在哪一步（question）' }}
+    </h4>
     <pre class="detail-block" style="white-space:pre-wrap">{{ n.question }}</pre>
 
     {% if n.ai_options %}
@@ -47,18 +64,28 @@
     <div style="white-space:pre-wrap">{{ n.owner_reply }}</div>
     {% endif %}
 
-    <form method="post" action="{{ url_for('need_reply', need_id=n.id) }}" style="margin-top:10px">
-      <textarea name="owner_reply" placeholder="填写方案 / 决策，例如：按方案A改，只影响 XX 模块，注意兼容旧数据"
+    <form method="post" action="{{ url_for('need_reply', need_id=n.id, kind=n.target) }}"
+          style="margin-top:10px">
+      <textarea name="owner_reply"
+                placeholder="{{ '填写确认或改后的细则，例如：按方案A做，只动 XX 模块，兼容旧数据' if n.need_kind == 'plan' else '填写方案 / 决策，例如：按方案A改，只影响 XX 模块，注意兼容旧数据' }}"
                 data-required>{{ n.owner_reply or '' }}</textarea>
       <div class="row-actions">
-        <button class="btn btn-primary" type="submit">提交方案</button>
-        <span class="hint">提交后状态变 replied，AI 下次运行按 pri/优先级最先处理该 bug。</span>
+        <button class="btn btn-primary" type="submit">
+          {{ '确认方案，开始实现' if n.need_kind == 'plan' else '提交方案' }}
+        </button>
+        {% if n.need_kind == 'plan' and n.status == 'awaiting' %}
+        <button class="btn" type="submit" name="quick"
+                onclick="this.form.owner_reply.value='确认，按 AI 建议的方案实现；边界与回滚方式按方案里写的执行。'">
+          一键确认（照 AI 建议做）
+        </button>
+        {% endif %}
+        <span class="hint">{{ '提交后这条任务解锁落码，AI 下次运行最先处理它。' if n.need_kind == 'plan' else '提交后状态变 replied，AI 下次运行按 pri/优先级最先处理该条目。' }}</span>
       </div>
     </form>
 
     {% if n.status == 'replied' %}
-    <form method="post" action="{{ url_for('need_done', need_id=n.id) }}"
-          data-confirm="确认该阻塞项已由 AI 处理完成并关闭？">
+    <form method="post" action="{{ url_for('need_done', need_id=n.id, kind=n.target) }}"
+          data-confirm="确认该条目已由 AI 处理完成并关闭？">
       <div class="row-actions"><button class="btn" type="submit">标记已处理完成</button></div>
     </form>
     {% endif %}
@@ -66,16 +93,16 @@
     {# The answer to a blocker is allowed to be "不修了": the owner decides it is
        not reproducible, not a defect, or already closed upstream. Closing never
        touches trunk and never deletes a draft branch. #}
-    {% if n.status != 'done' and n.bug_status in closeable_statuses %}
-    <form method="post" action="{{ url_for('bug_close', bug_id=n.bug_id) }}"
-          data-confirm="确认结案？这条不再下发给 AI，本阻塞项会标记为已处理{% if n.branch %}；分支 {{ n.branch }} 上的草稿提交保留不动{% endif %}。trunk 不受影响，禅道状态由你手动改；之后想修还能「重开补修」。">
+    {% if n.status != 'done' and n.item_status in closeable_statuses %}
+    <form method="post" action="{{ url_for('bug_close', bug_id=n.item_id, kind=n.target) }}"
+          data-confirm="确认结案？这条不再下发给 AI，本条目会标记为已处理{% if n.branch %}；分支 {{ n.branch }} 上的草稿提交保留不动{% endif %}。trunk 不受影响，禅道状态由你手动改；之后想再修还能「重开补修」。">
       <div class="row-actions">
         <select name="resolution" style="width:auto">
           {% for r in close_resolutions %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
         </select>
         <input type="text" name="reason" placeholder="补充说明（可空，进留痕与禅道评论）" style="flex:1">
         <button class="btn btn-reject" type="submit">结案（不修了）</button>
-        <span class="hint">答复不必是方案：复现不出来、不是缺陷、禅道那边已关闭，都算一个结论。</span>
+        <span class="hint">答复不必是方案：复现不出来、不是缺陷、这轮不做、禅道那边已关闭，都算一个结论。</span>
       </div>
     </form>
     {% endif %}
@@ -83,6 +110,6 @@
   {% endfor %}
 </div>
 {% else %}
-<div class="panel"><p class="muted">当前状态下没有阻塞项。AI 处理不动的 bug 会出现在这里。</p></div>
+<div class="panel"><p class="muted">当前状态下没有待答复的条目。AI 处理不动的 bug、以及等你确认方案的任务会出现在这里。</p></div>
 {% endif %}
 {% endblock %}

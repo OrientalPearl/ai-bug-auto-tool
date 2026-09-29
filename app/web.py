@@ -88,19 +88,41 @@ def create_app() -> Flask:
     def _form() -> dict[str, str]:
         return {k: (v.strip() if isinstance(v, str) else v) for k, v in request.form.items()}
 
+    def _kind(default: str = "bug") -> str:
+        """Which Zentao object kind this request is about (``?kind=task`` / form field).
+
+        A task and a bug share numbering only inside their own kind, so every
+        per-item route needs it; the default keeps every existing bug link working.
+        """
+        raw = str(request.values.get("kind") or "").strip().lower()
+        return raw if raw in db.ITEM_KINDS else default
+
+    def _item(item_id: int) -> dict:
+        item = db.get_item(item_id, _kind())
+        if item is None:
+            abort(404)
+        return item
+
+    def _word(item: dict) -> str:
+        """The noun a message should use: 缺陷 or 任务."""
+        return "任务" if item.get("target") == "task" else "bug"
+
+    def _slug(item: dict) -> str:
+        """How the item is written back to a human or to the CLI: ``T5417`` / ``41468``."""
+        return db.item_slug(item["zentao_id"], item.get("target") or "bug")
+
     # ------------------------------------------------------------------
     # 1) kanban
     # ------------------------------------------------------------------
     @app.route("/")
     def kanban():
-        return render_template("kanban.html", bands=_kanban_bands())
+        kinds = _kind("all")
+        return render_template("kanban.html", bands=_kanban_bands(kinds),
+                               kind_filter=kinds)
 
     @app.route("/api/bug/<int:bug_id>")
     def api_bug(bug_id: int):
-        bug = db.get_bug(bug_id)
-        if bug is None:
-            abort(404)
-        return jsonify(bug)
+        return jsonify(_item(bug_id))
 
     # ------------------------------------------------------------------
     # 2) zentao sync
@@ -115,20 +137,37 @@ def create_app() -> Flask:
 
     @app.route("/sync", methods=["POST"])
     def sync_run():
+        kinds = _sync_kinds()
         try:
-            result = sync.sync_now()
+            result = sync.sync_now(kinds=kinds)
         except (ZentaoError, RuntimeError) as exc:
             flash(f"同步失败：{exc}", "error")
             return redirect(url_for("sync_page"))
         if result["errors"]:
             flash("同步出现错误：" + " | ".join(result["errors"])[:500], "error")
-        else:
-            flash(
-                f"同步完成：新增 {result['created']} 条，更新 {result['updated']} 条，"
-                f"共 {result['total']} 条待修 bug。",
-                "ok",
-            )
+        by = result.get("by_kind") or {}
+        parts = "，".join(f"{_kind_word(k)} 新增 {v['created']} / 更新 {v['updated']}"
+                          for k, v in sorted(by.items()))
+        if not result["errors"]:
+            flash(f"同步完成：{parts or '没有拉到条目'}；共 {result['total']} 条。", "ok")
         return redirect(url_for("sync_page"))
+
+    def _sync_kinds(field: str = "kinds") -> tuple[str, ...]:
+        """Which kinds the buttons asked for (checkboxes or a comma list).
+
+        Default is both: a page that does not send the field at all must not
+        silently narrow what gets pulled.
+        """
+        raw = [str(v).strip().lower() for v in request.values.getlist(field)]
+        picked: list[str] = []
+        for chunk in raw:
+            for part in chunk.split(","):
+                if part in db.ITEM_KINDS and part not in picked:
+                    picked.append(part)
+        return tuple(picked) or tuple(db.ITEM_KINDS)
+
+    def _kind_word(kind: str) -> str:
+        return "任务" if kind == "task" else "缺陷"
 
     @app.route("/sync/doctor")
     def sync_doctor():
@@ -159,14 +198,18 @@ def create_app() -> Flask:
     @app.route("/sync/details", methods=["POST"])
     def sync_details():
         """Bulk pull screenshots / notes / attachments; limit 0 means everything."""
-        raw = _form().get("limit", "0")
+        form = _form()
+        raw = form.get("limit", "0")
         limit = int(raw) if str(raw).isdigit() and int(raw) > 0 else None
+        targets = _sync_kinds()
         try:
-            result = sync.pull_details(limit=limit)
+            result = sync.pull_details(limit=limit, targets=targets)
         except (ZentaoError, RuntimeError) as exc:
             flash(f"批量抓取失败：{exc}", "error")
             return redirect(url_for("sync_page"))
-        scope = "全部待处理 bug" if limit is None else f"优先级最高的 {limit} 条 bug"
+        scope = ("全部待处理条目" if limit is None
+                 else f"优先级最高的 {limit} 条条目")
+        scope += f"（{'、'.join(_kind_word(t) for t in targets)}）"
         if result.get("ok"):
             flash(
                 f"{scope} 详情抓取完成：成功 {result['done']} 条，"
@@ -183,31 +226,38 @@ def create_app() -> Flask:
         return redirect(url_for("sync_page"))
 
     # ------------------------------------------------------------------
-    # 3) need solution list
+    # 3) need solution list (blockers and task plans together)
     # ------------------------------------------------------------------
     @app.route("/need")
     def need_page():
         status = request.args.get("status", "awaiting")
         if status not in {"awaiting", "replied", "done", "all"}:
             status = "awaiting"
-        return render_template("need_solution.html", needs=db.list_needs(status), current=status)
+        kinds = _kind("all")
+        targets = tuple(db.ITEM_KINDS) if kinds == "all" else (kinds,)
+        return render_template("need_solution.html",
+                               needs=db.list_needs(status, targets),
+                               current=status, kind_filter=kinds)
 
     @app.route("/need/<int:need_id>/reply", methods=["POST"])
     def need_reply(need_id: int):
         reply = _form().get("owner_reply", "")
+        target = _kind()
         if not reply:
             flash("答复不能为空。", "error")
             return redirect(url_for("need_page"))
-        if db.reply_need(need_id, reply) is None:
+        need = db.reply_need(need_id, reply, target)
+        if need is None:
             abort(404)
-        flash("已记录答复，AI 下次运行会优先处理该 bug。", "ok")
+        flash(("方案已确认，AI 下次运行会实现这条任务。" if need.get("need_kind") == "plan"
+               else "已记录答复，AI 下次运行会优先处理该条目。"), "ok")
         return redirect(request.referrer or url_for("need_page"))
 
     @app.route("/need/<int:need_id>/done", methods=["POST"])
     def need_done(need_id: int):
-        if db.close_need(need_id) is None:
+        if db.close_need(need_id, _kind()) is None:
             abort(404)
-        flash("该阻塞项已标记为处理完成。", "ok")
+        flash("该条目已标记为处理完成。", "ok")
         return redirect(url_for("need_page", status="all"))
 
     # ------------------------------------------------------------------
@@ -215,21 +265,23 @@ def create_app() -> Flask:
     # ------------------------------------------------------------------
     @app.route("/review")
     def review_page():
-        return render_template("review.html", queue=db.list_review_queue())
+        kinds = _kind("all")
+        targets = tuple(db.ITEM_KINDS) if kinds == "all" else (kinds,)
+        return render_template("review.html", queue=db.list_review_queue(targets),
+                               kind_filter=kinds)
 
     @app.route("/review/<int:bug_id>/pass", methods=["POST"])
     def review_pass(bug_id: int):
-        bug = db.get_bug(bug_id)
-        if bug is None:
-            abort(404)
+        bug = _item(bug_id)
         merged = _form().get("merged_revision", "")
-        review = db.record_review(bug_id, "pass", merged_revision=merged)
+        review = db.record_review(bug_id, "pass", merged_revision=merged,
+                                  target=bug["target"])
         note = "人工审查通过，已合入 trunk"
         if merged:
             note += f" r{merged}"
-        result = sync.push_comment(bug["zentao_id"], f"{note}。")
+        result = sync.push_comment(bug["zentao_id"], f"{note}。", target=bug["target"])
         flash(
-            f"bug #{bug['zentao_id']} 已标记为已合入（trunk r{merged or '未填写'}）。"
+            f"{_word(bug)} #{_slug(bug)} 已标记为已合入（trunk r{merged or '未填写'}）。"
             + ("" if result["ok"] else f" 禅道评论未写入：{result['detail'][:120]}"),
             "ok",
         )
@@ -238,19 +290,19 @@ def create_app() -> Flask:
 
     @app.route("/review/<int:bug_id>/reject", methods=["POST"])
     def review_reject(bug_id: int):
-        """Send the bug back for another round. The draft branch stays where it is:
+        """Send the item back for another round. The draft branch stays where it is:
         the next run continues on top of it and the eventual push carries every
         round's changes as one SVN commit."""
-        bug = db.get_bug(bug_id)
-        if bug is None:
-            abort(404)
+        bug = _item(bug_id)
         reason = _form().get("reject_reason", "")
         if not reason:
             flash("打回必须填写原因。", "error")
             return redirect(url_for("review_page"))
-        db.record_review(bug_id, "reject", reject_reason=reason)
-        sync.push_comment(bug["zentao_id"], f"人工审查打回，原因：{reason}")
-        flash(f"bug #{bug['zentao_id']} 已打回，AI 下次运行会在原分支 {bug.get('branch') or '（未建分支）'} "
+        db.record_review(bug_id, "reject", reject_reason=reason, target=bug["target"])
+        sync.push_comment(bug["zentao_id"], f"人工审查打回，原因：{reason}",
+                          target=bug["target"])
+        flash(f"{_word(bug)} #{_slug(bug)} 已打回，AI 下次运行会在原分支 "
+              f"{bug.get('branch') or '（未建分支）'} "
               f"上继续修改（改动未回滚），最终推送时几轮改动会合成一次 svn 提交。", "ok")
         return redirect(url_for("review_page"))
 
@@ -263,9 +315,7 @@ def create_app() -> Flask:
         and typed the log message itself. ``mode=dry`` runs the identical checks
         (mirror, base, trunk drift, pending list) without writing anywhere.
         """
-        bug = db.get_bug(bug_id)
-        if bug is None:
-            abort(404)
+        bug = _item(bug_id)
         payload = _form()
         message = str(payload.get("message") or "").strip()
         dry = str(payload.get("mode") or "push") == "dry"
@@ -282,14 +332,14 @@ def create_app() -> Flask:
             return redirect(url_for("review_page"))
 
         if bug["status"] != "await_review" and not dry:
-            text = (f"bug #{bug['zentao_id']} 当前状态是"
+            text = (f"{_word(bug)} #{_slug(bug)} 当前状态是"
                     f"「{STATUS_LABELS.get(bug['status'], bug['status'])}」，不是待审查，未推送。")
             return reply({"ok": False, "summary": text, "detail": text}, "error", text)
 
         try:
             prom = svn_promote.promote(bug, message, dry_run=dry, merge_trunk=align)
         except svn_promote.PromoteError as exc:
-            text = f"bug #{bug['zentao_id']} 推送被拒绝：{exc}"
+            text = f"{_word(bug)} #{_slug(bug)} 推送被拒绝：{exc}"
             return reply({"ok": False, "summary": text, "detail": text}, "error", text)
 
         files = prom.files_to_commit()
@@ -322,8 +372,9 @@ def create_app() -> Flask:
             db.add_revision(bug["id"], prom.revision, branch=bug.get("branch") or "",
                             message=message,
                             author=get_settings().svn_username or "owner", files=files,
-                            git_commit=prom.commit)
-            db.record_review(bug["id"], "pass", merged_revision=prom.revision)
+                            git_commit=prom.commit, target=bug["target"])
+            db.record_review(bug["id"], "pass", merged_revision=prom.revision,
+                             target=bug["target"])
             note = (f"已由主人从审查页正式推入 SVN：{prom.url} r{prom.revision}"
                     f"（{len(files)} 个文件）"
                     + (f"，其中 {len(prom.merged_files)} 个推送前已对齐到 trunk 现内容"
@@ -331,8 +382,8 @@ def create_app() -> Flask:
                     + (f"，{len(prom.landed)} 个文件上一轮已入库不再重复"
                        f"（{('、'.join(prom.landed))[:200]}）" if prom.landed else "")
                     + f"。提交说明：{message}")
-            result = sync.push_comment(bug["zentao_id"], note)
-            text = (f"bug #{bug['zentao_id']} 已推入 SVN r{prom.revision}，"
+            result = sync.push_comment(bug["zentao_id"], note, target=bug["target"])
+            text = (f"{_word(bug)} #{_slug(bug)} 已推入 SVN r{prom.revision}，"
                     f"状态改为已合入。"
                     + ("" if result["ok"] else f" 禅道评论未写入：{result['detail'][:120]}"))
             return reply({"ok": True, "summary": text, "detail": prom.detail(),
@@ -358,13 +409,14 @@ def create_app() -> Flask:
                 "unverified": "失败原因见 evidence 原始输出；修好原因后可直接重推",
                 "rollback": "无远端写入，无需回退",
             },
-            kind="manual", author="owner",
+            kind="manual", author="owner", target=bug["target"],
         )
         sync.push_comment(
             bug["zentao_id"],
             f"人工推入 SVN 未成功（仅留痕，状态仍是待审查，AI 草稿未变）：{reason[:300]}",
+            target=bug["target"],
         )
-        text = (f"bug #{bug['zentao_id']} 推送失败：已留痕，状态仍是"
+        text = (f"{_word(bug)} #{_slug(bug)} 推送失败：已留痕，状态仍是"
                 f"「{STATUS_LABELS.get(bug['status'], bug['status'])}」，git 草稿记录未删。")
         if prom.mergeable and not prom.overlaps and not align:
             text += (f" {len(prom.mergeable)} 个文件与 trunk 改动不重叠，"
@@ -385,9 +437,7 @@ def create_app() -> Flask:
         refuses -- typically because another session has HEAD on that branch --
         nothing is changed on the bug either.
         """
-        bug = db.get_bug(bug_id)
-        if bug is None:
-            abort(404)
+        bug = _item(bug_id)
         payload = _form()
         reason = str(payload.get("reject_reason") or "").strip()
         inline = request.headers.get("X-Requested-With") == "fetch-dialog"
@@ -399,22 +449,22 @@ def create_app() -> Flask:
             return redirect(url_for("review_page"))
 
         if bug["status"] not in ("await_review", "rejected"):
-            text = (f"bug #{bug['zentao_id']} 当前状态是"
+            text = (f"{_word(bug)} #{_slug(bug)} 当前状态是"
                     f"「{STATUS_LABELS.get(bug['status'], bug['status'])}」，"
                     "不是待审查/已打回，未回滚。")
             return reply({"ok": False, "summary": text, "detail": text}, "error", text)
         if not reason:
-            text = f"bug #{bug['zentao_id']} 回滚必须写清原因（这是不可逆动作的留痕）。"
+            text = f"{_word(bug)} #{_slug(bug)} 回滚必须写清原因（这是不可逆动作的留痕）。"
             return reply({"ok": False, "summary": text, "detail": text}, "error", text)
 
         done = svn_promote.rollback_draft(bug)
         if not done.ok:
-            text = f"bug #{bug['zentao_id']} 回滚失败：{done.summary()}"
+            text = f"{_word(bug)} #{_slug(bug)} 回滚失败：{done.summary()}"
             return reply({"ok": False, "summary": text, "detail": done.raw[-600:],
                           "status": bug["status"], "unchanged": True}, "error", text)
 
         db.record_review(bug["id"], "reject", reject_reason=f"拒绝并回滚：{reason}"[:500],
-                         change_status=False)
+                         change_status=False, target=bug["target"])
         db.add_analysis(
             bug["id"],
             {
@@ -428,14 +478,14 @@ def create_app() -> Flask:
                 "unverified": "拒绝判定由主人作出，执行器不再重做这条",
                 "rollback": f"如需恢复草稿：git branch {done.branch} {done.shadow}",
             },
-            kind="manual", author="owner",
+            kind="manual", author="owner", target=bug["target"],
         )
-        db.set_bug_status(bug["id"], "closed")
+        db.set_item_status(bug["id"], "closed", target=bug["target"])
         note = (f"人工审查拒绝该修改，已回滚草稿分支 {done.branch}"
                 f"{'（提交 ' + done.tip[:10] + ' 保留在影子引用里）' if done.tip else ''}，"
                 f"本地系统记为已结案。原因：{reason}")
-        result = sync.push_comment(bug["zentao_id"], note)
-        text = (f"bug #{bug['zentao_id']} 已拒绝并回滚草稿，状态改为已结案。"
+        result = sync.push_comment(bug["zentao_id"], note, target=bug["target"])
+        text = (f"{_word(bug)} #{_slug(bug)} 已拒绝并回滚草稿，状态改为已结案。"
                 + ("" if result["ok"] else f" 禅道评论未写入：{result['detail'][:120]}"))
         return reply({"ok": True, "summary": text, "detail": done.summary(),
                       "status": "closed", "branch": done.branch,
@@ -451,9 +501,7 @@ def create_app() -> Flask:
         of starting from zero. The executor continues on the same branch and the
         following push only carries the new commits.
         """
-        bug = db.get_bug(bug_id)
-        if bug is None:
-            abort(404)
+        bug = _item(bug_id)
         reason = str(_form().get("reject_reason") or "").strip()
         inline = request.headers.get("X-Requested-With") == "fetch-dialog"
 
@@ -464,21 +512,21 @@ def create_app() -> Flask:
             return redirect(request.referrer or url_for("kanban"))
 
         if bug["status"] not in ("merged", "closed"):
-            text = (f"bug #{bug['zentao_id']} 当前状态是"
+            text = (f"{_word(bug)} #{_slug(bug)} 当前状态是"
                     f"「{STATUS_LABELS.get(bug['status'], bug['status'])}」，"
                     "只有已合入或已结案的条目才需要重开。")
             return reply({"ok": False, "summary": text, "detail": text}, "error", text)
         if not reason:
-            text = f"bug #{bug['zentao_id']} 重开必须写清哪里不完全。"
+            text = f"{_word(bug)} #{_slug(bug)} 重开必须写清哪里不完全。"
             return reply({"ok": False, "summary": text, "detail": text}, "error", text)
 
-        prior = db.prior_fix(bug["id"])
+        prior = db.prior_fix(bug["id"], bug["target"])
         landed = prior["svn_revisions"]
         trail = "、".join(f"r{r}" for r in landed) if landed else "只有本地草稿，未进正式库"
         try:
-            db.reopen_bug(bug["id"], reason)
+            db.reopen_item(bug["id"], reason, target=bug["target"])
         except ValueError as exc:
-            text = f"bug #{bug['zentao_id']} 重开失败：{exc}"
+            text = f"{_word(bug)} #{_slug(bug)} 重开失败：{exc}"
             return reply({"ok": False, "summary": text, "detail": text}, "error", text)
         db.add_analysis(
             bug["id"],
@@ -492,13 +540,13 @@ def create_app() -> Flask:
                 "unverified": "本轮尚未开始，未验证",
                 "rollback": "无远端写入；要撤回这次重开只能重新审查",
             },
-            kind="manual", author="owner",
+            kind="manual", author="owner", target=bug["target"],
         )
         note = (f"人工审查后重开（第 {prior['rounds'] + 1} 轮）：上一轮{trail}，但仍不完全。"
                 f"不完全的地方：{reason}。"
                 "已把上一轮的结论、改动文件与修订号一并交回 AI，AI 会在原分支上续修。")
-        result = sync.push_comment(bug["zentao_id"], note)
-        text = (f"bug #{bug['zentao_id']} 已重开入队列（状态已打回），"
+        result = sync.push_comment(bug["zentao_id"], note, target=bug["target"])
+        text = (f"{_word(bug)} #{_slug(bug)} 已重开入队列（状态已打回），"
                 f"上一轮的修复与结论已随任务下发。"
                 + ("" if result["ok"] else f" 禅道评论未写入：{result['detail'][:120]}"))
         return reply({"ok": True, "summary": text, "detail": note,
@@ -516,12 +564,10 @@ def create_app() -> Flask:
         Nothing is undone: whatever the AI already did stays on the draft branch,
         and 重开补修 remains available afterwards.
         """
-        bug = db.get_bug(bug_id)
-        if bug is None:
-            abort(404)
+        bug = _item(bug_id)
         if bug["status"] not in CLOSEABLE_STATUSES:
             flash(
-                f"bug #{bug['zentao_id']} 当前是「{STATUS_LABELS.get(bug['status'], bug['status'])}」，"
+                f"{_word(bug)} #{_slug(bug)} 当前是「{STATUS_LABELS.get(bug['status'], bug['status'])}」，"
                 "不能直接结案：待审查/已打回请走「拒绝并回滚」（它会留痕并删掉草稿分支），"
                 "修复中请等这一轮跑完。",
                 "error",
@@ -537,10 +583,10 @@ def create_app() -> Flask:
         if not resolution:
             resolution = CLOSE_MERGED_RESOLUTION if was_merged else CLOSE_RESOLUTIONS[-1]
 
-        db.set_bug_status(bug["id"], "closed")
+        db.set_item_status(bug["id"], "closed", target=bug["target"])
         # A blocker nobody has to answer any more: sweep the open questions so the
         # 需方案 page and the AI queue stop treating a closed bug as work in progress.
-        closed_needs = db.close_open_needs(bug["id"])
+        closed_needs = db.close_open_needs(bug["id"], bug["target"])
         if not was_merged:
             db.add_analysis(
                 bug["id"],
@@ -550,15 +596,16 @@ def create_app() -> Flask:
                 },
                 kind="manual",
                 author="owner",
+                target=bug["target"],
             )
         if was_merged:
             text = "已合入 trunk 并完成人工确认，本地系统标记为已结案（禅道状态请主人手动更新）。"
         else:
             text = f"本地结案：{resolution}" + (f" —— {reason}" if reason else "")
             text += "。未修改代码，AI 不再处理这条；禅道状态请主人手动更新。"
-        result = sync.push_comment(bug["zentao_id"], text)
+        result = sync.push_comment(bug["zentao_id"], text, target=bug["target"])
         flash(
-            f"bug #{bug['zentao_id']} 已标记为已结案（{resolution}）"
+            f"{_word(bug)} #{_slug(bug)} 已标记为已结案（{resolution}）"
             + (f"，同时关闭 {closed_needs} 条待答复的阻塞项" if closed_needs else "")
             + ("。" if was_merged or not bug["branch"] else f"；分支 {bug['branch']} 上的草稿提交保留不动。")
             + ("" if result["ok"] else f" 禅道评论未写入：{result['detail'][:120]}"),
@@ -568,14 +615,12 @@ def create_app() -> Flask:
 
     @app.route("/bug/<int:bug_id>/detail", methods=["POST"])
     def bug_refresh_detail(bug_id: int):
-        """Pull screenshots / notes / attachments for one bug."""
-        bug = db.get_bug(bug_id)
-        if bug is None:
-            abort(404)
-        result = sync.refresh_detail(bug["zentao_id"])
+        """Pull screenshots / notes / attachments for one item."""
+        bug = _item(bug_id)
+        result = sync.refresh_detail(bug["zentao_id"], target=bug["target"])
         if result.get("ok"):
             flash(
-                f"bug #{bug['zentao_id']} 详情已更新：{result['steps_length']} 字描述、"
+                f"{_word(bug)} #{_slug(bug)} 详情已更新：{result['steps_length']} 字描述、"
                 f"{result['comments']} 条备注、图片 {result['images_saved']}/{result['images']} 张已下载",
                 "ok",
             )
@@ -583,10 +628,17 @@ def create_app() -> Flask:
             flash(f"详情抓取失败：{result.get('detail')}", "error")
         return redirect(request.referrer or url_for("kanban"))
 
-    @app.route("/files/<int:zentao_id>/<path:filename>")
-    def attachment_file(zentao_id: int, filename: str):
-        """Serve a downloaded Zentao attachment to the browser."""
-        directory = Path(get_settings().attachment_dir) / f"zentao-{zentao_id}"
+    @app.route("/files/<ref>/<path:filename>")
+    def attachment_file(ref: str, filename: str):
+        """Serve a downloaded Zentao attachment to the browser.
+
+        ``ref`` is the item slug, so a bug's picture stays at ``/files/41468/...``
+        exactly as stored, and a task's lives beside it as ``/files/T5417/...``
+        instead of colliding with bug 5417.
+        """
+        if not re.fullmatch(r"[Tt]?\d{1,9}", ref or ""):
+            abort(404)
+        directory = Path(get_settings().attachment_dir) / f"zentao-{db.item_slug(ref)}"
         if not directory.is_dir():
             abort(404)
         return send_from_directory(directory, filename)
@@ -721,9 +773,14 @@ def create_app() -> Flask:
     return app
 
 
-def _kanban_bands() -> list[dict[str, Any]]:
-    """Statuses folded into the three bands the owner works through."""
-    columns = {col["status"]: col for col in db.kanban_columns()}
+def _kanban_bands(kind: str = "all") -> list[dict[str, Any]]:
+    """Statuses folded into the three bands the owner works through.
+
+    ``kind`` narrows the cards to one Zentao object type; a card carries its own
+    ``target`` so the page can badge 缺陷/任务 and open the right detail endpoint.
+    """
+    targets = tuple(db.ITEM_KINDS) if kind not in db.ITEM_KINDS else (kind,)
+    columns = {col["status"]: col for col in db.kanban_columns(targets)}
     bands: list[dict[str, Any]] = []
     for key, label, hint, statuses in KANBAN_BANDS:
         groups = [columns[s] for s in statuses if columns.get(s) and columns[s]["count"]]
@@ -796,6 +853,8 @@ def _make_group(index: int, rows: list[dict[str, Any]]) -> dict[str, Any]:
         "products": rows,
         "bugs": sum(int(row["bugs"] or 0) for row in rows),
         "pending": sum(int(row["pending"] or 0) for row in rows),
+        "tasks": sum(int(row.get("tasks") or 0) for row in rows),
+        "task_pending": sum(int(row.get("task_pending") or 0) for row in rows),
         "bound": all(row["source"] == "product" for row in rows),
         "error": next((row["error"] for row in rows if row["error"]), ""),
         "mixed": len(directories) > 1,
@@ -839,8 +898,15 @@ def _scope_block(group: dict[str, Any], base_label: str) -> str:
     verbatim (and keeps updating itself), only this part is filled per selection.
     """
     lines = [f"【本轮范围 · {base_label} · 产品 {group['ids']}】",
-             f"只处理禅道产品 ID ∈ {{{group['ids']}}}（{group['names']}）的 bug；"
+             f"只处理禅道产品 ID ∈ {{{group['ids']}}}（{group['names']}）的 bug 与 task；"
              f"其他产品一律不接手、不 claim、不改码。"]
+    if group.get("tasks"):
+        lines.append(
+            f"这个范围里有 {group['tasks']} 条任务（待出方案 {group['task_pending']} 条）："
+            "**任务编号一律写成 T<禅道ID>**（例：T5417），缺陷写纯数字，两套号是独立的；"
+            "任务的第一轮**只给方案与修改细则**（`plan T<id>`），"
+            "主人确认之前 `checkout` / `draft` / `commit` 对这条任务会被命令直接拒绝（G13），"
+            "不要试图绕过，也不要把方案当成已批准。")
     if group["mixed"]:
         lines.append("注意：所选产品跨了 " + " / ".join(group["directories"]) +
                      " 这几个落码目录，不能并成一条队列；本轮只做其中与本目录相关的产品，"
@@ -892,7 +958,9 @@ def _scope_block(group: dict[str, Any], base_label: str) -> str:
                      "禁止为了并行再开第二个主对话动这个目录。")
     else:
         lines.append("本队列独占这个目录 → 可以和其他目录的队列并行，但这个目录同时只允许一个操作方。")
-    lines.append("取队列后自行过滤，只留本产品/本目录的条目：python -m app.cli tasks --limit 20")
+    lines.append("取队列后自行过滤，只留本产品/本目录的条目：python -m app.cli tasks --limit 20"
+                 "（返回里 kind=task 的是任务、queue_kind=plan_needed 的是还欠方案；"
+                 "只做本产品的条目）")
     lines.append("运行中这四类情况按 §3.4 自己解决，禁止停下来等我（无人值守时等待就是卡死）：")
     lines.append("  a) 模型/接口限流（rate limit、429、overloaded、quota、502/503、稍后再试）"
                  "→ 等 5 分钟重试同一步，最多 3 次（RETRY_WAIT/RETRY_MAX），期间不改状态、不 block、不退循环；"
@@ -948,16 +1016,30 @@ def _dispatch_checklist(queues: list[dict[str, Any]]) -> list[dict[str, str]]:
     else:
         add("err", "禅道账号未配置：同步、抓详情、回写评论都不通。先编辑 .env，再到「配置」页重新加载。")
 
-    open_rows = db.query_all(
-        "SELECT detail_synced_at FROM bugs WHERE status IN "
-        "('pending','fixing','rejected','need_solution','await_review')"
-    )
+    open_rows = []
+    for target in db.ITEM_KINDS:
+        open_rows.extend(db.query_all(
+            f"SELECT detail_synced_at FROM {db.tables_for(target).item} WHERE status IN "
+            "('pending','fixing','rejected','need_solution','await_review')"
+        ))
     missing = sum(1 for row in open_rows if not row["detail_synced_at"])
     if missing:
         add("warn", f"{missing} 条未抓详情（截图 / 备注 / 附件）：执行器看不到现场只能靠猜。",
             "python -m app.cli sync --details -1")
     else:
-        add("ok", "未关闭 bug 的详情都已抓到（描述 / 截图 / 备注）。")
+        add("ok", "未关闭条目的详情都已抓到（描述 / 截图 / 备注）。")
+
+    plans_open = int((db.query_one(
+        "SELECT COUNT(*) AS c FROM task_needs WHERE need_kind='plan' AND status='awaiting'"
+    ) or {}).get("c") or 0)
+    tasks_todo = int((db.query_one(
+        "SELECT COUNT(*) AS c FROM tasks WHERE status='pending'"
+    ) or {}).get("c") or 0)
+    if plans_open or tasks_todo:
+        add("info", f"任务与缺陷同一条流水线，但任务多一道闸门（G13）：还欠 {tasks_todo} 条首轮方案、"
+                    f"{plans_open} 条方案在等你确认；方案没确认前 checkout / draft / commit "
+                    "对这些任务会被命令直接拒掉，执行器只能先出方案。",
+            "python -m app.cli tasks --kinds task")
 
     for group in queues:
         if not group["bound"]:
@@ -1092,7 +1174,7 @@ def _repo_form(product_id: int | None) -> dict[str, Any]:
 
 
 def _repo_row(product_id: int, name: str, bugs: int, pending: int,
-              binding: dict | None) -> dict[str, Any]:
+              binding: dict | None, tasks: int = 0, task_pending: int = 0) -> dict[str, Any]:
     """One table row: what is stored for the product and what actually applies."""
     binding = binding or {}
     error = ""
@@ -1106,6 +1188,8 @@ def _repo_row(product_id: int, name: str, bugs: int, pending: int,
         "product_name": binding.get("product_name") or name,
         "bugs": bugs,
         "pending": pending,
+        "tasks": tasks,
+        "task_pending": task_pending,
         "bound": bool(binding),
         "enabled": int(binding.get("enabled", 1) or 0) if binding else 1,
         "repo_url": binding.get("repo_url") or "",
@@ -1123,7 +1207,7 @@ def _repo_row(product_id: int, name: str, bugs: int, pending: int,
 
 
 def _repo_rows() -> list[dict[str, Any]]:
-    """Every Zentao product seen in the bug table, joined with its binding."""
+    """Every Zentao product seen in the bug/task tables, joined with its binding."""
     bindings = {int(row["product_id"]): row for row in db.list_product_repos()}
     rows: list[dict[str, Any]] = []
     seen: set[int] = set()
@@ -1131,7 +1215,9 @@ def _repo_rows() -> list[dict[str, Any]]:
         pid = int(product["product_id"])
         seen.add(pid)
         rows.append(_repo_row(pid, product["product_name"] or "", int(product["bugs"]),
-                              int(product["pending"] or 0), bindings.get(pid)))
+                              int(product["pending"] or 0), bindings.get(pid),
+                              int(product.get("tasks") or 0),
+                              int(product.get("task_pending") or 0)))
     for pid, binding in bindings.items():
         if pid in seen:
             continue
@@ -1140,7 +1226,7 @@ def _repo_rows() -> list[dict[str, Any]]:
         ) or {}
         rows.append(_repo_row(pid, binding.get("product_name") or "", int(count.get("bugs") or 0),
                               0, binding))
-    rows.sort(key=lambda item: (-item["bugs"], item["product_id"]))
+    rows.sort(key=lambda item: (-(item["bugs"] + item["tasks"]), item["product_id"]))
     return rows
 
 
@@ -1164,13 +1250,17 @@ def _sync_summary() -> dict[str, Any]:
                 created += 1
             elif payload.get("action") == "updated":
                 updated += 1
-    open_rows = db.query_all(
-        "SELECT detail_synced_at FROM bugs WHERE status IN "
-        "('pending','fixing','rejected','need_solution','await_review')"
-    )
+    open_rows = []
+    for target in db.ITEM_KINDS:
+        open_rows.extend(db.query_all(
+            f"SELECT detail_synced_at, '{target}' AS target FROM {db.tables_for(target).item}"
+            " WHERE status IN ('pending','fixing','rejected','need_solution','await_review')"
+        ))
     missing = sum(1 for row in open_rows if not row["detail_synced_at"])
+    tasks = db.query_one("SELECT COUNT(*) AS c FROM tasks") or {}
     return {
         "total_bugs": sum(counts.values()),
+        "total_tasks": int(tasks.get("c") or 0),
         "pending": counts.get("pending", 0),
         "created_today": created,
         "updated_today": updated,
