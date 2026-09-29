@@ -292,6 +292,7 @@ python -m app.cli mirror 1024             # 只读探测镜像上这条的草稿
 python -m app.cli checkout 1024 [--base <基线>]  # 在镜像里建/切 bugfix/zentao-1024（默认基线 origin/trunk）
                                      # 镜像未就绪、或工作区有别人未提交的**真实**改动 → 拒绝且不改状态（不替你 stash）；
                                      # 该库那几十行常年结构性噪音（.trae/ 符号链接、CRLF、$Id$）不拦，另计入 dirty_noise
+                                     # 判据自己没读成功时 dirt.state=failed 且一并拒绝（未知≠干净）；git 拒绝切分支的 stderr 原文随 error 返回（2.3 那台是 git 1.7.1）
                                      # 上一轮崩在写索引中途留下的陈锁（0 字节 + 本机无 git 进程 + 静默超 5 分钟）自动回收，返回 lock.swept
 python -m app.cli draft 1024 --message "fix #1024 <根因>" --files a.c,b.c
                                      # 在镜像的这条分支上落草稿提交：只 add 列出的文件，返回短哈希当 git:<哈希>

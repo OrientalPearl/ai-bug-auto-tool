@@ -164,7 +164,10 @@ python -m app.cli doctor                   # 禅道通道分步诊断
    **不是 block 的理由，也不是开工的障碍**；`lock.state` 是 `.git/index.lock` 的现状
    （`absent`/`stale`/`hold`/`busy`/`odd`）——`stale` 表示是上一轮崩掉留下的 0 字节空锁，
    `checkout`/`draft` 会自己回收（返回里带 `lock.swept`），**不需要也不许为它写 block**；
-   只有 `hold`/`busy`（非 0 字节、太新、或有活的 git 进程）才 block 并抄上 size/age
+   只有 `hold`/`busy`（非 0 字节、太新、或有活的 git 进程）才 block 并把 size/age 抄进去；
+   `dirt.state` 是这套脏判据**自己**有没有读成功（`ok`/`failed`）：2.3 那台是 git 1.7.1，
+   判据探测不过时会退回兼容写法，仍读不出就一律 `failed` + `worktree_clean=false`，
+   **绝不把「测不出来」当「干净」**；此时 `dirt.why` 与 `checkout` 的 `error` 带 git 原话，照原话 block
 5. 在镜像里为这条 bug 开/切本地分支：**`python -m app.cli checkout <禅道ID>`**（默认基线
    `refs/remotes/origin/trunk`；镜像未就绪、或工作区有**别人未提交的真实改动**时它会拒绝并列出文件，
    不替你 stash）；

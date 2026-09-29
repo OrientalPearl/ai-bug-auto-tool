@@ -230,8 +230,8 @@ git --git-dir=<镜像名>/.git fsck   # dangling blob 是镜像的正常现象�
 
 | 命令 | 做什么 | 护栏 |
 | --- | --- | --- |
-| `mirror <ID>` | 只读探测：草稿分支在不在、tip、领先几笔、改了哪些文件、镜像当前停在哪个分支、工作区**真实**脏不脏（`worktree_clean` + `dirty_real`/`dirty_noise`/`dirty_untracked` + `dirty_paths`）、`index.lock` 现状（`lock.state`）、就绪三判据（`mirror_ready`） | 纯只读，不 fetch 不 checkout，**也不删锁** |
-| `checkout <ID> [--base …]` | 建/切这条 bug 的 `bugfix/zentao-<ID>`，默认基线 `refs/remotes/origin/trunk`，成功即置 `fixing` 并写回 branch | 镜像缺 trunk ref 或索引没落盘 → 拒绝；工作区有**别人的真实未提交改动** → 拒绝并列出文件（不 stash 不切走，那是别人的会话）。本镜像的结构性噪音**不拦**；上一轮死掉留下的陈锁**自动回收**（见下） |
+| `mirror <ID>` | 只读探测：草稿分支在不在、tip、领先几笔、改了哪些文件、镜像当前停在哪个分支、工作区**真实**脏不脏（`worktree_clean` + `dirty_real`/`dirty_noise`/`dirty_untracked` + `dirty_paths` + `dirt{state,git,why}`）、`index.lock` 现状（`lock.state`）、就绪三判据（`mirror_ready`） | 纯只读，不 fetch 不 checkout，**也不删锁** |
+| `checkout <ID> [--base …]` | 建/切这条 bug 的 `bugfix/zentao-<ID>`，默认基线 `refs/remotes/origin/trunk`，成功即置 `fixing` 并写回 branch | 镜像缺 trunk ref 或索引没落盘 → 拒绝；工作区有**别人的真实未提交改动** → 拒绝并列出文件（不 stash 不切走，那是别人的会话）；**读不出工作区状态（`dirt.state=failed`）也拒绝**——未知不等于干净。git 拒绝切分支时的 stderr 原文会随 `error` 返回。本镜像的结构性噪音**不拦**；上一轮死掉留下的陈锁**自动回收**（见下） |
 | `draft <ID> --message "fix #<ID> …" --files a,b` | 只 `git add` 列出的文件并提交，返回短哈希 | 同上：陈锁自动回收后才动手；说明必须以 `fix #<禅道ID>` 开头（G8）；`--files` 必填、必须是镜像内相对路径、不许 `..`/绝对路径/`.git`；分支不存在就报错让你先 `checkout`；HEAD 不在这条分支上就拒绝；暂存为空 → 不造空提交 |
 | `reconcile [ID] [--apply]` | 对账：镜像上有草稿提交、库里却没登记（执行器跑完没收口 / 崩在收口前） | 默认只报告；`--apply` 才登记 `git:<哈希>` 并转 `await_review`，分析里写明「结论来自 git 提交信息，未验证」 |
 | `tmp-clean [--apply]` | 回收跑完留在项目根的交接文件（`a_<ID>.json`、`blk_<ID>.json`、`py_<ID>.py`、`_tmp_*.py`） | 只认上面这几种命名；分析**没**入库的 `a_<ID>.json` 一律留着只报告；默认 dry-run，`--apply` 才删；`.env`、库文件、源码都不在候选里 |
@@ -249,6 +249,16 @@ git --git-dir=<镜像名>/.git fsck   # dangling blob 是镜像的正常现象�
 加起来等于你自己在 SSH 侧数出来的 `git status --porcelain` 行数，`dirty_paths` 给出前 5 个真实改动的文件。
 执行器**不许**因为噪音就 `block`，也不许绕过这条判据自己拼 `ssh … git checkout`：真撞上有人的真实改动，
 按 §3.4 三处理（不动它、block 写清是哪个文件）。
+
+上面那句「`M` 要先过 `--ignore-cr-at-eol`」在 2.3 那台是不成立的：那里是 **git 1.7.1**，`-c <key>` 与
+`--ignore-cr-at-eol` 两个都不认，探测直接失败、旧判据把「探测失败的空输出」读成「干净」，于是 `dirty_real`
+恒为 0、`worktree_clean` 恒为 true，而 `git checkout -b` 被 git 本体拒绝、stderr 又被吞掉——只剩一句
+「建分支失败」，2.3 上 30 条 bug 就是这么逐条 block 的。现在的判据：先问这台 git 会什么再决定怎么用
+（不支持就退回 `sed 's/\r$//'` 剥 CR），**任何一步探测失败一律按「测不出来」处理并拒绝动工作树**，
+`git checkout` 的 stderr 原文随 `error` 一起返回。返回里多了 `dirt.state`（`ok|failed`）、`dirt.git`
+（那台的 git 版本）、`dirt.why`（读不出来时 git 说了什么），`mirror` 在读不出时 `worktree_clean` 直接给
+false。所以：**`dirt.state=failed` 时不许当成干净继续，`error` 里现在一定有 git 的原话**，照原话 block
+就是有效信息，不要再写「判据全绿但建分支失败」。
 
 `index.lock` 也一样：会话被 IDE 崩掉或模型报错打断时，git 正在写的 `.git/index.lock` 会留下一个
 **0 字节空锁**，git 自己不会清，于是这个镜像上后面每一条 bug 都撞同一堵墙（实测一天内三次，
@@ -724,7 +734,7 @@ Web /repos    各产品用哪个仓库、镜像在哪、正式 SVN 工作副本�
 | `i18n-up` / `i18n-commit` 报冲突 | 不许硬解（尤其 `.mo` 是二进制）：`block` 写「多语言冲突待人工处理」，把冲突文件名写进 `--question`，继续下一条 |
 | 报「未配置正式 SVN 工作副本」 | 该产品的 `svn_working_copy` 是空的：`bind-repo <产品ID> "<SVN仓库地址>" --svn-working-copy <正式SVN工作副本>` 补上；没补之前词条按老规矩留在镜像里，`block` 说明 |
 | 镜像 `refs/remotes/origin/trunk` 不存在或为空（clone/fetch 未完成） | 执行器**不许改码**，也不许转去动正式工作副本；`block` 写明「镜像未就绪」，等主人把 `git svn clone/fetch` 跑完 |
-| 另一条产品线（2.3 那份镜像）缺 index | 同上，但它挂在**另一台服务器**的共享目录上，那台目前不认这里的 key（`Permission denied (publickey)`）→ 主人要么在那台上用密码登录执行同一套 `read-tree` + 补文件，要么把执行侧的公钥装上去；在此之前该产品的 bug 全部 `block`「镜像未就绪（缺 index）」，不许转去动正式副本 |
+| 另一条产品线（2.3 那份镜像）缺 index | 同上，但它挂在**另一台服务器**的共享目录上；那台自 2026-09 起免密已可用（`mirror`/`checkout` 实测走得通），只是 git 是 **1.7.1**、不认 `-c`/`-C`，命令要写成 `git --git-dir=.git …`（§1.6）。缺 index 时照样 `block`「镜像未就绪（缺 index）」，不许转去动正式副本 |
 | clone 末尾报 `Filename too long` + `read-tree -m -u -v HEAD HEAD: command returned error: 128` | **不用重拉**：对象、基线 commit、`.git/svn/…/.rev_map` 都已写好，只是 `.git/index` 没落盘。**必须在 SSH（Linux）侧修** —— 本库有 109 组只差大小写的路径，Windows 侧的 `ignorecase` 修不出完整工作树。主人执行：`ssh <SSH用户>@<SSH主机> "cd <镜像目录> && git read-tree HEAD"` 建 index，再 `git -c core.ignorecase=false ls-files -z -d` 列出盘上缺的文件、`grep -zv '^\.trae/'` 滤掉符号链接那棵，`git -c core.ignorecase=false checkout --pathspec-from-file=<清单> --pathspec-file-nul` 补齐（实测 3.0 缺 129 条、补回 128 条，剩下 `.trae/doc/vpp-23.02/VPP_CORE_SHOW_LOG_AND_ERROR.md` 属符号链接噪音）。清单务必排掉 `.trae/` —— 那会写穿符号链接覆盖主人知识库。执行器遇到这种情况一律 `block` 写「镜像缺 index」，别自己动 |
 | 本地 git 分支攒了一堆 commit 没进正式库 | 正常状态（G11 设计如此）。由主人在 SSH 侧 `git -c core.ignorecase=false diff refs/remotes/origin/trunk..<分支>` 审，通过后自行 `git svn dcommit` 或出 patch 打到正式副本，再回填真实修订号 |
 | SSH 侧 `git status` 一跑冒出几十条 `M`，diff 是整文件重写 | Windows 侧检出留下的 CRLF（HEAD 里是 LF），本库实测 53 条（php / openvpn / products 那几棵第三方树居多）。不是改动，别去「修复」也别 `add -A`；看真实差异用 `git -c core.ignorecase=false diff --ignore-cr-at-eol`，`git add` 单文件时 git 会自动归一回 LF，提交内容不受影响。剩约 40 条是 `$Id$` 关键字形态差异，`--ignore-cr-at-eol` 消不掉，改到这类文件时在分析里点明 |
@@ -732,6 +742,7 @@ Web /repos    各产品用哪个仓库、镜像在哪、正式 SVN 工作副本�
 | 在 Windows 侧改了 `xt_dscp.c`，结果 `xt_DSCP.c` 变了 / `git status` 说另一半被删 | Windows 的 `ignorecase` 把大小写对偶混成一个（实测两个拼名 md5 相同）。立刻 `git -c core.ignorecase=false checkout -- <被误改的那个>` 回退，改到 SSH 侧重做；这类事故只有 Linux 侧能看出来 |
 | 工作树/分支基线莫名变化，或 `git status` 里冒出**别的产品/别的禅道 ID** 的文件 | 两个产品共用了同一份镜像却被并行处理（违反 §5）：立刻停掉其中一条队列，在 SSH 侧 `git -c core.ignorecase=false status` 核对，被串味的分支 `git reset --hard <基线>` 重做；要让它们真并行只能给其中一个另开一份镜像 |
 | 镜像被 `.git/index.lock` 冻住（`Unable to create …index.lock: File exists`） | 上一轮会话被 IDE 崩溃或模型报错打断在写索引的中间，留下 0 字节空锁，git 自己不清，于是这个镜像上后面每条 bug 都撞同一堵墙。**系统已经处理**：`checkout`/`draft` 会回收「0 字节 + 本机无 git 进程 + 静默超过 `LOCK_STALE_MINUTES`」的锁并返回 `lock.swept`；不满足条件（非 0 字节、太新、或有活的 git）就拒绝并告诉你该删哪个文件——那种情况才 `block`，并把 `lock.state`/size/age 抄进去。**不许**自己拼 `rm`，也不许为已被回收的锁写 block（§1.8） |
+| `mirror` 说 `worktree_clean=true`/`dirty_real=0`，但 `checkout` 仍然「建分支失败」，原因不明 | 这是 **2.3 那台 git 1.7.1 上的旧缺陷**（判据用的 `-c` 与 `--ignore-cr-at-eol` 探测失败被读成干净，git 的 stderr 又被吞），已修复（§1.8）：现在同一条 `mirror` 会如实给出 `dirty_real=1` + `dirty_paths` 点名文件，`checkout` 的 `error` 里带 git 原话（如 `error: You have local changes to '…'; cannot switch branches`）。再见到「判据全绿但建分支失败」就是回归，按原话 `block` 并抄 `dirt.state`/`dirt.git` |
 | 某条被 AI 反复处理不满意 | 三种处置别混：「打回」→ `rejected`，**改动与草稿分支都不回滚**，AI 在同一分支上追加提交，最终一次推入 SVN；「拒绝并回滚」→ 删掉该草稿分支（提交先存进 `refs/rejected/<分支>` 可取回），这条直接置 `closed`，AI 不再重做；「重开补修」（限 `merged`/`closed`）→ 已入过库但仍不完全，回到 `rejected` 重新入队，`queue_kind=reopened` |
 | 已合入的条目发现修得不完全 | 弹窗点「重开补修（入队列）」。登记的 r 号与草稿分支都保留，**trunk 不回退**（回退 trunk 是主人自己的 svn 动作）；上一轮的结论、改动文件、r 号作为 `prior_fix` 随任务下发。AI 在原分支续做；推送时以「上一轮推入的那个草稿提交」为增量基准，只把新改动入库，trunk 上已有的文件自动跳过，全一致就拒（不许空修订） |
 | 这条根本不该修（复现不出来 / 不是缺陷 / 重复单 / 禅道那边已关闭） | 主人在 `/need` 或详情弹窗点「结案（不修了）」，选理由即可，不必写方案（`await_review` 有草稿要推时走「拒绝并回滚」）。对执行器而言这是**正常收口**，不是失败：条目变 `closed` 后不再进队列，阻塞项被标记已处理，别重试也别再 `block` 同一条（§3.3） |

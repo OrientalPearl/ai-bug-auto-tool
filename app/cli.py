@@ -673,6 +673,7 @@ def cmd_mirror(args: argparse.Namespace) -> None:
         # these mirrors carry a permanent baseline of structural noise (§1.5).
         "worktree_clean": state.clean, "dirty_real": state.dirty_real, "dirty_noise": state.dirty_noise,
         "dirty_untracked": state.dirty_untracked, "dirty_paths": state.dirty_paths,
+        "dirt": _dirt_info(state),
         # Read-only: mirror never sweeps a lock, it only says what it found.
         "lock": _lock_info(state),
         "summary": state.summary(), "error": state.error,
@@ -698,6 +699,7 @@ def cmd_checkout(args: argparse.Namespace) -> None:
         "tip": result.tip, "status": "fixing" if result.ok else bug["status"],
         "dirty_real": result.dirty_real, "dirty_noise": result.dirty_noise,
         "dirty_untracked": result.dirty_untracked, "dirty_paths": result.dirty_paths,
+        "dirt": _dirt_info(result),
         "lock": _lock_info(result),
         "summary": result.summary(), "error": result.error,
     })
@@ -719,6 +721,23 @@ def _lock_info(result: Any) -> dict:
     swept = getattr(result, "lock_swept", "") or ""
     if swept:
         info["swept"] = swept
+    return info
+
+
+def _dirt_info(result: Any) -> dict:
+    """The worktree-dirt verdict, including whether it could be measured at all.
+
+    ``state=failed`` is the field that used to be missing: the 2.3 mirror runs git
+    1.7.1, whose probes can fail, and a failed probe read as "clean" while git itself
+    still refused every branch switch. Without this the blocker text is a contradiction.
+    """
+    state = getattr(result, "dirty_state", "") or ""
+    if not state:
+        return {}
+    info = {"state": state, "git": getattr(result, "git_version", "")}
+    why = getattr(result, "dirt_why", "") or ""
+    if why:
+        info["why"] = why
     return info
 
 

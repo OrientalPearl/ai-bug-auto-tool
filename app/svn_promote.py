@@ -21,6 +21,7 @@ Safety properties this module is responsible for:
 from __future__ import annotations
 
 import base64
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,6 +72,37 @@ def read_lock_marker(obj, tag: str, value: str) -> bool:
         return True
     if tag == "swept":
         obj.lock_swept = value.strip()
+        return True
+    return False
+
+
+def read_dirt_marker(obj, tag: str, value: str) -> bool:
+    """Copy a ``dirt`` / ``dirt_paths`` / ``dirt_why`` / ``gitv`` marker.
+
+    The fourth field of ``dirt`` is the one that saves runs: on the 2.3 mirror the
+    git is 1.7.1, so an option probe can fail, and "probe failed" must never be
+    rendered as "tree clean". Carrying the state plus git's own stderr words means
+    a blocked bug reads as "could not measure" instead of the false "dirty_real=0
+    but the checkout still failed" that blocked thirty tickets.
+    """
+    if tag == "dirt":
+        bits = (value.split("|") + ["0", "0", "0", ""])[:4]
+        try:
+            obj.dirty_real = int(bits[0] or 0)
+            obj.dirty_noise = int(bits[1] or 0)
+            obj.dirty_untracked = int(bits[2] or 0)
+        except ValueError:
+            return False
+        obj.dirty_state = bits[3] or "failed"
+        return True
+    if tag == "dirt_paths":
+        obj.dirty_paths = value.strip()
+        return True
+    if tag == "dirt_why":
+        obj.dirt_why = value.strip()
+        return True
+    if tag == "gitv":
+        obj.git_version = value.strip()
         return True
     return False
 
@@ -1203,6 +1235,7 @@ def draft_commit(bug: dict, message: str, files: list[str]) -> DraftCommit:
 
     mirror_dir = svn_client.resolve_target(bug=bug).working_copy
     target = remote_target(mirror_dir)
+    _require_wiring()
     args = [
         target.mirror, branch,
         base64.b64encode(text.encode("utf-8")).decode("ascii"),
@@ -1281,6 +1314,9 @@ class DraftState:
     dirty_noise: int = 0
     dirty_untracked: int = 0
     dirty_paths: str = ""
+    dirty_state: str = ""      # ok | failed -- "failed" means we could not read dirt
+    dirt_why: str = ""         # git's own words when the read failed
+    git_version: str = ""      # the toolchain on that host (2.3 is git 1.7.1)
     lock_state: str = ""
     lock_size: int = -1
     lock_age: int = -1
@@ -1319,6 +1355,14 @@ class DraftState:
 # Only a *real* local edit is ever at stake in a branch switch, so only that may
 # stop one. Counting the rest and reporting it is what keeps the guard useful --
 # a guard that refuses everything protects nothing and breaks the whole §1.8 chain.
+#
+# The two mirrors do not run the same toolchain, and this is where that bites:
+# 3.0 has git 2.33, 2.3 still has **git 1.7.1**, which understands neither
+# `-c <key>` nor `--ignore-cr-at-eol`. A failed probe prints nothing, so a gate
+# that reads "empty output" as "clean" tells every bug on 2.3 that the tree is
+# fine while git itself refuses every checkout -- 30 tickets ended up blocked that
+# way with "判据全绿但建分支失败". So: ask the git on this host what it can do,
+# degrade instead of failing, and treat a failed probe as UNKNOWN, which refuses.
 _DIRTY_GATE = r"""
 is_mirror_noise() {
   case "$1" in
@@ -1328,14 +1372,66 @@ is_mirror_noise() {
   return 1
 }
 
-# Fills REAL / NOISE / UNTRACKED / REAL_LIST. The loop reads from a here-document
-# on purpose: a pipe would run it in a subshell and the counters would be lost.
+# Fills GITE (a git invocation this host accepts), GITCR (how to compare ignoring
+# line-ending noise), GITV. Nothing here may assume a modern git.
+probe_git() {
+  GITV=$(git --version 2>/dev/null | sed 's/[^0-9]*\([0-9][0-9.]*\).*/\1/')
+  GITE="git"
+  if git -c core.ignorecase=false rev-parse --git-dir >/dev/null 2>&1; then
+    GITE="git -c core.ignorecase=false"     # Linux is case-sensitive anyway; this only
+  fi                                        # guards the rehearsal run under Windows sh
+  GITCR="--ignore-cr-at-eol"
+  # rc 0 = no diff, rc 1 = differences, rc > 1 = the option itself is unknown.
+  git diff --ignore-cr-at-eol --quiet HEAD >/dev/null 2>&1
+  [ $? -le 1 ] || GITCR=""                   # git 1.7.1: strip CR in the comparison instead
+  return 0
+}
+
+# Somebody's edit is what is left after dropping CR at line ends and the $Id$
+# keyword lines. git diff exits 0 (identical) / 1 (differs) / >1 (error), and an
+# error is never read as "clean" -- it is reported as an edit so the switch fails.
+path_is_edited() {
+  _p=$1
+  _tf="/tmp/dirtgate.$$.diff"
+  _ef="/tmp/dirtgate.$$.err"
+  if [ -n "$GITCR" ]; then
+    $GITE diff $GITCR -U0 -- "$_p" >"$_tf" 2>"$_ef"
+  else
+    $GITE diff -U0 -- "$_p" >"$_tf" 2>"$_ef"
+  fi
+  _rc=$?
+  if [ $_rc -gt 1 ]; then
+    rm -f "$_tf" "$_ef"
+    return 0
+  fi
+  _res=$(sed -e 's/\r$//' "$_tf" 2>/dev/null | grep '^[+-]' | grep -v '^+++' \
+         | grep -v '^---' | grep -v '\$Id' | sed -n '1,20p')
+  rm -f "$_tf" "$_ef"
+  [ -n "$_res" ]
+}
+
+# Fills DIRT_STATE (ok|failed) / DIRT_WHY / REAL / NOISE / UNTRACKED / REAL_LIST.
+# The loop reads from a here-document on purpose: a pipe would run it in a
+# subshell and the counters would be lost.
 assess_dirt() {
   REAL=0
   NOISE=0
   UNTRACKED=0
   REAL_LIST=""
-  DIRTY=$(git -c core.ignorecase=false status --porcelain 2>/dev/null)
+  DIRT_STATE=failed
+  DIRT_WHY=""
+  probe_git
+  P gitv "$GITV"
+  PERR=$(mktemp 2>/dev/null || echo /tmp/dirtstatus.$$.err)
+  DIRTY=$($GITE status --porcelain 2>"$PERR")
+  SRC=$?
+  if [ $SRC -ne 0 ]; then
+    DIRT_WHY=$(tr '\n' ' ' < "$PERR" 2>/dev/null | cut -c1-200)
+    rm -f "$PERR"
+    return 0
+  fi
+  rm -f "$PERR"
+  DIRT_STATE=ok
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     xy=$(printf '%s' "$line" | cut -c1-2)
@@ -1352,13 +1448,7 @@ assess_dirt() {
     case "$idx" in 'M'|'A'|'R'|'C'|'U') real=1 ;; esac
     if [ "$real" = 0 ]; then
       case "$wt" in
-        'M')
-          # Somebody's edit is what is left after ignoring CR at line ends and the
-          # $Id$ keyword lines; unified=0 keeps a huge file from flooding us.
-          res=$(git -c core.ignorecase=false diff --ignore-cr-at-eol --unified=0 -- "$path" 2>/dev/null \
-                | grep '^[+-]' | grep -v '^+++' | grep -v '^---' | grep -v '\$Id' | sed -n '1,20p')
-          [ -n "$res" ] && real=1
-          ;;
+        'M') path_is_edited "$path" && real=1 ;;
         'D'|'U'|'T') real=1 ;;
         *) [ "$wt" != ' ' ] && real=1 ;;
       esac
@@ -1379,8 +1469,9 @@ EOF
 }
 
 report_dirt() {
-  P dirt "$REAL|$NOISE|$UNTRACKED"
+  P dirt "$REAL|$NOISE|$UNTRACKED|$DIRT_STATE"
   [ -n "$REAL_LIST" ] && P dirt_paths "$(printf '%s' "$REAL_LIST" | cut -c1-300)"
+  [ -n "$DIRT_WHY" ] && P dirt_why "$DIRT_WHY"
   return 0
 }
 """
@@ -1403,7 +1494,10 @@ P current "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
 P trunk_head "$(git rev-parse --short=10 refs/remotes/origin/trunk 2>/dev/null)"
 if git ls-files --error-unmatch AGENTS.md >/dev/null 2>&1; then P index ok; else P index missing; fi
 assess_dirt
-if [ "$REAL" = 0 ]; then P clean ok; else P clean dirty; fi
+if [ "$DIRT_STATE" != ok ]; then P clean unknown
+elif [ "$REAL" = 0 ]; then P clean ok
+else P clean dirty
+fi
 report_dirt
 git_dir_of || exit 0
 assess_lock
@@ -1456,6 +1550,7 @@ def draft_state(bug: dict, base_ref: str = "") -> DraftState:
 
     mirror_dir = svn_client.resolve_target(bug=bug).working_copy
     target = remote_target(mirror_dir)
+    _require_wiring()
     args = [target.mirror, branch, base_ref or promoted_commit(bug), str(lock_limit_minutes())]
     quoted = " ".join("'" + str(a).replace("'", "'\\''") + "'" for a in args)
     proc = subprocess.run(
@@ -1504,14 +1599,8 @@ def draft_state(bug: dict, base_ref: str = "") -> DraftState:
             out.index_ok = value == "ok"
         elif tag == "clean":
             out.clean = value == "ok"
-        elif tag == "dirt":
-            # "<real>|<noise>|<untracked>" -- see _DIRTY_GATE for what counts as which.
-            bits = (value.split("|") + ["0", "0", "0"])[:3]
-            out.dirty_real = int(bits[0] or 0)
-            out.dirty_noise = int(bits[1] or 0)
-            out.dirty_untracked = int(bits[2] or 0)
-        elif tag == "dirt_paths":
-            out.dirty_paths = value.strip()
+        elif read_dirt_marker(out, tag, value):
+            pass
         elif read_lock_marker(out, tag, value):
             pass
         elif tag == "err":
@@ -1540,6 +1629,9 @@ class Checkout:
     dirty_noise: int = 0
     dirty_untracked: int = 0
     dirty_paths: str = ""
+    dirty_state: str = ""
+    dirt_why: str = ""
+    git_version: str = ""
     lock_state: str = ""
     lock_size: int = -1
     lock_age: int = -1
@@ -1601,12 +1693,31 @@ if [ "$LOCK_STATE" != absent ]; then
 fi
 assess_dirt
 report_dirt
+if [ "$DIRT_STATE" != ok ]; then
+  # An unreadable worktree is never read as a clean one. On 2.3 this is what turns
+  # "判据全绿但建分支失败" into a message that names the real cause.
+  P err "读不到工作区状态（git ${GITV:-?}）：${DIRT_WHY:-git status 失败}；判据未知时不建分支，免得把别人的改动带进 $BR"
+  exit 1
+fi
 if [ "$REAL" -gt 0 ]; then
   P err "镜像工作区在 $CUR 上有 $REAL 处真实未提交改动（$REAL_LIST），不替你 stash / checkout：先让那条会话收口"
   exit 1
 fi
+# git refuses a switch for its own reasons, and only git words them ("error: You
+# have local changes to 'x'" on 1.7.1). Swallowing stderr is what left 30 tickets
+# blocked with "建分支失败" and nothing to act on, so the failure text is the error.
+run_git_checkout() {
+  _label=$1
+  shift
+  _out=$(git checkout "$@" 2>&1)
+  if [ $? -ne 0 ]; then
+    P err "$_label: $(printf '%s' "$_out" | tr '\n' ' ' | cut -c1-300)"
+    return 1
+  fi
+  return 0
+}
 if git rev-parse --verify "refs/heads/$BR" >/dev/null 2>&1; then
-  git checkout -q "$BR" || { P err "切到已有分支 $BR 失败"; exit 1; }
+  run_git_checkout "切到已有分支 $BR 失败" -q "$BR" || exit 1
   P action switched
 else
   FROM="$BASE"
@@ -1614,13 +1725,44 @@ else
   if ! git rev-parse --verify "$FROM^{commit}" >/dev/null 2>&1; then
     P err "基线不可用: $FROM"; exit 1
   fi
-  git checkout -q -b "$BR" "$FROM" || { P err "从 $FROM 建分支 $BR 失败"; exit 1; }
+  run_git_checkout "从 $FROM 建分支 $BR 失败" -q -b "$BR" "$FROM" || exit 1
   P action created
   P base "$FROM"
 fi
 P tip "$(git rev-parse --short=10 HEAD)"
 P done ok
 """
+
+# The remote scripts are assembled by concatenating gate snippets, and
+# concatenation is where they break: _CHECKOUT_SCRIPT once called git_dir_of /
+# sweep_lock with no _LOCK_GATE in front of it, every checkout died with
+# "command not found", and that reads like a broken mirror -- so each bug got
+# blocked instead of anyone noticing the typo. Checking the strings costs nothing
+# and does not need to reach the build server, so it runs before any of them ships.
+_GATE_HELPERS = ("is_mirror_noise", "probe_git", "path_is_edited", "assess_dirt",
+                 "report_dirt", "git_dir_of", "assess_lock", "report_lock",
+                 "sweep_lock", "lock_refuse", "run_git_checkout")
+
+
+def script_wiring_issues() -> list[str]:
+    """Return helpers a generated script calls but does not define (empty = sane)."""
+    problems: list[str] = []
+    for name, body in (("_DRAFT_SCRIPT", _DRAFT_SCRIPT),
+                       ("_DRAFT_COMMIT_SCRIPT", _DRAFT_COMMIT_SCRIPT),
+                       ("_CHECKOUT_SCRIPT", _CHECKOUT_SCRIPT)):
+        code = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
+        defined = set(re.findall(r"^([a-z_][a-z0-9_]*)\(\)", code, re.M))
+        for helper in _GATE_HELPERS:
+            if re.search(r"(?<![\w])" + helper + r"\s", code) and helper not in defined:
+                problems.append(f"{name} 调用 {helper}()，但脚本体内没有定义（缺 _DIRTY_GATE / _LOCK_GATE？）")
+    return problems
+
+
+def _require_wiring() -> None:
+    """Refuse to ship a script that would only fail after it reached the server."""
+    issues = script_wiring_issues()
+    if issues:
+        raise PromoteError("远端脚本不自洽，已拒绝下发：" + "；".join(issues))
 
 
 def checkout_draft(bug: dict, base: str = "") -> Checkout:
@@ -1639,6 +1781,7 @@ def checkout_draft(bug: dict, base: str = "") -> Checkout:
 
     mirror_dir = svn_client.resolve_target(bug=bug).working_copy
     target = remote_target(mirror_dir)
+    _require_wiring()
     args = [target.mirror, branch, base or "", str(lock_limit_minutes())]
     quoted = " ".join("'" + str(a).replace("'", "'\\''") + "'" for a in args)
     proc = subprocess.run(
@@ -1664,13 +1807,8 @@ def checkout_draft(bug: dict, base: str = "") -> Checkout:
             out.base = value
         elif tag == "tip":
             out.tip = value
-        elif tag == "dirt":
-            bits = (value.split("|") + ["0", "0", "0"])[:3]
-            out.dirty_real = int(bits[0] or 0)
-            out.dirty_noise = int(bits[1] or 0)
-            out.dirty_untracked = int(bits[2] or 0)
-        elif tag == "dirt_paths":
-            out.dirty_paths = value.strip()
+        elif read_dirt_marker(out, tag, value):
+            pass
         elif read_lock_marker(out, tag, value):
             pass
         elif tag == "done":
