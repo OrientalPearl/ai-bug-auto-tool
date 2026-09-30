@@ -875,13 +875,22 @@ def _queue_for(target: str, limit: int, stale_minutes: int) -> list[dict]:
                     "(n.need_kind = 'block'"
                     " OR (n.need_kind = 'plan'"
                     "     AND n.owner_reply IS NOT NULL AND n.owner_reply != ''))")
+    # A blocker the executor raised again after an earlier answer still waits on the
+    # owner. An old replied row must not hand the item back to the AI while a newer
+    # `awaiting` row is unanswered -- #42012 / #44274 / #29010 each had exactly that
+    # pair, and all three sat at the head of the queue as "the AI's turn" while the
+    # kanban rightly showed them under 要我处理. So any awaiting row vetoes the rank.
+    no_awaiting = (f"NOT EXISTS (SELECT 1 FROM {tab.need} a"
+                   f" WHERE a.{tab.fk} = i.id AND a.status = 'awaiting')")
     sql = f"""
         SELECT i.*, '{tab.kind}' AS target,
                (SELECT n.id FROM {tab.need} n
                  WHERE n.{tab.fk} = i.id AND n.status = 'replied'
+                   AND {no_awaiting}
                  ORDER BY n.replied_at DESC LIMIT 1) AS open_need_id,
                CASE
-                 WHEN EXISTS (SELECT 1 FROM {tab.need} n
+                 WHEN {no_awaiting}
+                   AND EXISTS (SELECT 1 FROM {tab.need} n
                                WHERE n.{tab.fk} = i.id AND n.status = 'replied'
                                  AND {replied_cond}) THEN 0
                  WHEN i.status = 'rejected' THEN 1
@@ -890,6 +899,7 @@ def _queue_for(target: str, limit: int, stale_minutes: int) -> list[dict]:
           FROM {tab.item} i
          WHERE i.status IN ('pending', 'rejected')
             OR (i.status NOT IN ('closed', 'merged', 'await_review')
+                AND {no_awaiting}
                 AND EXISTS (SELECT 1 FROM {tab.need} n
                             WHERE n.{tab.fk} = i.id AND n.status = 'replied'))
 {stale_sql}         ORDER BY queue_rank ASC, i.pri ASC, {severity_sql}i.id ASC

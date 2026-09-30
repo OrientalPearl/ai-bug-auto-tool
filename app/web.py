@@ -31,9 +31,14 @@ LOOP_PROMPT_SECTIONS = (r"^## 0\.", r"^### 3\.1 ", r"^### 3\.2 ", r"^## 9\.")
 
 # Kanban shows three stacked bands instead of one column per status:
 # (key, label, hint, statuses) in the order the owner reads them.
+#
+# ``rejected`` belongs to the AI band, not to "要我处理": a 打回 is the owner having
+# already acted -- the newest instruction is the reject reason, and the ball is back in
+# the executor's court (fetch_task_queue ranks it as queue_kind=rejected). Leaving it
+# under "要我处理" made a sent-back item look like it had never been queued at all.
 KANBAN_BANDS = (
-    ("mine", "要我处理", "需要你答复或拍板", ("need_solution", "await_review", "rejected")),
-    ("ai", "AI 在跑", "等 AI 出结果", ("pending", "fixing")),
+    ("mine", "要我处理", "需要你答复或拍板", ("need_solution", "await_review")),
+    ("ai", "AI 在跑", "等 AI 出结果（打回的在这里重做）", ("rejected", "pending", "fixing")),
     ("done", "已收尾", "已合入 / 已结案，只作回溯", ("merged", "closed")),
 )
 

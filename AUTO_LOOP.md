@@ -672,6 +672,10 @@ python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.
    一条既被打回、又留着「已答复阻塞项」的条目，**标签按打回算**（`queue_kind=rejected`，已入库过的算 `reopened`），
    并始终带 `reject_reason`（你的打回原话）与 `prior_fix`（上一轮结论/文件/草稿号）；旧的 `owner_reply` 也一并下发，
    两份指令都在，**以打回原话为准**（它更新）。排序仍占最前。
+   **另有一条否决规则**：这条只要还挂着**任何** `awaiting` 阻塞项——哪怕是答复过旧问题之后又新提的那条——
+   就**不进 AI 队列**。旧版只看"有没有 replied 行"，于是 `#42012/#44274/#29010` 三条各带着一条已答复的老问题
+   和一条你没答的新问题（#79/#80/#81）一起排在队首，执行器会拿着**还没回答的问题**去改码。
+   现在"有未答阻塞项"直接否决，条目留在「要我处理」等你；答复后它自己回到队首。
 6. **批次可调**：`.env` 的 `AI_BATCH_SIZE`（默认 5）是约定值；临时改批量直接 `tasks --limit N`。
 7. **退出条件由数据决定**：`tasks --limit 1` 返回空 = 没有可处理项，此时才允许停下汇报。
 8. **跑挂了不会把任务卡死**：被限流打断、进程被杀、会话断掉时，那条 bug 会停在 `fixing`；
@@ -776,7 +780,7 @@ Web /repos    各产品用哪个仓库、镜像在哪、正式 SVN 工作副本�
 | 工作树/分支基线莫名变化，或 `git status` 里冒出**别的产品/别的禅道 ID** 的文件 | 两个产品共用了同一份镜像却被并行处理（违反 §5）：立刻停掉其中一条队列，在 SSH 侧 `git -c core.ignorecase=false status` 核对，被串味的分支 `git reset --hard <基线>` 重做；要让它们真并行只能给其中一个另开一份镜像 |
 | 镜像被 `.git/index.lock` 冻住（`Unable to create …index.lock: File exists`） | 上一轮会话被 IDE 崩溃或模型报错打断在写索引的中间，留下 0 字节空锁，git 自己不清，于是这个镜像上后面每条 bug 都撞同一堵墙。**系统已经处理**：`checkout`/`draft` 会回收「0 字节 + 本机无 git 进程 + 静默超过 `LOCK_STALE_MINUTES`」的锁并返回 `lock.swept`；不满足条件（非 0 字节、太新、或有活的 git）就拒绝并告诉你该删哪个文件——那种情况才 `block`，并把 `lock.state`/size/age 抄进去。**不许**自己拼 `rm`，也不许为已被回收的锁写 block（§1.8） |
 | `mirror` 说 `worktree_clean=true`/`dirty_real=0`，但 `checkout` 仍然「建分支失败」，原因不明 | 这是 **2.3 那台 git 1.7.1 上的旧缺陷**（判据用的 `-c` 与 `--ignore-cr-at-eol` 探测失败被读成干净，git 的 stderr 又被吞），已修复（§1.8）：现在同一条 `mirror` 会如实给出 `dirty_real=1` + `dirty_paths` 点名文件，`checkout` 的 `error` 里带 git 原话（如 `error: You have local changes to '…'; cannot switch branches`）。再见到「判据全绿但建分支失败」就是回归，按原话 `block` 并抄 `dirt.state`/`dirt.git` |
-| 打了回但队列里像没这条 / 看不到打回理由 | **已修**（旧版缺陷）：一条被打回、同时又留着「已答复阻塞项」的条目会先落进 `replied` 分支就返回，`reject_reason` 与 `prior_fix` 双双不下发，`queue_kind` 还标成「已答复」——于是它在页面上不挂着「已打回」，AI 也只按你旧的答复续做。现在打回项一律带 `reject_reason` + `prior_fix`，标签按 `rejected`/`reopened` 算（`owner_reply` 仍一并下发，以更晚的打回原话为准）。注意看板把 `rejected` 归在「要我处理」带（不是「AI 在跑」），`/review` 里它已消失——想确认有没有入队就看 `/dispatch` 的「下一条会被处理的条目」或 `python -m app.cli tasks` |
+| 打了回但队列里像没这条 / 看不到打回理由 | **已修**（旧版缺陷）：一条被打回、同时又留着「已答复阻塞项」的条目会先落进 `replied` 分支就返回，`reject_reason` 与 `prior_fix` 双双不下发，`queue_kind` 还标成「已答复」——于是它在页面上不挂着「已打回」，AI 也只按你旧的答复续做。现在打回项一律带 `reject_reason` + `prior_fix`，标签按 `rejected`/`reopened` 算（`owner_reply` 仍一并下发，以更晚的打回原话为准）。看板上 `rejected` 归在**「AI 在跑」带**（打回是主人已经做完的动作，球在 AI 这边），不在「要我处理」；`/review` 里它已消失属正常，想确认有没有入队看 `/dispatch` 的「下一条会被处理的条目」或 `python -m app.cli tasks` |
 | 某条被 AI 反复处理不满意 | 三种处置别混：「打回」→ `rejected`，**改动与草稿分支都不回滚**，AI 在同一分支上追加提交，最终一次推入 SVN；「拒绝并回滚」→ 删掉该草稿分支（提交先存进 `refs/rejected/<分支>` 可取回），这条直接置 `closed`，AI 不再重做；「重开补修」（限 `merged`/`closed`）→ 已入过库但仍不完全，回到 `rejected` 重新入队，`queue_kind=reopened` |
 | 已合入的条目发现修得不完全 | 弹窗点「重开补修（入队列）」。登记的 r 号与草稿分支都保留，**trunk 不回退**（回退 trunk 是主人自己的 svn 动作）；上一轮的结论、改动文件、r 号作为 `prior_fix` 随任务下发。AI 在原分支续做；推送时以「上一轮推入的那个草稿提交」为增量基准，只把新改动入库，trunk 上已有的文件自动跳过，全一致就拒（不许空修订） |
 | 这条根本不该修（复现不出来 / 不是缺陷 / 重复单 / 禅道那边已关闭） | 主人在 `/need` 或详情弹窗点「结案（不修了）」，选理由即可，不必写方案（`await_review` 有草稿要推时走「拒绝并回滚」）。对执行器而言这是**正常收口**，不是失败：条目变 `closed` 后不再进队列，阻塞项被标记已处理，别重试也别再 `block` 同一条（§3.3） |

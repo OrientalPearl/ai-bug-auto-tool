@@ -17,7 +17,7 @@
 | 禅道回填 | 提交后自动评论（分支 + 修订号 + 待审查）、阻塞时评论「AI 阻塞」、任务出方案时评论「AI 已给出任务方案，等主人确认」；**不提供** resolve/close；缺陷与任务分别走 `/bug-comment-<id>` 与 `/task-comment-<id>`（后者会被禅道用 200 + `user-deny` 页拒绝，系统识别拒绝页、不再假报成功） | `commit` / `block` / `plan` / `comment` |
 | 分析结论落库 | 每条 bug 收尾必须写回结构化分析（现象/根因/定位依据/链路/改动/影响面/验证/未验证/回退/结论 + 闸门逐条），`REQUIRE_ANALYSIS` 让无分析的 commit 直接失败 | `analyze` / `commit --analysis-file` / `/review` |
 | 陈旧 index.lock 自回收 | 会话被 IDE 崩溃/模型报错打断在写索引中途，会留下 0 字节 `.git/index.lock`，git 自己不清，此后该镜像上每条 bug 都撞同一堵墙（实测一天三次、最长躺 8 小时）。写类命令（`checkout`/`draft`）自动回收，条件三者同时成立：恰好 0 字节、本机 `pgrep -x git` 为 0、已静默 `LOCK_STALE_MINUTES`（默认 5 分钟）。非 0 字节 / 太新 / 有活进程一律不动，只拒绝并给出该删的文件；`mirror` 永远只报告。`LOCK_STALE_MINUTES=0` 关闭自动回收 | `lock.state` / `lock.swept` |
-| 任务编排 | SQLite 队列 + 7 态状态机，缺陷与任务**共用同一套状态与同一条队列**；优先级 = 已答复/已确认方案 > 已打回 > 待处理（任务首轮标 `plan_needed`），再 pri 升序 / severity 降序（任务无 severity）；已是终态（`closed`/`merged`）或待审查的条目不会因历史阻塞项有答复而被重新排队 | `tasks [--kinds]` / `claim` / 看板 |
+| 任务编排 | SQLite 队列 + 7 态状态机，缺陷与任务**共用同一套状态与同一条队列**；优先级 = 已答复/已确认方案 > 已打回 > 待处理（任务首轮标 `plan_needed`），再 pri 升序 / severity 降序（任务无 severity）；已是终态（`closed`/`merged`）或待审查的条目不会因历史阻塞项有答复而被重新排队；**只要还挂着任何 `awaiting` 阻塞项就不进队列**（旧问题被答复过，不许把没答的新问题挤开） | `tasks [--kinds]` / `claim` / 看板 |
 | 任务两轮流程（G13） | 禅道任务第一轮**只出方案**：`plan T<id>` 落 `task_needs(need_kind='plan')` + 置 `need_solution` + 禅道留言；主人在 `/need` 确认（`owner_reply`）后条目回队列（`queue_kind=plan_approved`），才允许 `checkout` / `draft` / `commit`。**未确认时这三条命令与 `app/svn_promote.py` 都直接拒绝**（代码级闸门，不靠执行器自觉）；任务草稿分支 `bugfix/zentao-T<id>`、提交说明 `feat #<id>`，与同号缺陷在镜像里不撞车 | `plan` / `/need` / `status` 的 `plan_approved` / `AUTO_LOOP.md` G13 |
 | 结论式结案（人工） | 需方案的答复允许**不是方案**：`/need` 或详情弹窗选「无法重现 / 不是缺陷 / 重复单 / 禅道已关闭」直接结案，条目停止下发、阻塞项一并收口、留一条 `author=owner` 的人工分析；不删草稿分支、不动 trunk，之后仍可重开补修。执行器无此能力（G11） | `/bug/<id>/close` |
 | 无人值守连跑 | 一条条目跑完自动取下一条、卡点回填后不阻塞、任务方案登记后不空等、断线可续跑；下达「提交闸门 G1–G13」清单 | `AUTO_LOOP.md` |
@@ -91,7 +91,7 @@
 
 | 方法 | 路径 | 用途 | 入参 |
 | --- | --- | --- | --- |
-| GET | `/` | 看板（7 列状态 + 产品标签 + 截图画廊；「全部 / 只看缺陷 / 只看任务」三档，任务卡片带紫色「任务」徽标、编号写成 `T<id>`） | `kind=all\|bug\|task` |
+| GET | `/` | 看板（三条带：**要我处理** = 需方案 / 待审查；**AI 在跑** = 打回重做 / 待处理 / 正在跑；**已收尾** = 已合入 / 已结案；带内按状态分列，另有产品标签 + 截图画廊；「全部 / 只看缺陷 / 只看任务」三档，任务卡片带紫色「任务」徽标、编号写成 `T<id>`。打回后条目离开 `/review` 并进「AI 在跑」带，因为球已在 AI 那边） | `kind=all\|bug\|task` |
 | GET | `/api/bug/<id>` | **单条条目完整 JSON**（本地主键） | `?kind=task` 取任务 |
 | GET | `/sync` | 同步页：统计（缺陷数 + 任务数）、日志、待抓详情数 | — |
 | POST | `/sync` | 立即同步禅道条目（勾选决定同步哪几种） | `kinds`（复选 `bug`/`task`） |

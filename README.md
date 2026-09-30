@@ -321,6 +321,7 @@ python -m app.cli detail --all            # 全量抓（--kinds task 只抓任�
 python -m app.cli img-gate --check        # 重量已下载的截图：1x1 / 损坏图标为 unreadable（去掉 --check 才写库）
                                      # 这类图喂给视觉模型会 400 打断整轮，标出来后它们就不在「必须看图」清单里
 python -m app.cli tasks --limit 5         # 取队列：已答复/已确认方案 > 已打回 > 待处理（任务首轮 plan_needed），再按 pri 升序 / severity 降序
+                                     # 只要这条还挂着未答复的阻塞项（awaiting），就不进队列——老问题被答过不算数
                                      # 每条带 target=bug|task，任务编号一律写成 T<id>；--kinds task 只看任务
 python -m app.cli status 1024             # 读缺陷全文 + 历史提交 + 主人答复 + 所属产品
 python -m app.cli status T5417            # 读任务（另带 迭代/关联需求/截止时间/plan_approved）
