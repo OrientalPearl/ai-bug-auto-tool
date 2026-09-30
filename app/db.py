@@ -896,6 +896,23 @@ def _queue_for(target: str, limit: int, stale_minutes: int) -> list[dict]:
          LIMIT ?
     """
     rows = query_all(sql, tuple(params))
+
+    def attach_reject(item: dict) -> str:
+        """Load the owner's reject instruction and what the last round landed.
+
+        Kept in one place because two queue branches need it: a plain reject, and a
+        reject that also still holds an answered blocker (see below).
+        """
+        last_review = query_one(
+            f"SELECT * FROM {tab.review} WHERE {tab.fk} = ? ORDER BY id DESC",
+            (item["id"],),
+        )
+        item["reject_reason"] = (last_review or {}).get("reject_reason")
+        # An item that was already accepted once is a reopen, not a plain reject:
+        # the executor must inherit the previous round instead of re-deriving it.
+        item["prior_fix"] = prior_fix(item["id"], target)
+        return "reopened" if item["prior_fix"]["was_merged"] else "rejected"
+
     out = []
     for row in rows:
         row["files_changed"] = _json_load(row.get("files_changed")) or []
@@ -907,15 +924,7 @@ def _queue_for(target: str, limit: int, stale_minutes: int) -> list[dict]:
             kind = (row["owner_reply"] or {}).get("need_kind") or "block"
             row["queue_kind"] = "plan_approved" if kind == "plan" else "replied"
         elif row["status"] == "rejected":
-            last_review = query_one(
-                f"SELECT * FROM {tab.review} WHERE {tab.fk} = ? ORDER BY id DESC",
-                (row["id"],),
-            )
-            row["reject_reason"] = (last_review or {}).get("reject_reason")
-            # An item that was already accepted once is a reopen, not a plain reject:
-            # the executor must inherit the previous round instead of re-deriving it.
-            row["prior_fix"] = prior_fix(row["id"], target)
-            row["queue_kind"] = "reopened" if row["prior_fix"]["was_merged"] else "rejected"
+            row["queue_kind"] = attach_reject(row)
         elif row["status"] == "fixing":
             # Reclaimed: some earlier run claimed it and died before reporting.
             row["queue_kind"] = "stale"
@@ -924,6 +933,16 @@ def _queue_for(target: str, limit: int, stale_minutes: int) -> list[dict]:
             row["queue_kind"] = "plan_needed"
         else:
             row["queue_kind"] = "pending"
+        # A reject must never be shadowed by an older answered blocker: an item that was
+        # sent back while it still held an answered blocker fell into the replied branch
+        # above, and the owner's newest words ("回滚重新修改…") plus prior_fix disappeared
+        # -- #45746 looked like it had vanished from the queue. The fields are always
+        # attached now; only a plain replied label gets replaced, so a task that still
+        # needs its plan gate (plan_approved) keeps that gate and merely gains the text.
+        if row["status"] == "rejected" and "reject_reason" not in row:
+            reject_kind = attach_reject(row)
+            if row["queue_kind"] == "replied":
+                row["queue_kind"] = reject_kind
         out.append(row)
     return out
 

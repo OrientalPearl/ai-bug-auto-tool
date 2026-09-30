@@ -34,6 +34,26 @@ from . import db, svn_client, sync
 from .config import PROJECT_ROOT, get_settings
 
 
+def _utf8_streams() -> None:
+    """Never let the console codepage kill an unattended run.
+
+    When stdout is a pipe -- which is how the executor always reads this output -- a
+    redirected Windows process falls back to the locale codec (cp936 here), and one
+    single character outside GBK in a bug title ('↔', '→', an emoji carried over from a
+    screenshot) makes print() raise UnicodeEncodeError and abort the whole command.
+    That is a loop-killing failure with no cause anybody can see in the JSON, so force
+    UTF-8 and replace whatever still cannot be encoded.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+_utf8_streams()
+
+
 def _out(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
