@@ -44,6 +44,7 @@
     </div>
     <div class="row-actions">
       <label class="field-check"><input type="radio" name="base" value="0" {% if base == '0' %}checked{% endif %}> §0 最短下达语</label>
+      <label class="field-check"><input type="radio" name="base" value="0.5" {% if base == '0.5' %}checked{% endif %}> §0.5 在线讨论轮</label>
       <label class="field-check"><input type="radio" name="base" value="3.1" {% if base == '3.1' %}checked{% endif %}> §3.1 主循环（调度器）</label>
       <button class="btn-primary" type="submit">生成下达语</button>
       <span class="hint">勾几个都行；同一次勾选只应该覆盖<b>同一个落码目录</b>的产品。</span>
@@ -132,7 +133,8 @@
       <button class="btn right" type="button" data-copy="prompt-{{ loop.index }}">复制整段</button>
     </h3>
     <p class="hint">
-      {% if p.title.startswith('0') %}不挑产品时的整段下达语；要指定产品请用上面的「串行队列」里那条。
+      {% if p.title.startswith('0.5') %}在线讨论版：仍然在 AI-BUG 任务系统里工作，但这一轮只回忆单条条目的现值并讨论，不进入执行。
+      {% elif p.title.startswith('0') %}不挑产品时的整段下达语；要指定产品请用上面的「串行队列」里那条。
       {% elif p.title.startswith('3.1') %}调度器版：主对话只排队不下场改码，改码交给子任务。
       {% elif p.title.startswith('3.2') %}子任务版：<b>不用你粘</b>，主循环会按这个模板逐条生成；<code>&lt;禅道ID&gt;</code> 由它替换。
       {% elif p.title.startswith('9') %}一整轮的实操顺序（你的一步、AI 的一步、你的收尾），当操作手册看。
@@ -159,6 +161,7 @@
         <th style="width:150px">产品</th>
         <th style="width:70px">PRI/S</th>
         <th style="width:130px">入队原因</th>
+        <th style="width:130px">在线讨论</th>
       </tr>
     </thead>
     <tbody>
@@ -179,6 +182,10 @@
           'stale': '跑挂回收·重跑',
           'pending': '待处理'
         }[b.queue_kind] or b.queue_kind }}</td>
+        <td>
+          <button class="btn" type="button"
+                  data-discussion-item="1" data-bug-id="{{ b.id }}" data-target="{{ b.target }}">在线讨论下达语</button>
+        </td>
       </tr>
       {% endfor %}
     </tbody>

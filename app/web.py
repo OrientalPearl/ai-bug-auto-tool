@@ -27,7 +27,7 @@ STATUS_LABELS = {
 
 # Headings in AUTO_LOOP.md whose code block is meant to be pasted verbatim;
 # the 下达 page renders them instead of duplicating the text.
-LOOP_PROMPT_SECTIONS = (r"^## 0\.", r"^### 3\.1 ", r"^### 3\.2 ", r"^## 9\.")
+LOOP_PROMPT_SECTIONS = (r"^## 0\. ", r"^## 0\.5 ", r"^### 3\.1 ", r"^### 3\.2 ", r"^## 9\.")
 
 # Kanban shows three stacked bands instead of one column per status:
 # (key, label, hint, statuses) in the order the owner reads them.
@@ -54,6 +54,7 @@ CLOSE_MERGED_RESOLUTION = "已修复合入"
 # AUTO_LOOP.md sections the dispatch page can build a scoped prompt from.
 DISPATCH_BASES = {
     "0": "§0 最短下达语",
+    "0.5": "§0.5 在线讨论轮",
     "3.1": "§3.1 主循环（调度器）",
 }
 
@@ -127,7 +128,9 @@ def create_app() -> Flask:
 
     @app.route("/api/bug/<int:bug_id>")
     def api_bug(bug_id: int):
-        return jsonify(_item(bug_id))
+        item = _item(bug_id)
+        item["discussion_prompt"] = _discussion_prompt(item)
+        return jsonify(item)
 
     # ------------------------------------------------------------------
     # 2) zentao sync
@@ -849,6 +852,102 @@ def _prompt_map() -> dict[str, str]:
     return mapping
 
 
+def _prompt_line(value: Any, default: str = "（无）", limit: int = 220) -> str:
+    """One trimmed line for a copy-paste prompt."""
+    text = str(value or "").strip()
+    if not text:
+        return default
+    text = re.sub(r"\s+", " ", text)
+    return text[:limit].rstrip() + ("…" if len(text) > limit else "")
+
+
+def _rev_text(value: Any) -> str:
+    """Human-facing revision text: svn numbers keep the r prefix."""
+    text = str(value or "").strip()
+    if not text:
+        return "（无）"
+    return f"r{text}" if text.isdigit() else text
+
+
+def _discussion_prompt(item: dict[str, Any]) -> str:
+    """A single-item prompt that stays inside AI-BUG, but enters discussion mode."""
+    slug = db.item_slug(item.get("zentao_id"), item.get("target") or "bug")
+    target_word = "任务" if item.get("target") == "task" else "bug"
+    product_id = int(item.get("product_id") or 0)
+    analysis = item.get("analysis") or {}
+    latest_rev = (item.get("revisions") or [None])[0] or {}
+    latest_need = next((n for n in (item.get("needs") or []) if n.get("owner_reply")), {}) or {}
+    latest_reject = next((r for r in (item.get("reviews") or []) if r.get("reject_reason")), {}) or {}
+    files = item.get("files_changed") or []
+    files_text = "、".join(str(f).strip() for f in files[:6] if str(f).strip())
+    if len(files) > 6:
+        files_text += f"（另 {len(files) - 6} 个）"
+    status = STATUS_LABELS.get(item.get("status"), item.get("status") or "（未知）")
+    repo_url = effective_trunk = effective_wc = i18n_wc = repo_note = "（未解析）"
+    try:
+        target = svn_client.resolve_target(product_id=product_id) if product_id else None
+    except svn_client.SvnError as exc:
+        target = None
+        repo_note = f"仓库解析失败：{exc}"
+    if target:
+        repo_url = _prompt_line(target.repo_url)
+        effective_trunk = _prompt_line(target.trunk_url())
+        effective_wc = _prompt_line(str(target.working_copy))
+        i18n_wc = _prompt_line(str(target.svn_working_copy) if target.svn_working_copy else "（未配置）")
+        repo_note = f"代码库来源={target.source}"
+    return "\n".join([
+        "【单条在线讨论下达语】",
+        "先读 AGENTS.md 与 AUTO_LOOP.md。",
+        "本轮仍然在 AI-BUG 任务系统语境里工作，但这一轮不是执行轮：",
+        "- 不进入 sync/tasks 的主循环",
+        "- 不处理别的条目",
+        "- 只围绕下面这一条先回忆、再讨论",
+        "",
+        f"条目：{slug}（{target_word}）",
+        f"标题：{_prompt_line(item.get('title'))}",
+        f"当前状态：{status}",
+        f"所属产品：#{product_id or '（无）'} {item.get('product_name') or '（无）'}",
+        f"代码库 repo_url：{repo_url}",
+        f"trunk：{effective_trunk}",
+        f"落码目录 working_copy：{effective_wc}",
+        f"正式 SVN 工作副本 svn_working_copy：{i18n_wc}",
+        f"备注：{repo_note}",
+        "",
+        "进入讨论前，先在这个系统里回忆现值：",
+        f"1. python -m app.cli status {slug}",
+        f"2. python -m app.cli detail {slug}",
+        f"3. python -m app.cli mirror {slug}",
+        "4. 如需确认代码库绑定，再看 python -m app.cli repos",
+        "",
+        "然后再进入在线讨论模式，只输出：",
+        "- 这条最近一次修改与当前状态摘要",
+        "- 方案对比",
+        "- 风险与影响面",
+        "- 推荐方案",
+        "- 待我拍板点",
+        "",
+        "本轮禁止：",
+        "- 不改代码，不 checkout / draft / commit / recut / promote",
+        "- 不把这条收口为“已完成 / 已修复 / 可推”",
+        "- 没有我的“进入执行”指令，不得开始实现",
+        "",
+        "这条的当前已知上下文：",
+        f"- 当前分支：{_prompt_line(item.get('branch'))}",
+        f"- 最近草稿/修订：{_rev_text(latest_rev.get('revision'))}",
+        f"- 最近提交说明：{_prompt_line(latest_rev.get('message'))}",
+        f"- 最近修改文件：{_prompt_line(files_text)}",
+        f"- 最近分析结论：{_prompt_line(analysis.get('conclusion') or analysis.get('root_cause') or item.get('fix_summary'))}",
+        f"- 最近主人答复：{_prompt_line(latest_need.get('owner_reply'))}",
+        f"- 最近打回原因：{_prompt_line(latest_reject.get('reject_reason'))}",
+        f"- 未验证项：{_prompt_line(analysis.get('unverified'))}",
+        "",
+        "现在只讨论这个问题：",
+        "<把这次要讨论的修改点写在这里>",
+        "",
+        "如果后面我说“进入执行”，你再回到 AGENTS.md / AUTO_LOOP.md 的执行流程与 G1-G13。"
+    ])
+
+
 def _make_group(index: int, rows: list[dict[str, Any]]) -> dict[str, Any]:
     """One serial queue: the products that share a single landing directory."""
     directories = {row["effective_wc"] or "(无法解析)" for row in rows}
@@ -902,9 +1001,14 @@ def _scope_block(group: dict[str, Any], base_label: str) -> str:
     Kept separate from the AUTO_LOOP.md body on purpose: the rules text stays
     verbatim (and keeps updating itself), only this part is filled per selection.
     """
-    lines = [f"【本轮范围 · {base_label} · 产品 {group['ids']}】",
-             f"只处理禅道产品 ID ∈ {{{group['ids']}}}（{group['names']}）的 bug 与 task；"
-             f"其他产品一律不接手、不 claim、不改码。"]
+    discussion_only = "在线讨论" in base_label
+    lines = [f"【本轮范围 · {base_label} · 产品 {group['ids']}】"]
+    if discussion_only:
+        lines.append(f"只围绕禅道产品 ID ∈ {{{group['ids']}}}（{group['names']}）范围内的 bug 与 task 讨论；"
+                     "其他产品一律不接手，不扩展到无关条目。")
+    else:
+        lines.append(f"只处理禅道产品 ID ∈ {{{group['ids']}}}（{group['names']}）的 bug 与 task；"
+                     f"其他产品一律不接手、不 claim、不改码。")
     if group.get("tasks"):
         lines.append(
             f"这个范围里有 {group['tasks']} 条任务（待出方案 {group['task_pending']} 条）："

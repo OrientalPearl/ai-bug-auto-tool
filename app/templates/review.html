@@ -20,6 +20,8 @@
     <h3>禅道 #{{ ref }} · {{ bug.title }}
       {% if bug.target == 'task' %}<span class="badge badge-task">任务</span>{% endif %}
       <span class="badge badge-orange">待审查</span>
+      <button class="btn" style="float:right;margin-left:6px" type="button"
+              data-discussion-item="1" data-bug-id="{{ bug.id }}" data-target="{{ bug.target }}">在线讨论下达语</button>
       <a class="btn" style="float:right" href="#/item/{{ bug.target }}/{{ bug.id }}">弹窗看完整详情</a>
     </h3>
     <p class="hint">

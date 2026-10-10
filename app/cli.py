@@ -835,7 +835,7 @@ def cmd_checkout(args: argparse.Namespace) -> None:
 
     bug = _bug_ref(args.ref)
     _plan_gate_or_die(bug, "checkout")
-    result = svn_promote.checkout_draft(bug, base=args.base or "")
+    result = svn_promote.checkout_draft(bug, base=args.base or "", carry=args.carry or "")
     if result.ok:
         db.set_item_status(bug["id"], "fixing", target=bug["target"], branch=result.branch)
     _out({
@@ -845,6 +845,13 @@ def cmd_checkout(args: argparse.Namespace) -> None:
         "tip": result.tip, "status": "fixing" if result.ok else bug["status"],
         "dirty_real": result.dirty_real, "dirty_noise": result.dirty_noise,
         "dirty_untracked": result.dirty_untracked, "dirty_paths": result.dirty_paths,
+        # --carry bookkeeping: named == the whole real dirt, restored == written
+        # back on the new branch with a byte-for-byte sha1 match.
+        "carry_named": result.carry_named, "carry_restored": result.carry_restored,
+        "carry_snapshot": result.carry_dir, "carry_back": result.carry_back,
+        # git compares byte for byte when a switch rewrites a file; this is the
+        # line-ending / $Id$ drift the gate had to clear before retrying.
+        "drift_cleared": result.drift_note,
         "dirt": _dirt_info(result),
         "lock": _lock_info(result),
         "summary": result.summary(), "error": result.error,
@@ -926,6 +933,55 @@ def cmd_draft(args: argparse.Namespace) -> None:
         "next": (f"python -m app.cli commit {slug} --message \"<一句话根因>\" "
                  f"--files {','.join(result.staged or files)} --no-svn "
                  f"--revision git:{result.short_tip} --analysis-file a.json"),
+    })
+
+
+def cmd_recut(args: argparse.Namespace) -> None:
+    """Re-cut the draft branch onto a newer trunk commit (merge; never pushes).
+
+    Needed when the mirror's ``origin/trunk`` is behind SVN and a landed change sits on the
+    line next to the draft's own: a line-level three-way merge refuses that shape whatever the
+    draft text says, so the only honest way through is to make the trunk commit an ancestor of
+    the tip. The remote side refuses on its own if a trunk-added line is missing from the
+    draft, so this cannot overwrite somebody else's work.
+    """
+    from . import svn_promote
+
+    bug = _bug_ref(args.ref)
+    _plan_gate_or_die(bug, "recut")
+    message = str(args.message or "").strip()
+    if not args.dry_run:
+        want = f"{_subject_prefix(bug)} #{bug['zentao_id']}"
+        if not message.startswith(want):
+            raise SystemExit(json.dumps(
+                {"ok": False, "error": f"--apply 的提交说明必须以 {want} 开头（闸门 G8），"
+                                       f"收到: {message[:60]}"}, ensure_ascii=False))
+    try:
+        result = svn_promote.recut_draft(bug, args.onto or "",
+                                         dry_run=bool(args.dry_run), message=message)
+    except svn_promote.PromoteError as exc:
+        _out({"ok": False, "action": "recut", "error": str(exc)})
+        return
+    _out({
+        "ok": bool(result.ok), "action": "recut",
+        "zentao_id": bug["zentao_id"], "kind": bug["target"],
+        "branch": result.branch, "dry_run": result.dry_run,
+        "onto": result.onto, "tip": result.tip, "merge_base": result.merge_base,
+        "new_tip": result.new_tip, "new_base": result.new_base,
+        "new_base_src": result.new_base_src,
+        "already": result.already, "plan": result.plan,
+        "shared": result.shared, "lost": result.lost, "lost_lines": result.lost_lines,
+        "svn_match": result.svn_match, "resolved": result.resolved,
+        "want": result.want, "aborted": result.aborted,
+        "dirty_real": result.dirty_real, "dirty_noise": result.dirty_noise,
+        "dirty_untracked": result.dirty_untracked, "dirty_paths": result.dirty_paths,
+        "dirt": _dirt_info(result), "lock": _lock_info(result),
+        "summary": result.summary(), "error": result.error,
+        "next": ("" if result.error or result.already else
+                 (f"确认无误后：python -m app.cli recut {bug['zentao_id']} --apply "
+                  f"--message \"{_subject_prefix(bug)} #{bug['zentao_id']} <一句话>\""
+                  if result.dry_run else
+                  f"python -m app.cli mirror {bug['zentao_id']}  复验基准已推进")),
     })
 
 
@@ -1137,6 +1193,10 @@ def build_parser() -> argparse.ArgumentParser:
                             "任务若没有已确认的方案，本命令直接拒绝（G13）")
     p.add_argument("ref")
     p.add_argument("--base", default="", help="建分支的基线，默认 refs/remotes/origin/trunk")
+    p.add_argument("--carry", default="",
+                   help="逗号分隔的路径：工作区上这几处未提交改动归本条所有，切分支前先备份、"
+                        "切完逐文件 sha1 校验放回；点名集合必须与工作区真实脏文件完全相等，"
+                        "少点名或多点名都整笔拒绝。不填时脏工作区一律拒（默认行为不变）")
     p.set_defaults(func=cmd_checkout)
 
     p = sub.add_parser("draft",
@@ -1148,6 +1208,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--files", required=True,
                    help="逗号分隔的改动文件（镜像内相对路径）；不做整仓 add")
     p.set_defaults(func=cmd_draft)
+
+    p = sub.add_parser("recut",
+                       help="把更新的 trunk 提交合进本条草稿分支，让护栏的基准变成 trunk"
+                            "（只在本地改分支，不推远端；先跑一次看无损证明再加 --apply）")
+    p.add_argument("ref")
+    p.add_argument("--onto", default="",
+                   help="新基线，默认 refs/remotes/origin/trunk（主人 fetch 之后就指向最新 trunk）")
+    p.add_argument("--dry-run", action="store_true", default=True,
+                   help="只证明与预演，不写任何东西（默认）")
+    p.add_argument("--apply", dest="dry_run", action="store_false",
+                   help="真的落这笔 merge 提交；要求 --message 以 fix #<ID> 开头（G8）")
+    p.add_argument("--message", default="", help="--apply 用的提交说明（合并 trunk 到草稿分支）")
+    p.set_defaults(func=cmd_recut)
 
     p = sub.add_parser("reconcile",
                        help="对账：镜像上已有草稿提交、库里却没登记的条目；"
@@ -1231,8 +1304,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--block-file",
                    help="JSON 文件：一次性写入 question / options / advice（长文本免转义），"
                         "命令成功后由本系统回收")
-    p.add_argument("--options", default="")
-    p.add_argument("--advice", default="")
+    # Defaults stay None so an omitted flag lets the --block-file value win
+    # (`_need_command` only falls back to the file when the flag is absent).
+    p.add_argument("--options", default=None)
+    p.add_argument("--advice", default=None)
     _add_analysis_args(p)
     p.set_defaults(func=cmd_block)
 
@@ -1245,8 +1320,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--plan-file", dest="block_file",
                    help="JSON 文件：一次性写入 question / options / advice（长文本免转义），"
                         "命令成功后由本系统回收")
-    p.add_argument("--options", default="", help="可选做法 A/B/C")
-    p.add_argument("--advice", default="", help="AI 建议走哪条、为什么")
+    p.add_argument("--options", default=None, help="可选做法 A/B/C")
+    p.add_argument("--advice", default=None, help="AI 建议走哪条、为什么")
     _add_analysis_args(p)
     p.set_defaults(func=cmd_plan)
 

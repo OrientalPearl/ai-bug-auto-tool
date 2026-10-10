@@ -35,6 +35,8 @@
       <span class="badge badge-{{ {'awaiting':'yellow','replied':'blue','done':'green'}[n.status] }}">
         {{ {'awaiting':'待答复','replied':'已答复','done':'已处理'}[n.status] }}
       </span>
+      <button class="btn" style="float:right;margin-left:6px" type="button"
+              data-discussion-item="1" data-bug-id="{{ n.item_id }}" data-target="{{ n.target }}">在线讨论下达语</button>
       <a class="btn" style="float:right" href="#/item/{{ n.target }}/{{ n.item_id }}">弹窗看完整详情</a>
     </h3>
     <p class="hint">

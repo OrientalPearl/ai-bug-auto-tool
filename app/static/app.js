@@ -150,6 +150,19 @@
         : `模块：${esc(b.module || "-")}    产品：${esc(b.product_name || "-")}    指派给：${esc(b.assigned_to_name || b.assigned_to || "-")}    提交人：${esc(b.opened_by || "-")}    迭代：${esc(b.opened_build || "-")}`}
 禅道状态：${esc(b.zentao_status || "-")}    分支：${esc(b.branch || "尚未建分支")}    最近同步：${esc(b.synced_at || "-")}</pre>`;
 
+    if (b.discussion_prompt) {
+      html += `
+        <h4>单条在线讨论下达语</h4>
+        <div class="row-actions">
+          <button class="btn" type="button" data-copy="discussion-prompt">复制在线讨论下达语</button>
+          <span class="hint">这段会带上 AGENTS.md / AUTO_LOOP.md、条目号、代码库与 working_copy，不是普通聊天提示词。</span>
+        </div>
+        <details class="scope-detail">
+          <summary>查看完整下达语</summary>
+          <pre class="prompt copyable" data-copy-src="discussion-prompt">${esc(b.discussion_prompt)}</pre>
+        </details>`;
+    }
+
     if (b.fix_summary || b.verify_steps) {
       html += `<h4>修复说明 / 验证步骤</h4><pre>${esc(b.fix_summary || "")}\n\n验证：${esc(b.verify_steps || "")}</pre>`;
     }
@@ -431,12 +444,47 @@
     }
   }
 
+  function copyDiscussionPrompt(button) {
+    const bugId = Number(button.dataset.bugId || 0);
+    const target = button.dataset.target === "task" ? "task" : "bug";
+    if (!bugId) return;
+    fetch(`/api/bug/${bugId}?kind=${target}`)
+      .then(function (resp) { return resp.json(); })
+      .then(function (data) {
+        const text = String(data && data.discussion_prompt || "").trim();
+        if (!text) {
+          window.alert("这条条目还没有可复制的在线讨论下达语。");
+          return;
+        }
+        if (navigator.clipboard && window.isSecureContext) {
+          navigator.clipboard.writeText(text).then(function () {
+            flashCopied(button);
+          }, function () {
+            copyViaTextArea(text);
+            flashCopied(button);
+          });
+        } else {
+          copyViaTextArea(text);
+          flashCopied(button);
+        }
+      })
+      .catch(function (err) {
+        window.alert("生成在线讨论下达语失败：" + (err && err.message ? err.message : "未知错误"));
+      });
+  }
+
   document.addEventListener("click", function (event) {
     if (!event.target || !event.target.closest) return;
     const copy = event.target.closest("[data-copy]");
     if (copy) {
       event.preventDefault();
       copyFrom(copy);
+      return;
+    }
+    const discuss = event.target.closest("[data-discussion-item]");
+    if (discuss) {
+      event.preventDefault();
+      copyDiscussionPrompt(discuss);
       return;
     }
     if (event.target.closest("[data-dialog-close]")) {

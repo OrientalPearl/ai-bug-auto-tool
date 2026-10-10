@@ -74,6 +74,54 @@
 不许把词条攒进镜像分支、不许和代码混在一次提交里、除这两个命令外不许碰任何 svn 子命令
 ```
 
+## 0.5 在线讨论轮（直接粘）
+
+这段不是给无人值守执行器排队用的，而是给你和 AI **单独在线讨论某一条 bug / task** 用的。
+但它仍然要先进入 **AI-BUG 任务系统语境**：先读 `AGENTS.md` 与 `AUTO_LOOP.md`，再围绕这条条目的产品、
+代码库与 `working_copy` 回忆现值，然后只讨论、不执行。
+
+如果页面里已经有「在线讨论下达语」按钮，优先点按钮复制单条版；单条版会自动把条目号、代码库、分支与最近分析带进去。
+下面这段是通用版，适合手填 `<条目号>` 与 `<working_copy>`。
+
+```
+先读 AGENTS.md 与 AUTO_LOOP.md。
+
+这是一条【单条在线讨论轮】，仍然在 AI-BUG 任务系统里工作，但不是执行轮：
+- 不进入 sync/tasks 的主循环
+- 不处理别的条目
+- 只围绕这一个 bug / task 先回忆，再讨论
+
+条目：<条目号>        # 任务写 T<禅道ID>，缺陷写纯数字
+产品：<产品ID / 产品名>
+repo_url：<代码库地址>
+trunk：<trunk 路径>
+working_copy：<落码目录>
+svn_working_copy：<正式 SVN 工作副本，没有就写未配置>
+
+先在这个系统里回忆现值：
+1) python -m app.cli status <条目号>
+2) python -m app.cli detail <条目号>
+3) python -m app.cli mirror <条目号>
+4) 如需确认产品与代码库绑定，再看 python -m app.cli repos
+
+然后进入在线讨论模式，只输出：
+- 最近一次修改与当前状态摘要
+- 方案对比
+- 风险与影响面
+- 推荐方案
+- 待我拍板点
+
+本轮禁止：
+- 不改代码，不 checkout / draft / commit / recut / promote
+- 不把这条收口为“已完成 / 已修复 / 可推”
+- 没有我的“进入执行”指令，不得开始实现
+
+现在只讨论这个问题：
+<把这次要讨论的修改点写在这里>
+
+如果后面我说“进入执行”，你再回到 AGENTS.md / AUTO_LOOP.md 的执行流程与 G1–G13。
+```
+
 ## 1. 三种执行方式（本工程默认第三种）
 
 | 方式 | 提交动作由谁做 | 本系统命令 | 适用 |
@@ -233,7 +281,7 @@ git --git-dir=<镜像名>/.git fsck   # dangling blob 是镜像的正常现象�
 包放在各台服务器自己的 `~/hy-10G-2/mirror-backup/`（3.0 的包在 3.0 那台，2.3 的包在 2.3 那台），
 不跨机拷贝；换盘或重装前先补一份新的，包名带短哈希，能看出它是哪条基线的备份。
 
-## 1.8 镜像操作收进本系统命令（执行器一律走这四条，别再自己拼 ssh）
+## 1.8 镜像操作收进本系统命令（执行器一律走这几条，别再自己拼 ssh）
 
 以前子任务要 `ssh … "cd 镜像 && git checkout -b …"`、`ssh … "git add && git commit"`、
 `ssh … "git rev-parse …"` 各来一遍。每一条都是 IDE 眼里的陌生命令，都要点一次授权；
@@ -243,8 +291,10 @@ git --git-dir=<镜像名>/.git fsck   # dangling blob 是镜像的正常现象�
 | 命令 | 做什么 | 护栏 |
 | --- | --- | --- |
 | `mirror <ID>` | 只读探测：草稿分支在不在、tip、领先几笔、改了哪些文件、镜像当前停在哪个分支、工作区**真实**脏不脏（`worktree_clean` + `dirty_real`/`dirty_noise`/`dirty_untracked` + `dirty_paths` + `dirt{state,git,why}`）、`index.lock` 现状（`lock.state`）、就绪三判据（`mirror_ready`） | 纯只读，不 fetch 不 checkout，**也不删锁** |
-| `checkout <ID> [--base …]` | 建/切这条条目的 `bugfix/zentao-<ID>`（任务写成 `T<ID>`，落在 `bugfix/zentao-T<ID>`），默认基线 `refs/remotes/origin/trunk`，成功即置 `fixing` 并写回 branch | **任务没有已确认方案 → 直接拒绝（G13）**；镜像缺 trunk ref 或索引没落盘 → 拒绝；工作区有**别人的真实未提交改动** → 拒绝并列出文件（不 stash 不切走，那是别人的会话）；**读不出工作区状态（`dirt.state=failed`）也拒绝**——未知不等于干净。git 拒绝切分支时的 stderr 原文会随 `error` 返回。本镜像的结构性噪音**不拦**；上一轮死掉留下的陈锁**自动回收**（见下） |
+| `checkout <ID> [--base …] [--carry a,b]` | 建/切这条条目的 `bugfix/zentao-<ID>`（任务写成 `T<ID>`，落在 `bugfix/zentao-T<ID>`），默认基线 `refs/remotes/origin/trunk`，成功即置 `fixing` 并写回 branch；`--carry` 把**归本条所有**的未提交改动搬到新分支上 | **任务没有已确认方案 → 直接拒绝（G13）**；镜像缺 trunk ref 或索引没落盘 → 拒绝；工作区有**别人的真实未提交改动** → 拒绝并列出文件（不 stash 不切走，那是别人的会话）；**读不出工作区状态（`dirt.state=failed`）也拒绝**——未知不等于干净。git 拒绝切分支时的 stderr 原文会随 `error` 返回（多条 `err` 用 `／` 串起来，原因不再被收尾语盖掉）。本镜像的结构性噪音**不拦**；上一轮死掉留下的陈锁**自动回收**（见下） |
+| `checkout --carry <路径,路径>` | 工作树被别的分支占着、而改动确实归本条时用：先证明「点名集合 == 工作区真实脏集合」（少点名、多点名、点名一个不脏的都整笔拒绝），逐个 `cp` 快照到镜像 `/tmp` 并记 sha1，再 `git checkout --` 清干净、建/切分支、把快照放回并**逐文件重算 sha1 必须相等**，返回 `carry_named`/`carry_restored`/`carry_snapshot` | 放回前先比 blob：某文件在 `$CUR` 与目标分支上的**已提交版本**不是同一份就拒绝放回（否则会把别人在该分支的新内容覆盖掉），并**退回原分支、把改动放回原处**；切分支失败同样放回原分支，快照目录只报不删。默认行为不变——不带 `--carry` 时脏工作区一律拒。路径含 `\|` 或换行在本侧直接拒（远端清单用 `\|` 分隔） |
 | `draft <ID> --message "fix #<ID> …" --files a,b` | 只 `git add` 列出的文件并提交，返回短哈希 | 同上：任务未确认方案先被 G13 拒绝；陈锁自动回收后才动手；说明必须以 `fix #<禅道ID>` 开头（G8，任务是 `feat #<ID>`）；`--files` 必填、必须是镜像内相对路径、不许 `..`/绝对路径/`.git`；分支不存在就报错让你先 `checkout`；HEAD 不在这条分支上就拒绝；暂存为空 → 不造空提交 |
+| `recut <ID> [--onto <ref>] [--apply --message "fix #<ID> …"]` | 把更新的 trunk 提交**合进**本条草稿分支，让护栏的基准变成 trunk。用在：主人 `git svn fetch` 之后，而 trunk 落的那笔正好与草稿改到**相邻行** —— 这种形状行级三方合并必拒（实测 `git merge-file`：两侧改动之间没有一行未变的行就 rc=1，草稿把 trunk 那行原样抄过去也照样 rc=1），对齐内容救不回来，只能让 trunk 提交成为 tip 的祖先 | 默认 dry-run：只证明与预演，不写任何东西。**写之前先证明**：该文件里 trunk 新增的每一行都必须已在草稿中存在（多重集比对，重复行也要重复命中），缺一行就整笔拒绝并报出那行原文，因为那种情况下合并会盖掉别人的改动；`--apply` 才落 merge 提交，说明必须以 `fix #<禅道ID>` 开头（G8）；HEAD 不在这条分支上 → 拒绝（不替你切分支）；工作区有真实未提交改动 / 判据读不出来 → 拒绝；陈锁自动回收后才动手。旧草稿提交不删不改写（新 tip 的两个父都还在），回退方式就是回到旧 tip。**不推远端、不碰 SVN** |
 | `plan T<ID> --question … --options … --advice …` | **任务第一轮的唯一产出**：把「需求理解 + 修改细则」登记成待确认方案（`task_needs.need_kind='plan'`）、状态置 `need_solution`、并在禅道任务下留言 | 只对 `T<ID>` 开放（缺陷用 `block`）；登记后 `checkout`/`draft`/`commit` 对这条任务仍然一律拒绝，直到主人在「需方案」页确认（G13） |
 | `reconcile [ID] [--apply]` | 对账：镜像上有草稿提交、库里却没登记（执行器跑完没收口 / 崩在收口前） | 默认只报告；`--apply` 才登记 `git:<哈希>` 并转 `await_review`，分析里写明「结论来自 git 提交信息，未验证」 |
 | `tmp-clean [--apply]` | 回收跑完留在项目根的交接文件（`a_<ID>.json`、`blk_<ID>.json`、`py_<ID>.py`、`_tmp_*.py`） | 只认上面这几种命名；分析**没**入库的 `a_<ID>.json` 一律留着只报告；默认 dry-run，`--apply` 才删；`.env`、库文件、源码都不在候选里 |
@@ -272,6 +322,19 @@ git --git-dir=<镜像名>/.git fsck   # dangling blob 是镜像的正常现象�
 （那台的 git 版本）、`dirt.why`（读不出来时 git 说了什么），`mirror` 在读不出时 `worktree_clean` 直接给
 false。所以：**`dirt.state=failed` 时不许当成干净继续，`error` 里现在一定有 git 的原话**，照原话 block
 就是有效信息，不要再写「判据全绿但建分支失败」。
+
+同一口径还有一处会翻车，而且这次是**判据对了、git 仍然拒**：护栏判「`M` 是不是真实改动」时按
+`--ignore-cr-at-eol` 剥 CR、再剔 `$Id$` 行，所以常年带 CRLF 漂移的文件读成噪音；可 `git checkout`
+**重写某个文件时是逐字节比较的**，那个文件只要同时满足「HEAD 与目标分支上内容不同」和「工作区带
+CR 漂移」，git 就报 `Your local changes to the following files would be overwritten by checkout`。
+2026-10 实测：`checkout T5426` 时 `dirty_real=3` 全是 portal_ac 的三个文件，被点名拦下却与它们无关，
+真正挡路的是 `page/nm/view/systemObject/addressBook/edit.php`（`git status` 报 ` M`，剥掉行尾 CR 后
+与 HEAD 逐字节相等）。现在的处理：切分支失败后，取 `git diff --name-only HEAD <目标>` 里那些仍被
+`git status` 报为已修改的文件，**用与护栏完全相同的判据逐个证明它只是换行/关键字漂移**——证明成立才
+快照到 `/tmp` 再 `git checkout --` 交还给 git、只重试一次；任何一个证明不成立（是真改动）就拒绝重试。
+返回里带 `drift_cleared`（清了几处、分别是哪些文件）。这不是放宽判据：那条文件本来就要被这次切换
+重写掉，交还 git 与让它切过去结果一致，而快照仍在 `/tmp` 留着。执行器**不许**自己 `git checkout -f`、
+`git stash` 或 `git checkout -- <文件>` 去"清干净"，那等于替别人丢改动（§1.8 开头那条禁令同样适用）。
 
 `index.lock` 也一样：会话被 IDE 崩掉或模型报错打断时，git 正在写的 `.git/index.lock` 会留下一个
 **0 字节空锁**，git 自己不会清，于是这个镜像上后面每一条 bug 都撞同一堵墙（实测一天内三次，
@@ -473,6 +536,11 @@ JSON 的 `gates` 也可以走 `--gates`（`k=v` 用逗号/分号分隔）。
    不许绕过知识体系全库散搜；跨文件检索与遍历也按该库硬门禁走 SSH（Windows 映射盘上本机 grep/find 会卡死）
    然后为这条 bug 开/切本地分支（§1.8，它只在**有人的真实未提交改动**时拒绝并列出文件，§1.5 那 92 行噪音不拦）：
    python -m app.cli checkout <禅道ID>
+   它拒绝时先看 `dirty_paths` 归谁：归**本条**（上一轮没收口，或改动写在了别的分支工作树上）就
+   `python -m app.cli checkout <ID> --carry <那些路径,逐个点名>` 搬过来——远端会先证明点名集合与真实
+    脏集合完全相等，再快照、切分支、放回并逐文件 sha1 复核；只有 `ok=true` 且 `carry_restored` 等于
+    点名的个数才算搬成功，否则按 `error` 收口（快照目录在 `carry_snapshot` 里，不许当已搬运）；归**别人**
+   就不许搬，按 §3.4 三 block 写清分支与文件名（§1.8）
    只改与这条 bug 直接相关的文件，且路径必须属于这条 bug 的产品仓库（闸门 G3）
    改文件前先确认大小写拼名 —— 本库有 109 组只差大小写的同名对偶，Windows 侧两个拼名读到的是
    同一个文件，只有 Linux 侧才是真身份：按该库规程在 SSH 侧跑
@@ -780,6 +848,8 @@ Web /repos    各产品用哪个仓库、镜像在哪、正式 SVN 工作副本�
 | 工作树/分支基线莫名变化，或 `git status` 里冒出**别的产品/别的禅道 ID** 的文件 | 两个产品共用了同一份镜像却被并行处理（违反 §5）：立刻停掉其中一条队列，在 SSH 侧 `git -c core.ignorecase=false status` 核对，被串味的分支 `git reset --hard <基线>` 重做；要让它们真并行只能给其中一个另开一份镜像 |
 | 镜像被 `.git/index.lock` 冻住（`Unable to create …index.lock: File exists`） | 上一轮会话被 IDE 崩溃或模型报错打断在写索引的中间，留下 0 字节空锁，git 自己不清，于是这个镜像上后面每条 bug 都撞同一堵墙。**系统已经处理**：`checkout`/`draft` 会回收「0 字节 + 本机无 git 进程 + 静默超过 `LOCK_STALE_MINUTES`」的锁并返回 `lock.swept`；不满足条件（非 0 字节、太新、或有活的 git）就拒绝并告诉你该删哪个文件——那种情况才 `block`，并把 `lock.state`/size/age 抄进去。**不许**自己拼 `rm`，也不许为已被回收的锁写 block（§1.8） |
 | `mirror` 说 `worktree_clean=true`/`dirty_real=0`，但 `checkout` 仍然「建分支失败」，原因不明 | 这是 **2.3 那台 git 1.7.1 上的旧缺陷**（判据用的 `-c` 与 `--ignore-cr-at-eol` 探测失败被读成干净，git 的 stderr 又被吞），已修复（§1.8）：现在同一条 `mirror` 会如实给出 `dirty_real=1` + `dirty_paths` 点名文件，`checkout` 的 `error` 里带 git 原话（如 `error: You have local changes to '…'; cannot switch branches`）。再见到「判据全绿但建分支失败」就是回归，按原话 `block` 并抄 `dirt.state`/`dirt.git` |
+| `checkout` 的 `error` 里出现 `Your local changes to the following files would be overwritten by checkout`，可那些文件**不在** `dirty_paths` 里 | 不是判据漏判：那是常年带 CRLF/`$Id$` 漂移的文件，护栏按 `--ignore-cr-at-eol` 读成噪音，而 git 重写文件时逐字节比较。**系统已经处理**：证明只是漂移后快照进 `/tmp` 交还 git 并只重试一次，返回 `drift_cleared` 列出清了哪几个（§1.8）。执行器**不许**自己 `git checkout -f` / `git stash` / `git checkout -- <文件>` 去"清干净"；`drift_cleared` 里出现你正在改的文件才需要 block，并抄上文件名 |
+| 工作树被另一条会话占着（`dirty_paths` 全是别的条目的文件），`checkout` 一律拒 | 两种处置别混：**改动归本条**（上一轮没收口、或像 T5426 那样代码写在别人的分支上）→ `checkout <ID> --carry <那些路径>`，点名集合必须与真实脏集合完全相等，搬完逐文件 sha1 复核、`carry_snapshot` 给出 `/tmp` 快照；**改动归别人** → 不许 `--carry`，按 §3.4 三 block 写清是哪个分支的哪几个文件，等那条会话自己收口 |
 | 打了回但队列里像没这条 / 看不到打回理由 | **已修**（旧版缺陷）：一条被打回、同时又留着「已答复阻塞项」的条目会先落进 `replied` 分支就返回，`reject_reason` 与 `prior_fix` 双双不下发，`queue_kind` 还标成「已答复」——于是它在页面上不挂着「已打回」，AI 也只按你旧的答复续做。现在打回项一律带 `reject_reason` + `prior_fix`，标签按 `rejected`/`reopened` 算（`owner_reply` 仍一并下发，以更晚的打回原话为准）。看板上 `rejected` 归在**「AI 在跑」带**（打回是主人已经做完的动作，球在 AI 这边），不在「要我处理」；`/review` 里它已消失属正常，想确认有没有入队看 `/dispatch` 的「下一条会被处理的条目」或 `python -m app.cli tasks` |
 | 某条被 AI 反复处理不满意 | 三种处置别混：「打回」→ `rejected`，**改动与草稿分支都不回滚**，AI 在同一分支上追加提交，最终一次推入 SVN；「拒绝并回滚」→ 删掉该草稿分支（提交先存进 `refs/rejected/<分支>` 可取回），这条直接置 `closed`，AI 不再重做；「重开补修」（限 `merged`/`closed`）→ 已入过库但仍不完全，回到 `rejected` 重新入队，`queue_kind=reopened` |
 | 已合入的条目发现修得不完全 | 弹窗点「重开补修（入队列）」。登记的 r 号与草稿分支都保留，**trunk 不回退**（回退 trunk 是主人自己的 svn 动作）；上一轮的结论、改动文件、r 号作为 `prior_fix` 随任务下发。AI 在原分支续做；推送时以「上一轮推入的那个草稿提交」为增量基准，只把新改动入库，trunk 上已有的文件自动跳过，全一致就拒（不许空修订） |

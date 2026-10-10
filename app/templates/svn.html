@@ -53,6 +53,8 @@
         {{ status_labels[g.item_status] }}
       </span>
       <span class="muted" style="font-weight:400;font-size:12px">分支 <code>{{ g.branch or '-' }}</code></span>
+      <button class="btn" style="float:right;margin-left:6px" type="button"
+              data-discussion-item="1" data-bug-id="{{ g.item_id }}" data-target="{{ g.target }}">在线讨论下达语</button>
       <a class="btn" style="float:right" href="#/item/{{ g.target }}/{{ g.item_id }}">弹窗看完整详情</a>
     </h3>
     <table class="grid">

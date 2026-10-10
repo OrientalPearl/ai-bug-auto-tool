@@ -63,6 +63,12 @@
               {% if bug.severity %}<span>S{{ bug.severity }}</span>{% endif %}
               <span>{{ bug.updated_at }}</span>
             </div>
+            <div class="row-actions" style="margin-top:8px">
+              <button class="btn" type="button"
+                      data-discussion-item="1" data-bug-id="{{ bug.id }}" data-target="{{ bug.target }}">
+                在线讨论下达语
+              </button>
+            </div>
           </article>
           {% endfor %}
         </div>

@@ -2,9 +2,13 @@
 
 AUTO_LOOP.md G11 keeps every remote write away from the executor; the one place it
 does happen is this module, and only behind an explicit click in the review dialog.
-Neither build server has ``git svn`` (verified: ``git: 'svn' is not a git command``),
-so the draft cannot be dcommitted. Instead the promoted content is materialised
-file by file: git objects are read inside the mirror, written into a sparse
+Neither build server's ``git svn`` is used here, and the reason is not availability:
+measured 2026-10-08, the 3.0 host does have it (``git-svn version 2.33.0 (svn 1.14.2)``,
+``perl-Git-SVN`` installed, SVN::Core/Ra/Delta/Client all load) while the 2.3 host really
+lacks it (``git: 'svn' is not a git command``). Even where it exists the draft is not
+dcommitted, because ``git svn dcommit`` is a remote write and G11 reserves those for the
+owner -- ``git svn fetch`` is the owner's too (AUTO_LOOP 1.5). Instead the promoted content is
+materialised file by file: git objects are read inside the mirror, written into a sparse
 (``--depth empty``) SVN working copy that holds nothing but the touched files, and
 committed with the message the owner typed.
 
@@ -1309,8 +1313,11 @@ def draft_commit(bug: dict, message: str, files: list[str]) -> DraftCommit:
             pass
         elif tag == "err":
             out.error = value
-    if not out.ok and not out.error and proc.returncode != 0 and err.strip():
-        out.error = err.strip().splitlines()[-1]
+    if not out.ok and not out.error:
+        # Same rule as checkout_draft: git's stderr is never paraphrased into a
+        # verdict -- "Switched to branch" sits there even on a successful run.
+        out.error = (f"远端脚本没有给出结论（rc={proc.returncode}），不假定成功"
+                     + (f"；stderr 末行：{err.strip().splitlines()[-1]}" if err.strip() else ""))
     out.raw = out_text if not err.strip() else out_text + "\n[stderr] " + err.strip()
     if out.error:
         out.error = f"{out.error}（{target.host} · {target.mirror}）"
@@ -1448,6 +1455,7 @@ assess_dirt() {
   NOISE=0
   UNTRACKED=0
   REAL_LIST=""
+  REAL_ALL=""
   DIRT_STATE=failed
   DIRT_WHY=""
   probe_git
@@ -1485,6 +1493,9 @@ assess_dirt() {
     fi
     if [ "$real" = 1 ]; then
       REAL=$((REAL + 1))
+      # Full untruncated set: --carry has to prove the named paths ARE the dirty
+      # paths, and REAL_LIST is capped at 5 for the message.
+      REAL_ALL="$REAL_ALL${REAL_ALL:+,}$path"
       [ $REAL -le 5 ] && REAL_LIST="$REAL_LIST $path"
     else
       # Nothing at stake: either a listed noise path or a diff that evaporates once
@@ -1664,12 +1675,19 @@ class Checkout:
     lock_age: int = -1
     lock_procs: int = 0
     lock_swept: str = ""
+    carry_named: int = 0        # paths --carry proved to be the whole real dirt
+    carry_restored: int = 0     # paths written back on the target branch, sha1-checked
+    carry_dir: str = ""         # the /tmp snapshot dir, kept as recovery evidence
+    carry_back: str = ""        # what happened to the edits when the switch failed
+    drift_note: str = ""        # line-ending / $Id$ drift git had to be cleared
     error: str = ""
     raw: str = ""
 
     def summary(self) -> str:
         if self.error:
-            return self.error
+            back = (f"；收尾：{self.carry_back}"
+                    if self.carry_back and self.carry_back != "none" else "")
+            return self.error + back
         words = {"created": "已从", "switched": "已切到", "already": "本来就停在"}
         swept = ""
         if self.lock_swept:
@@ -1677,6 +1695,13 @@ class Checkout:
         if self.dirty_noise or self.dirty_untracked:
             swept += (f"（已忽略本镜像的结构性噪音：{self.dirty_noise} 条 .trae/INSTALL/CRLF/"
                       f"$Id$ 类 + {self.dirty_untracked} 条未跟踪）")
+        if self.carry_restored:
+            swept += (f"（--carry 搬运了 {self.carry_restored} 处未提交改动到本分支，"
+                      f"逐文件 sha1 已校验；快照留在 {self.carry_dir}）")
+        elif self.carry_named:
+            swept += f"（--carry 已清出 {self.carry_named} 处，但没走到放回这一步，快照在 {self.carry_dir}）"
+        if self.drift_note:
+            swept += f"（{self.drift_note}）"
         if self.action == "created":
             return f"已创建并切到 {self.branch}（基线 {self.base}），当前 {self.tip}{swept}"
         return f"{words.get(self.action, '已切到')} {self.branch}，当前 {self.tip}{swept}"
@@ -1690,7 +1715,7 @@ _CHECKOUT_SCRIPT = _DIRTY_GATE + _LOCK_GATE + r"""
 # POSIX sh, runs on the build server. Local git only -- no fetch, no push, no svn.
 export LC_ALL=C LANG=C
 set -f
-MIRROR=$1; BR=$2; BASE=$3; LOCK_LIMIT=${4:-5}
+MIRROR=$1; BR=$2; BASE=$3; LOCK_LIMIT=${4:-5}; CARRY=${5:-}
 P() { printf 'PV|%s|%s\n' "$1" "$2"; }
 cd "$MIRROR" 2>/dev/null || { P err "镜像目录不存在: $MIRROR"; exit 1; }
 case "$BR" in
@@ -1726,13 +1751,12 @@ if [ "$DIRT_STATE" != ok ]; then
   P err "读不到工作区状态（git ${GITV:-?}）：${DIRT_WHY:-git status 失败}；判据未知时不建分支，免得把别人的改动带进 $BR"
   exit 1
 fi
-if [ "$REAL" -gt 0 ]; then
-  P err "镜像工作区在 $CUR 上有 $REAL 处真实未提交改动（$REAL_LIST），不替你 stash / checkout：先让那条会话收口"
-  exit 1
-fi
 # git refuses a switch for its own reasons, and only git words them ("error: You
 # have local changes to 'x'" on 1.7.1). Swallowing stderr is what left 30 tickets
 # blocked with "建分支失败" and nothing to act on, so the failure text is the error.
+# All helpers are defined before the first place they get called: a shell reads
+# top-down, so a definition below its call site is a "command not found" that
+# looks like a broken mirror.
 run_git_checkout() {
   _label=$1
   shift
@@ -1743,22 +1767,412 @@ run_git_checkout() {
   fi
   return 0
 }
+
+# Write every snapshot back onto the branch we are standing on and prove it landed
+# byte for byte. The list is pipe-separated because a path may contain spaces.
+carry_writeback() {
+  _wb=""
+  _oldifs=$IFS
+  IFS='|'
+  while read -r _sum _idx _p _b; do
+    [ -n "$_p" ] || continue
+    if ! cp -p "$CARRY_TMP/$_idx" "$_p"; then
+      _wb="$_wb $_p"
+      continue
+    fi
+    [ "$(sha1sum "$_p" | cut -c1-40)" = "$_sum" ] || _wb="$_wb $_p"
+  done < "$CARRY_TMP/.list"
+  IFS=$_oldifs
+  CARRY_FAIL="$_wb"
+  return 0
+}
+
+# A failed switch must never leave the named edits only in /tmp. The cause stays in
+# `err` (the caller printed it); this reports the recovery as its own marker so the
+# two never overwrite each other -- the first refusal was diagnosed from a message
+# that only said "restored", and git's actual words were lost.
+carry_back_on_failure() {
+  [ -n "$CARRY_TMP" ] || { P carry_back "none"; return 0; }
+  [ -s "$CARRY_TMP/.list" ] || { P carry_back "none"; return 0; }
+  carry_writeback
+  if [ -n "$CARRY_FAIL" ]; then
+    P carry_back "fail:放回 $CARRY_FAIL 校验不过，快照在 $CARRY_TMP，务必人工找回"
+  else
+    P carry_back "ok:点名的改动已放回 $(git rev-parse --abbrev-ref HEAD)，快照留在 $CARRY_TMP"
+  fi
+  return 0
+}
+
+# The dirt gate ignores CR-at-EOL and $Id$ keyword drift on purpose (see
+# _DIRTY_GATE), but a branch switch compares byte for byte. When the two verdicts
+# disagree git's refusal is the one that stops the run, and a file carrying that
+# drift only blocks the switch if the switch would rewrite it anyway.
+#
+# So: take the files HEAD..target actually differs on, keep the ones git still
+# calls modified, and PROVE each is drift by the very judgement the gate used.
+# Drift gets snapshotted (recovery first) and handed back to git; a genuine edit
+# that shows up here means the gate and git disagree about a change, and that is
+# refused instead of discarded. Then, and only then, retry once.
+reconcile_drift() {
+  _blkbase=$1
+  DRIFT_N=0
+  DRIFT_LIST=""
+  BF="/tmp/switchblock.$$.lst"
+  git diff --name-only HEAD "$_blkbase" > "$BF" 2>/dev/null
+  if [ $? -gt 1 ] || [ ! -s "$BF" ]; then
+    rm -f "$BF"
+    return 1
+  fi
+  di=0
+  while read -r _p; do
+    [ -n "$_p" ] || continue
+    [ -f "$_p" ] || continue
+    _xy=$($GITE status --porcelain -- "$_p" 2>/dev/null | cut -c1-2)
+    [ -n "$_xy" ] || continue
+    case "$_xy" in '??') continue ;; esac
+    if path_is_edited "$_p"; then
+      P err "切换被 $CUR 到 $_blkbase 之间的 $BF 挡住：$_p 是真实改动却不在 --carry 点名里，不替你丢掉"
+      rm -f "$BF"
+      return 1
+    fi
+    if [ -n "$CARRY_TMP" ] && [ ! -d "$CARRY_TMP" ]; then CARRY_TMP=""; fi
+    if [ -z "$CARRY_TMP" ]; then
+      CARRY_TMP=$(mktemp -d 2>/dev/null)
+      [ -n "$CARRY_TMP" ] || { rm -f "$BF"; return 1; }
+      : > "$CARRY_TMP/.list"
+      P carry_tmp "$CARRY_TMP"
+    fi
+    di=$((di + 1))
+    cp -p "$_p" "$CARRY_TMP/d$di" || { rm -f "$BF"; return 1; }
+    git checkout -q -- "$_p" 2>/dev/null || { P err "还原漂移文件失败: $_p"; rm -f "$BF"; return 1; }
+    DRIFT_N=$((DRIFT_N + 1))
+    DRIFT_LIST="$DRIFT_LIST $_p"
+  done < "$BF"
+  rm -f "$BF"
+  [ "$DRIFT_N" -gt 0 ] || return 1
+  P drift "清掉 $DRIFT_N 处仅换行/关键字漂移后重试：$DRIFT_LIST"
+  return 0
+}
+
+# $1 = the ref the switch moves to (for the blocker list), rest = git checkout args.
+switch_with_drift_retry() {
+  _blkbase=$1
+  shift
+  _out=$(git checkout -q "$@" 2>&1)
+  if [ $? -eq 0 ]; then
+    return 0
+  fi
+  _first=$(printf '%s' "$_out" | tr '\n' ' ' | cut -c1-300)
+  if ! reconcile_drift "$_blkbase"; then
+    P err "切换失败：$_first"
+    return 1
+  fi
+  _out2=$(git checkout -q "$@" 2>&1)
+  if [ $? -eq 0 ]; then
+    return 0
+  fi
+  P err "清掉换行漂移后仍切换失败：$_first ／ $(printf '%s' "$_out2" | tr '\n' ' ' | cut -c1-200)"
+  return 1
+}
+
+if [ "$REAL" -gt 0 ]; then
+  if [ -z "$CARRY" ]; then
+    P err "镜像工作区在 $CUR 上有 $REAL 处真实未提交改动（$REAL_LIST），不替你 stash / checkout：先让那条会话收口；改动确实归本条时用 --carry <路径,路径> 点名搬运"
+    exit 1
+  fi
+  # --carry: the operator names the paths they own. The named set must equal the
+  # dirty set exactly -- a real edit left out of the list would be dropped on the
+  # floor at $CUR, and a named path that is not dirty means we are reading a tree
+  # nobody described, so both cases refuse instead of guessing. Comparison is field
+  # by field rather than a `case` match because a path is data, never a pattern.
+  _bad=""
+  NAMED=0
+  _oldifs=$IFS
+  IFS=,
+  for _p in $CARRY; do
+    [ -n "$_p" ] || continue
+    NAMED=$((NAMED + 1))
+    _found=0
+    for _r in $REAL_ALL; do
+      [ -n "$_r" ] || continue
+      [ "$_r" = "$_p" ] && _found=1
+    done
+    [ "$_found" = 1 ] || _bad="$_bad $_p"
+  done
+  IFS=$_oldifs
+  if [ -n "$_bad" ] || [ "$NAMED" != "$REAL" ]; then
+    P err "--carry 与工作区真实脏文件对不上（点名 $NAMED 处、实测 $REAL 处）：${_bad:-点名的都在脏集合里，但数量不等}；脏集合是 $REAL_ALL，整笔拒绝"
+    exit 1
+  fi
+  # Snapshot to /tmp first, and only then touch the worktree. Nothing is ever
+  # deleted on a failure path -- the directory is named in the message.
+  CARRY_TMP=$(mktemp -d 2>/dev/null)
+  if [ -z "$CARRY_TMP" ]; then
+    P err "建不出临时目录，搬运没开始，工作区未动"
+    exit 1
+  fi
+  P carry_tmp "$CARRY_TMP"
+  : > "$CARRY_TMP/.list"
+  i=0
+  _fail=""
+  _oldifs=$IFS
+  IFS=,
+  for _p in $CARRY; do
+    [ -n "$_p" ] || continue
+    i=$((i + 1))
+    if [ ! -f "$_p" ]; then
+      _fail="$_fail $_p"
+      continue
+    fi
+    cp -p "$_p" "$CARRY_TMP/$i" || { _fail="$_fail $_p"; continue; }
+    _b=$(git rev-parse --verify "$CUR:$_p" 2>/dev/null)
+    printf '%s|%s|%s|%s\n' "$(sha1sum "$CARRY_TMP/$i" | cut -c1-40)" "$i" "$_p" "${_b:-none}" >> "$CARRY_TMP/.list"
+  done
+  IFS=$_oldifs
+  if [ -n "$_fail" ]; then
+    P err "备份失败：$_fail（$CARRY_TMP 未删，工作区未动）"
+    exit 1
+  fi
+  # Drop the carried edits from $CUR so the dirt gate reads clean, then prove it
+  # really did go clean -- a leftover edit means git is still holding something.
+  _oldifs=$IFS
+  IFS=,
+  for _p in $CARRY; do
+    [ -n "$_p" ] || continue
+    if ! run_git_checkout "清掉 $CUR 上的 $_p 失败" -- "$_p"; then
+      carry_writeback
+      P err "搬运中止（还没切分支）：清 $CUR 上的 $_p 失败，点名的改动已放回 $CUR，快照留在 $CARRY_TMP"
+      exit 1
+    fi
+  done
+  IFS=$_oldifs
+  assess_dirt
+  if [ "$DIRT_STATE" != ok ] || [ "$REAL" -gt 0 ]; then
+    carry_writeback
+    P err "清掉点名的改动后工作区仍有 ${REAL:-?} 处未提交改动（$REAL_LIST），分支不动；改动已放回 $CUR，快照留在 $CARRY_TMP"
+    exit 1
+  fi
+  P carry_clean "$NAMED"
+fi
 if git rev-parse --verify "refs/heads/$BR" >/dev/null 2>&1; then
-  run_git_checkout "切到已有分支 $BR 失败" -q "$BR" || exit 1
-  P action switched
+  if switch_with_drift_retry "$BR" "$BR"; then
+    P action switched
+  else
+    carry_back_on_failure
+    exit 1
+  fi
 else
   FROM="$BASE"
   [ -n "$FROM" ] || FROM=refs/remotes/origin/trunk
   if ! git rev-parse --verify "$FROM^{commit}" >/dev/null 2>&1; then
-    P err "基线不可用: $FROM"; exit 1
+    P err "基线不可用: $FROM"
+    carry_back_on_failure
+    exit 1
   fi
-  run_git_checkout "从 $FROM 建分支 $BR 失败" -q -b "$BR" "$FROM" || exit 1
-  P action created
-  P base "$FROM"
+  if switch_with_drift_retry "$FROM" -b "$BR" "$FROM"; then
+    P action created
+    P base "$FROM"
+  else
+    carry_back_on_failure
+    exit 1
+  fi
+fi
+# Finish the --carry: the file must say the same thing on both ends of the switch,
+# otherwise writing the snapshot back would silently revert the target branch's own
+# version of it. Compare the COMMITTED blob, not the worktree (which is clean here).
+if [ -n "$CARRY_TMP" ] && [ -s "$CARRY_TMP/.list" ]; then
+  _drift=""
+  _oldifs=$IFS
+  IFS='|'
+  while read -r _sum _idx _p _b; do
+    [ -n "$_p" ] || continue
+    case "$_b" in ''|none) continue ;; esac
+    _now=$(git rev-parse --verify "HEAD:$_p" 2>/dev/null)
+    [ "$_now" = "$_b" ] || _drift="$_drift $_p"
+  done < "$CARRY_TMP/.list"
+  IFS=$_oldifs
+  if [ -n "$_drift" ]; then
+    # Back out the way we came: go home to $CUR and put the edits back, so the only
+    # copy of somebody's work is never just a /tmp snapshot.
+    P err "搬运停在 $BR：$_drift 在新分支上的已提交版本与你改动时不是同一份，放回会覆盖别人的内容"
+    if run_git_checkout "退回 $CUR 失败" -q "$CUR"; then
+      carry_writeback
+      if [ -n "$CARRY_FAIL" ]; then
+        P err "退回 $CUR 后放回 $CARRY_FAIL 校验不过：快照在 $CARRY_TMP，务必人工找回"
+      else
+        P err "已退回 $CUR 并放回改动，等你人工对齐后再搬；快照同时留在 $CARRY_TMP"
+      fi
+    else
+      P err "退回 $CUR 也失败了：改动只在快照 $CARRY_TMP 里，务必人工找回"
+    fi
+    exit 1
+  fi
+  carry_writeback
+  if [ -n "$CARRY_FAIL" ]; then
+    P err "放回 $CARRY_FAIL 后字节校验不过（sha1 不一致）：快照留在 $CARRY_TMP，请人工核对，别当已搬运成功"
+    exit 1
+  fi
+  P carry_restored "$NAMED"
 fi
 P tip "$(git rev-parse --short=10 HEAD)"
 P done ok
 """
+
+# ---------------------------------------------------------------------------
+# re-cutting a draft branch onto a newer trunk
+# ---------------------------------------------------------------------------
+# Why this exists at all: the push guard measures a draft against
+# ``merge-base(origin/trunk, tip)``. When the mirror's trunk ref is older than SVN and the
+# landed change sits on the line *neighbouring* the draft's own change, no content whatsoever
+# can pass a line-level three-way merge -- measured with ``git merge-file`` on a three-line
+# fixture: ours editing line 3 against theirs editing line 2 conflicts, and it still conflicts
+# when ours copies theirs' line verbatim and only adds its own edit below it. Two changes are
+# only accepted when at least one unchanged line separates them.
+# Merging the trunk commit into the draft is the one action that fixes this without touching
+# the judgement: that commit becomes an ancestor of the tip, so the guard's baseline *is*
+# trunk, its md5 comparison matches, and it never attempts a merge at push time.
+_RECUT_SCRIPT = _DIRTY_GATE + _LOCK_GATE + r"""
+# POSIX sh, runs on the build server. Local git only: no push, no dcommit, no svn ci.
+# The one thing that may never happen is losing the other person's line, so before anything
+# is committed every line the trunk side ADDED (relative to the merge base) has to be provably
+# present in the draft already. One missing line and the whole attempt is refused.
+export LC_ALL=C LANG=C
+set -f
+MIRROR=$1; BR=$2; ONTO=$3; DRY=$4; MSG_B64=${5:-}; LOCK_LIMIT=${6:-5}
+P() { printf 'PV|%s|%s\n' "$1" "$2"; }
+cd "$MIRROR" 2>/dev/null || { P err "镜像目录不存在: $MIRROR"; exit 1; }
+case "$BR" in
+  bugfix/*) : ;;
+  *) P err "只允许在 bugfix/* 草稿分支上重取基线，收到: $BR"; exit 1 ;;
+esac
+[ -n "$ONTO" ] || ONTO=refs/remotes/origin/trunk
+ONTOR=$(git rev-parse --verify "$ONTO^{commit}" 2>/dev/null)
+[ -n "$ONTOR" ] || { P err "新基线在镜像里找不到: $ONTO"; exit 1; }
+git rev-parse --verify "refs/heads/$BR" >/dev/null 2>&1 \
+  || { P err "镜像上没有 $BR：先 python -m app.cli checkout <ID> 建分支"; exit 1; }
+CUR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+if [ "$CUR" != "$BR" ]; then
+  P err "镜像当前停在 $CUR 而不是 $BR，重取基线会连带检出这 23G 工作树，不替你切分支"
+  exit 1
+fi
+git_dir_of || exit 1
+assess_lock
+report_lock
+if [ "$LOCK_STATE" != absent ]; then
+  sweep_lock || { lock_refuse; exit 1; }
+fi
+assess_dirt
+report_dirt
+if [ "$DIRT_STATE" != ok ]; then
+  P err "读不到工作区状态（git ${GITV:-?}）：${DIRT_WHY:-判据未知}；未知就不检出"
+  exit 1
+fi
+if [ "$REAL" -gt 0 ]; then
+  P err "工作区在 $CUR 上有 $REAL 处真实未提交改动（$REAL_LIST），merge 的检出会把它们卷进来"
+  exit 1
+fi
+P onto "$(printf '%.10s' "$ONTOR")"
+P tip "$(git rev-parse --short=10 HEAD)"
+if git merge-base --is-ancestor "$ONTOR" HEAD 2>/dev/null; then
+  P already "$(printf '%.10s' "$ONTOR") 已经是 $BR 的祖先，护栏的基准就是它，不需要重取"
+  P done "$(git rev-parse --short=10 HEAD)"
+  exit 0
+fi
+MB=$(git merge-base HEAD "$ONTOR" 2>/dev/null)
+[ -n "$MB" ] || { P err "$BR 与 $ONTO 没有共同祖先，不做合并"; exit 1; }
+P merge_base "$(printf '%.10s' "$MB")"
+
+MD=$(mktemp -d) || { P err "mktemp 失败"; exit 1; }
+TMPW="$MD/want"; TMPF="$MD/mine"; TMPT="$MD/theirs"
+trap 'rm -rf "$MD" 2>/dev/null' EXIT
+git diff --name-only "$MB" HEAD > "$TMPF" 2>/dev/null
+git diff --name-only "$MB" "$ONTOR" > "$TMPT" 2>/dev/null
+
+# Paths and the md5 of what trunk actually holds right now, per file this draft carries.
+URL=$(git config --get svn-remote.svn.url 2>/dev/null)
+: > "$TMPW"
+while read -r P_; do
+  [ -n "$P_" ] || continue
+  grep -qxF "$P_" "$TMPT" || continue
+  printf '%s\n' "$P_" >> "$TMPW"
+done < "$TMPF"
+REFUSED=
+while read -r P_; do
+  [ -n "$P_" ] || continue
+  git show "$MB:$P_" > "$MD/b" 2>/dev/null || : > "$MD/b"
+  git show "$ONTOR:$P_" > "$MD/t" 2>/dev/null || : > "$MD/t"
+  git show "HEAD:$P_" > "$MD/o" 2>/dev/null || : > "$MD/o"
+  # Multiset difference: comm on sorted files, so a line the trunk added twice still has to be
+  # present twice before this counts as无损.
+  sort "$MD/b" -o "$MD/b"; sort "$MD/t" -o "$MD/t"; sort "$MD/o" -o "$MD/o"
+  comm -13 "$MD/b" "$MD/t" > "$MD/ta"
+  comm -23 "$MD/ta" "$MD/o" > "$MD/ms"
+  N=$(wc -l < "$MD/ms" | tr -d ' ')
+  if [ "$N" != 0 ]; then
+    P lost "$P_ trunk 新增里有 $N 行草稿没有，拒绝重取基线"
+    head -3 "$MD/ms" | while read -r L; do P lostline "$(printf '%s' "$L" | cut -c1-140)"; done
+    REFUSED=1
+  else
+    P shared "$P_ trunk 新增行草稿已全含（保留双方，无损）"
+  fi
+done < "$TMPW"
+[ -z "$REFUSED" ] || { P err "有文件的 trunk 新增行草稿没含住，重取会覆盖他人改动，已拒绝"; exit 1; }
+
+while read -r P_; do
+  [ -n "$P_" ] || continue
+  S=""; if [ -n "$URL" ]; then
+    S=$(timeout 90 svn cat --non-interactive "$URL/$P_" 2>/dev/null | md5sum | cut -d' ' -f1)
+  fi
+  B=$(git show "$ONTOR:$P_" 2>/dev/null | md5sum | cut -d' ' -f1)
+  if [ -n "$S" ] && [ "$S" = "$B" ]; then P svnmatch "$P_ same"; else
+    P svnmatch "$P_ diff svn=${S:-取不到} trunk_ref=${B:-取不到}"
+  fi
+  O=$(git show "HEAD:$P_" 2>/dev/null | md5sum | cut -d' ' -f1)
+  P draftmd5 "$P_ $O"
+done < "$TMPW"
+
+if [ "$DRY" = 1 ]; then
+  P plan "$(wc -l < "$TMPW" | tr -d ' ') 个文件会随合并带走；确认后加 --apply 真合"
+  P done "$(git rev-parse --short=10 HEAD)"
+  exit 0
+fi
+[ -n "$MSG_B64" ] || { P err "--apply 需要提交说明（G8：fix #<ID> …）"; exit 1; }
+MSGF="$MD/msg"; printf '%s' "$MSG_B64" | base64 -d > "$MSGF" 2>/dev/null \
+  || { P err "提交说明解码失败"; exit 1; }
+git merge --no-commit --no-ff -q "$ONTOR" >/dev/null 2>&1
+git diff --name-only --diff-filter=U > "$MD/unm" 2>/dev/null
+if [ -s "$MD/unm" ]; then
+  while read -r P_; do
+    [ -n "$P_" ] || continue
+    # The proof above already showed ours holds every line trunk added, so keeping the draft
+    # side here loses nothing -- and anything else would have been refused before merging.
+    if ! git checkout --ours -- "$P_" 2>/dev/null; then
+      P err "取草稿侧内容失败: $P_"
+      git merge --abort >/dev/null 2>&1; P aborted "已 git merge --abort，工作树回到合并前"; exit 1
+    fi
+    git add -- "$P_" 2>/dev/null || { P err "git add 失败: $P_"
+      git merge --abort >/dev/null 2>&1; exit 1; }
+    P resolved "$P_"
+  done < "$MD/unm"
+fi
+git commit -q -F "$MSGF" || { P err "git commit 合并提交失败"
+  git merge --abort >/dev/null 2>&1; P aborted "已 git merge --abort，工作树回到合并前"; exit 1; }
+ NEW=$(git rev-parse --short=10 HEAD)
+# The guard measures against refs/remotes/origin/trunk, so that is the preferred reference.
+# Falling back to the merged commit keeps new_base and the want-list meaningful on a repo that
+# has no such ref (the rehearsal does not), instead of silently emitting an empty baseline.
+NB=$(git merge-base refs/remotes/origin/trunk HEAD 2>/dev/null)
+if [ -n "$NB" ]; then P new_base_src trunk; else
+  NB=$(git merge-base "$ONTOR" HEAD 2>/dev/null); P new_base_src onto
+fi
+P new_tip "$NEW"
+P new_base "$(printf '%.10s' "$NB")"
+git diff --name-only "$NB" HEAD 2>/dev/null | while read -r P_; do
+  [ -n "$P_" ] && P want "$P_"
+done
+P done "$NEW"
+"""
+
 
 # The remote scripts are assembled by concatenating gate snippets, and
 # concatenation is where they break: _CHECKOUT_SCRIPT once called git_dir_of /
@@ -1768,7 +2182,8 @@ P done ok
 # and does not need to reach the build server, so it runs before any of them ships.
 _GATE_HELPERS = ("is_mirror_noise", "probe_git", "path_is_edited", "assess_dirt",
                  "report_dirt", "git_dir_of", "assess_lock", "report_lock",
-                 "sweep_lock", "lock_refuse", "run_git_checkout")
+                 "sweep_lock", "lock_refuse", "run_git_checkout",
+                 "carry_writeback", "carry_back_on_failure")
 
 
 def script_wiring_issues() -> list[str]:
@@ -1776,7 +2191,8 @@ def script_wiring_issues() -> list[str]:
     problems: list[str] = []
     for name, body in (("_DRAFT_SCRIPT", _DRAFT_SCRIPT),
                        ("_DRAFT_COMMIT_SCRIPT", _DRAFT_COMMIT_SCRIPT),
-                       ("_CHECKOUT_SCRIPT", _CHECKOUT_SCRIPT)):
+                       ("_CHECKOUT_SCRIPT", _CHECKOUT_SCRIPT),
+                       ("_RECUT_SCRIPT", _RECUT_SCRIPT)):
         code = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
         defined = set(re.findall(r"^([a-z_][a-z0-9_]*)\(\)", code, re.M))
         for helper in _GATE_HELPERS:
@@ -1792,13 +2208,19 @@ def _require_wiring() -> None:
         raise PromoteError("远端脚本不自洽，已拒绝下发：" + "；".join(issues))
 
 
-def checkout_draft(bug: dict, base: str = "") -> Checkout:
+def checkout_draft(bug: dict, base: str = "", carry: str = "") -> Checkout:
     """Create or switch the mirror's working tree onto this bug's draft branch.
 
     Part of the same goal as ``draft_commit``: the executor should be able to do
     its whole draft lifecycle through ``python -m app.cli`` instead of typing raw
     ``ssh ... git checkout``, which is the kind of command that stops an
     unattended run dead on an approval prompt.
+
+    ``carry`` is a comma-separated list of paths the caller declares to be *this*
+    item's own uncommitted edits. Without it the dirt gate refuses (unchanged
+    default); with it the gate refuses unless the named set equals the real dirty
+    set exactly, snapshots every named file, switches, then writes them back and
+    proves each one byte for byte -- see _CHECKOUT_SCRIPT.
     """
     branch = draft_branch_of(bug)
     require_plan(bug, "开/切草稿分支")
@@ -1807,7 +2229,18 @@ def checkout_draft(bug: dict, base: str = "") -> Checkout:
     mirror_dir = svn_client.resolve_target(bug=bug).working_copy
     target = remote_target(mirror_dir)
     _require_wiring()
-    args = [target.mirror, branch, base or "", str(lock_limit_minutes())]
+    carry = (carry or "").strip()
+    if carry:
+        items = [p.strip() for p in carry.split(",") if p.strip()]
+        # The remote manifest is pipe-separated and newline-recorded, so neither
+        # may appear inside a path; refuse here rather than corrupt the checklist.
+        bad = [p for p in items if "|" in p or "\n" in p or "\r" in p]
+        if bad:
+            raise PromoteError("--carry 的路径里不能带 | 或换行：" + " ".join(bad))
+        if len(items) != len(set(items)):
+            raise PromoteError("--carry 有重复路径：" + carry)
+        carry = ",".join(items)
+    args = [target.mirror, branch, base or "", str(lock_limit_minutes()), carry]
     quoted = " ".join("'" + str(a).replace("'", "'\\''") + "'" for a in args)
     proc = subprocess.run(
         target.ssh_command(f"sh -s {quoted}"),
@@ -1819,6 +2252,7 @@ def checkout_draft(bug: dict, base: str = "") -> Checkout:
     text = _decode(proc.stdout or b"")
     err = _decode(proc.stderr or b"")
     out = Checkout(branch=branch)
+    errs: list[str] = []
     for line in text.splitlines():
         if not line.startswith("PV|"):
             continue
@@ -1832,6 +2266,148 @@ def checkout_draft(bug: dict, base: str = "") -> Checkout:
             out.base = value
         elif tag == "tip":
             out.tip = value
+        elif tag == "carry_tmp":
+            out.carry_dir = value
+        elif tag == "carry_clean":
+            out.carry_named = int(value or 0)
+        elif tag == "carry_restored":
+            out.carry_restored = int(value or 0)
+        elif tag == "carry_back":
+            out.carry_back = value
+        elif tag == "drift":
+            out.drift_note = value
+        elif read_dirt_marker(out, tag, value):
+            pass
+        elif read_lock_marker(out, tag, value):
+            pass
+        elif tag == "done":
+            out.ok = True
+        elif tag == "err":
+            errs.append(value)
+    if errs:
+        # Keep every refusal the script printed. The old "last one wins" collapsed
+        # git's words about the switch together with the recovery note, so the run
+        # reported only that the edits had been put back and never said why.
+        out.error = " ／ ".join(errs)
+    if not out.ok and not out.error:
+        # No verdict marker at all. git's own stderr is context, never the cause --
+        # "Switched to a new branch" lands there on a perfectly good run, and pasting
+        # it into `error` reads as if the switch failed.
+        out.error = (f"远端脚本没有给出结论（rc={proc.returncode}），不假定成功"
+                     + (f"；stderr 末行：{err.strip().splitlines()[-1]}" if err.strip() else ""))
+    out.raw = text if not err.strip() else text + "\n[stderr] " + err.strip()
+    if out.error:
+        out.error = f"{out.error}（{target.host} · {target.mirror}）"
+    return out
+
+
+@dataclass
+class Recut:
+    """Outcome of re-cutting a draft branch onto a newer trunk commit."""
+
+    ok: bool = False
+    dry_run: bool = True
+    branch: str = ""
+    onto: str = ""
+    tip: str = ""
+    merge_base: str = ""
+    new_tip: str = ""
+    new_base: str = ""
+    new_base_src: str = ""            # trunk | onto: which ref the baseline was measured from
+    already: str = ""                   # set when the trunk commit is already an ancestor
+    shared: list[str] = field(default_factory=list)      # files proved loss-free
+    lost: list[str] = field(default_factory=list)        # files that would lose trunk lines
+    lost_lines: list[str] = field(default_factory=list)  # the lines themselves
+    svn_match: list[str] = field(default_factory=list)   # baseline vs live svn cat, per file
+    draft_md5: list[str] = field(default_factory=list)
+    resolved: list[str] = field(default_factory=list)    # conflicts kept from the draft side
+    want: list[str] = field(default_factory=list)        # files a push would now carry
+    plan: str = ""
+    aborted: str = ""
+    dirty_real: int = 0
+    dirty_noise: int = 0
+    dirty_untracked: int = 0
+    dirty_paths: str = ""
+    dirty_state: str = ""
+    dirt_why: str = ""
+    git_version: str = ""
+    lock_state: str = ""
+    lock_size: int = -1
+    lock_age: int = -1
+    lock_procs: int = 0
+    lock_swept: str = ""
+    error: str = ""
+    raw: str = ""
+
+    def summary(self) -> str:
+        if self.error:
+            return self.error
+        if self.already:
+            return self.already
+        if self.dry_run:
+            return (f"预演：{len(self.shared)} 个文件已证明保留双方无损；"
+                    f"合并后护栏基准将变成 {self.onto}，待提交 {self.plan or '（无文件）'}"
+                    f"{'；已回退，未写入' if self.aborted else ''}")
+        return (f"已把 {self.onto} 合进 {self.branch}：新 tip {self.new_tip}，"
+                f"护栏基准现在是 {self.new_base}，本次会提交 {len(self.want)} 个文件")
+
+
+def recut_draft(bug: dict, onto: str = "", *, dry_run: bool = True,
+                message: str = "") -> Recut:
+    """Merge a newer trunk commit into this item's draft branch (locally, never pushed).
+
+    The point is the baseline, not the content: after the merge the trunk commit is an
+    ancestor of the tip, so the push guard's ``merge-base(origin/trunk, tip)`` *is* current
+    trunk and its md5 comparison matches ``svn cat`` -- which is the only way a draft whose
+    change sits on the neighbour of a landed line can get through, since a line-level
+    three-way merge refuses that shape no matter how the draft text is written.
+
+    Loss is prevented before anything is written: every line the trunk side added must
+    already be in the draft, or the script refuses and leaves the branch alone.
+    """
+    branch = draft_branch_of(bug)
+    require_plan(bug, "重取草稿基线")
+    text = str(message or "").strip()
+    if not dry_run and not text:
+        raise PromoteError("--apply 需要提交说明（G8：fix #<禅道ID> …）")
+
+    from . import svn_client
+
+    mirror_dir = svn_client.resolve_target(bug=bug).working_copy
+    target = remote_target(mirror_dir)
+    _require_wiring()
+    args = [target.mirror, branch, str(onto or ""), "1" if dry_run else "0",
+            base64.b64encode(text.encode("utf-8")).decode("ascii"),
+            str(lock_limit_minutes())]
+    quoted = " ".join("'" + str(a).replace("'", "'\\''") + "'" for a in args)
+    proc = subprocess.run(
+        target.ssh_command(f"sh -s {quoted}"),
+        input=_RECUT_SCRIPT.strip().replace("\r\n", "\n").encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=_SSH_TIMEOUT,
+    )
+    out_text = _decode(proc.stdout or b"")
+    err = _decode(proc.stderr or b"")
+    out = Recut(branch=branch, dry_run=bool(dry_run))
+    for line in out_text.splitlines():
+        if not line.startswith("PV|"):
+            continue
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            continue
+        tag, value = parts[1], parts[2]
+        if tag in ("onto", "tip", "merge_base", "new_tip", "new_base", "new_base_src",
+                   "plan"):
+            setattr(out, tag, value)
+        elif tag == "already":
+            out.already = value
+        elif tag in ("shared", "lost", "lostline", "svnmatch", "draftmd5",
+                     "resolved", "want"):
+            getattr(out, {"lostline": "lost_lines", "svnmatch": "svn_match",
+                          "draftmd5": "draft_md5"}.get(tag, tag)).append(value)
+        elif tag == "aborted":
+            out.aborted = value
         elif read_dirt_marker(out, tag, value):
             pass
         elif read_lock_marker(out, tag, value):
@@ -1840,9 +2416,14 @@ def checkout_draft(bug: dict, base: str = "") -> Checkout:
             out.ok = True
         elif tag == "err":
             out.error = value
-    if not out.ok and not out.error and proc.returncode != 0 and err.strip():
-        out.error = err.strip().splitlines()[-1]
-    out.raw = text if not err.strip() else text + "\n[stderr] " + err.strip()
+    if not out.ok and not out.error:
+        # recut_draft always ends with a `done` / `already` / `err` marker, so a run
+        # that produced none is "unknown", not "no problem". git's stderr is context
+        # only: "Switched to branch" sits there even on a successful run, and pasting
+        # it into `error` would make a good merge look like a failed one.
+        out.error = (f"远端脚本没有给出结论（rc={proc.returncode}），不假定成功"
+                     + (f"；stderr 末行：{err.strip().splitlines()[-1]}" if err.strip() else ""))
+    out.raw = out_text if not err.strip() else out_text + "\n[stderr] " + err.strip()
     if out.error:
         out.error = f"{out.error}（{target.host} · {target.mirror}）"
     return out
