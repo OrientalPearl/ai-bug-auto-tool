@@ -137,9 +137,11 @@ Web「下达任务」页 `/dispatch` 会按落码模式自动换正文：direct 
 
 0) 本系统命令一律在 <AI-BUG 项目根> 下执行（`app` 包要能 import；换到代码库目录跑会 ModuleNotFoundError）。
    代码的读与改在 SVN 工作副本里做，那个目录由下一条命令现读，不要自己认路径。
-1) python -m app.cli mirror <禅道ID>
+1) python -m app.cli mirror <禅道ID> --full
    以这条命令报出的 wc_local（Windows 侧读改文件）/ wc_remote（SSH 侧跑 svn）为**唯一落码位置**，
-   再看 url / revision / held_by / mirror_ready / dirt.state；
+   再看 url / revision / held_by / mirror_ready / dirt.state / dirty_real / conflicts / stale；
+   **--full 不能省**：不带它时只扫本条已声明的文件，此刻还没 checkout、声明是空的，
+   它回 scanned=none / dirt.state=skipped —— 那是"没看"，不是"干净"（整副本扫描实测约 58.6 秒，开工前一次就够）；
    工作区里可能同时挂着多份 SVN URL 相同的副本（例：3.0-86 / 3.0-A / 3.0-B / 3.0.new），
    只准动 mirror 点名的那一份，其余一律不许打开、不许改、不许 revert。
    `held_by` 指向别的条目 → 这条开不了工，block 或等那条收尾。
@@ -428,9 +430,11 @@ python -m app.cli repos                         # landing_spot / code_mode 会�
 **一条 bug 在 direct 模式下的完整走法**：
 
 ```
-0) python -m app.cli mirror <禅道ID>
+0) python -m app.cli mirror <禅道ID> --full
    看 code_mode=svn_direct / wc_local（Windows 侧读改）/ wc_remote（SSH 侧跑 svn）/ url / revision /
-   mirror_ready / held_by / held_by_this_item / dirt.state。
+   mirror_ready / held_by / held_by_this_item / dirt.state / dirty_real / conflicts / stale。
+   --full 不能省：不带它时只扫本条声明过的文件，没 checkout 前声明为空 → 回 scanned=none、
+   dirt.state=skipped，那是"没扫"不是"干净"（整副本扫描实测 58.6 秒，一次一条就够）。
    本机有多份 URL 相同的副本（实测 trunk/3.0 四份），只有 mirror 点名的那份准动。
    `held_by` 指向别的条目 → 这条开不了工，block 或等那条收尾，不要在同一份副本里叠两条改动。
 1) python -m app.cli checkout <禅道ID> --files <打算动的文件,逗号分隔>

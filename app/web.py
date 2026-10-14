@@ -935,6 +935,7 @@ def _discussion_prompt(item: dict[str, Any]) -> str:
     code_mode = "git_mirror"
     direct_wc = "（未配置）"
     draft_note = "（无在册草稿）"
+    draft = None
     try:
         target = svn_client.resolve_target(product_id=product_id) if product_id else None
     except svn_client.SvnError as exc:
@@ -975,28 +976,49 @@ def _discussion_prompt(item: dict[str, Any]) -> str:
         ]
     scope_lines += [
         f"备注：{repo_note}",
-        f"上面这些路径只作核对：真值是产品仓库绑定，动手前先 `python -m app.cli mirror {slug}` 现读一遍，"
+        # Same --full rule as below: naming the bare probe here would tell the reader
+        # to run the one version that deliberately does not look at the copy.
+        f"上面这些路径只作核对：真值是产品仓库绑定，动手前先 "
+        f"`python -m app.cli mirror {slug}{' --full' if code_mode == 'svn_direct' else ''}` 现读一遍，"
         "不一致就以命令报出的为准并 block 说明。",
         f"本系统命令一律在 {PROJECT_ROOT} 下执行（在代码库目录里跑 `python -m app.cli` 会 ModuleNotFoundError，"
         "IDE 工作区挂了代码库不等于能在那儿跑命令）。",
     ]
     if code_mode == "svn_direct":
+        # What an "SVN 目录讨论" actually needs is the copy's own state, and the
+        # cheap probe does not report it: without --full the scan is limited to the
+        # files this item declared, and a pre-checkout item has declared none -- so
+        # it comes back scanned=none / dirt.state=skipped. Reporting that as clean
+        # would be the single most misleading thing this prompt could say.
         recall_lines = [
             "进入讨论前，先在这个系统里回忆现值：",
             f"1. python -m app.cli status {slug}",
             f"2. python -m app.cli detail {slug}",
-            f"3. python -m app.cli mirror {slug}   # direct 模式下它报 wc_local / wc_remote / held_by / dirt.state",
+            f"3. python -m app.cli mirror {slug} --full   # 必须带 --full，原因写在下面",
             "4. 如需确认代码库绑定，再看 python -m app.cli repos",
+            "",
+            "这一条讨论的对象是那份 SVN 副本本身，mirror 的返回要分三块读：",
+            "  · 落点与版本：wc_local（Windows 侧读改文件）/ wc_remote（SSH 侧跑 svn）/ url / revision"
+            " —— 本机有多份 URL 相同的副本，先确认讨论的是哪一份；",
+            "  · 副本现在承载着什么：dirty_real / dirty_real_count（未提交的真实改动）、"
+            "conflicts（冲突态）、stale（落后仓库的） —— 这决定这条能不能开工；",
+            "  · 归属：held_by / held_by_this_item / base_rev / files / diff_stat"
+            " —— 被别的条目占着就先讨论怎么腾，别在一份副本里叠两条改动。",
+            f"  不带 --full 时 mirror 只扫本条已声明的文件；讨论轮还没 checkout，声明是空的，"
+            "它会直接回 scanned=none / dirt.state=skipped —— 那等于没看副本，"
+            "**不许把 skipped 读成“副本是干净的”**。",
+            "  整副本扫描实测约 58.6 秒（trunk/3.0-86），一次讨论跑一次就够，别反复扫。",
         ]
         forbid_lines = [
             "本轮禁止：",
             "- 不改代码，不 checkout / draft / commit / push / revert / recut / promote",
+            "- 不 svn update / svn ci / svn revert —— 讨论轮连副本的状态都不该动",
             "- 不把这条收口为“已完成 / 已修复 / 可推”",
             "- 没有我的“进入执行”指令，不得开始实现",
         ]
         execute_lines = [
             "如果后面我说“进入执行”，按 svn_direct 在线协作轮（AUTO_LOOP.md §0.6 / §1.9）做，一次只做这一条：",
-            f"  1) python -m app.cli mirror {slug}",
+            f"  1) python -m app.cli mirror {slug} --full   # 领副本前必须先看副本承载着什么",
             f"  2) python -m app.cli checkout {slug} --files <要动的文件>   # 领副本 + 记归属基线",
             "  3) 改码 → 编译 / 测试（svn 子命令一律 SSH 侧，Windows 盘只读与编辑）",
             f'  4) python -m app.cli draft {slug} --message "fix #{slug} <根因>" --files <同一批文件>   # 不提交，只做归属证明',
@@ -1004,6 +1026,10 @@ def _discussion_prompt(item: dict[str, Any]) -> str:
             "     登记完停下来等我验证；我自己 svn ci 后回填 r 号，或当面叫你 push --owner-approved（先 --dry-run）。",
             "     这份副本在我验证前一直被这条占着 —— 不许接着开下一条。",
         ]
+        ctx_lines = []
+        if draft and str(draft.get("diff_stat") or "").strip():
+            ctx_lines.append("- 副本改动摘要（draft 登记的 svn status 字母 + 每文件 +/- 行数，不用再去扫一遍）：")
+            ctx_lines += ["    " + ln for ln in str(draft["diff_stat"]).splitlines()[:20]]
     else:
         recall_lines = [
             "进入讨论前，先在这个系统里回忆现值：",
@@ -1021,6 +1047,7 @@ def _discussion_prompt(item: dict[str, Any]) -> str:
         execute_lines = [
             "如果后面我说“进入执行”，你再回到 AGENTS.md / AUTO_LOOP.md 的执行流程与 G1-G13。"
         ]
+        ctx_lines = []
     return "\n".join([
         "【单条在线讨论下达语】",
         "先读 AGENTS.md 与 AUTO_LOOP.md。",
@@ -1055,6 +1082,7 @@ def _discussion_prompt(item: dict[str, Any]) -> str:
         f"- 最近主人答复：{_prompt_line(latest_need.get('owner_reply'))}",
         f"- 最近打回原因：{_prompt_line(latest_reject.get('reject_reason'))}",
         f"- 未验证项：{_prompt_line(analysis.get('unverified'))}",
+        *ctx_lines,
         "",
         "现在只讨论这个问题：",
         "<把这次要讨论的修改点写在这里>",
@@ -1074,9 +1102,12 @@ def _direct_scope_lines(group: dict[str, Any]) -> str:
     return "\n".join([
         "这一组走 **svn_direct 落码模式**：代码直接改在那份 SVN 工作副本里，"
         "**本轮是主人在线的协作轮，不是无人值守连跑轮**。没有分支、没有草稿提交、也没有 patch。",
-        f"开工前先看落码位置就绪与归属：`python -m app.cli mirror {slug_example}`，"
+        f"开工前先看落码位置就绪与归属：`python -m app.cli mirror {slug_example} --full`，"
         "看 code_mode / url / wc_local / wc_remote / revision / held_by / held_by_this_item / "
-        "mirror_ready / dirt.state；"
+        "mirror_ready / dirt.state / dirty_real / conflicts / stale；"
+        "**--full 不能省**：不带它时这条命令只扫本条已声明的文件，而此刻还没 checkout、声明是空的，"
+        "它会回 scanned=none / dirt.state=skipped —— 那是“没看”，不是“干净”（整副本扫描实测约 58.6 秒，"
+        "开工前跑一次就够）；"
         "`wc_local` 是 Windows 侧读改文件的目录、`wc_remote` 是 SSH 侧跑 svn 的目录，这两个才是本条唯一准改的那份副本——"
         "同一台机器上有多份 SVN URL 完全相同的副本"
         "（实测 trunk/3.0 有 3.0-86 / 3.0-A / 3.0-B / 3.0.new 四份），IDE 工作区里同时挂着它们时，"
@@ -1191,7 +1222,8 @@ def _scope_block(group: dict[str, Any], base_label: str) -> str:
                  " ModuleNotFoundError）；IDE 工作区里挂了代码库不等于能在那个目录跑命令。")
     lines.append(f"落码目录 = {group['working_copy']}"
                  + (f"（落码模式 {group['code_mode']}）" if group.get("code_mode") else "")
-                 + " —— 这一行只用来核对：真值是产品仓库绑定，动手前用 `mirror <禅道ID>` 现读一遍，"
+                 + " —— 这一行只用来核对：真值是产品仓库绑定，动手前用 "
+                 + f"`mirror <禅道ID>{' --full' if direct else ''}` 现读一遍，"
                    "两者不一致就以命令报出的为准并 block 说明。")
     unbound = [str(p["product_id"]) for p in group["products"] if p["source"] != "product"]
     if unbound and len(unbound) < len(group["products"]):
