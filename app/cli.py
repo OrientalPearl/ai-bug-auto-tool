@@ -35,13 +35,16 @@ from .config import PROJECT_ROOT, get_settings
 
 
 def _code_mode(item: dict) -> str:
-    """Which landing spot this item's product uses: the mirror or a direct SVN copy.
+    """Which landing spot this item uses: the mirror or a direct SVN copy.
 
-    Read straight from the binding so an item can never be routed into the other
-    mode's commands by an unrelated SVN error.
+    Resolved through `svn_direct.landing_for`, i.e. the item's own override first
+    and the product binding second -- so the 下达 button and these commands can
+    never disagree about which mode a given item is in. An SVN error still cannot
+    reroute an item: resolution reads stored data only, never the network.
     """
-    binding = db.get_product_repo(item.get("product_id")) or {}
-    return str(binding.get("code_mode") or "git_mirror")
+    from . import svn_direct
+
+    return svn_direct.landing_for(item)[0]
 
 
 def _direct_unsupported(item: dict, action: str) -> dict[str, Any] | None:
@@ -953,7 +956,7 @@ def cmd_checkout(args: argparse.Namespace) -> None:
                  if f.strip()]
         target = svn_client.resolve_target(bug=bug)
         try:
-            wc = svn_direct.resolve(target)
+            wc = svn_direct.resolve(target, item=bug)
             result = svn_direct.open_draft(wc, bug, files, note=getattr(args, "note", "") or "")
         except (svn_direct.DirectError, svn_client.SvnError, ValueError) as exc:
             _out({"ok": False, "action": "checkout", "code_mode": "svn_direct",
@@ -1073,7 +1076,7 @@ def cmd_draft(args: argparse.Namespace) -> None:
 
         target = svn_client.resolve_target(bug=bug)
         try:
-            wc = svn_direct.resolve(target)
+            wc = svn_direct.resolve(target, item=bug)
             result = svn_direct.record(wc, bug, files, message=message)
         except (svn_direct.DirectError, svn_client.SvnError, ValueError) as exc:
             _out({"ok": False, "action": "draft", "code_mode": "svn_direct",
@@ -1171,6 +1174,72 @@ def cmd_recut(args: argparse.Namespace) -> None:
     })
 
 
+def cmd_landing(args: argparse.Namespace) -> None:
+    """Decide (or undo) that one item lands in an SVN copy -- naming a path is optional.
+
+    `--mode svn_direct` is the decision; without `--wc` the copy is discovered by the
+    same rule `resolve` uses (same repository root as the bound repo, beside the
+    mirror). This changes no product binding and runs no SVN command.
+    """
+    from . import svn_direct
+
+    bug = _bug_ref(args.ref)
+    mode = str(args.mode or "").strip()
+    wc = str(args.wc or "").strip()
+    if args.clear:
+        mode, wc = "", ""
+    if not mode and not wc and not args.clear:
+        _out({"ok": False, "action": "landing", "zentao_id": bug["zentao_id"],
+              "kind": bug["target"],
+              "error": "三选一：--mode svn_direct（副本由系统自动判定）、--wc <绝对路径>"
+                       "（顺带点名副本）、--clear（回到产品绑定的模式）"})
+        return
+    if wc and not mode:
+        # Naming a path out loud is the same statement as "this one runs in the copy".
+        mode = "svn_direct"
+    try:
+        updated = db.set_item_landing(bug["id"], bug["target"], wc or None, mode=mode)
+    except ValueError as exc:
+        _out({"ok": False, "action": "landing", "error": str(exc)})
+        return
+    res_mode, resolved, source, why = _landing_report(updated or bug)
+    payload: dict[str, Any] = {
+        "ok": True, "action": "landing",
+        "zentao_id": bug["zentao_id"], "kind": bug["target"],
+        "code_mode": res_mode,
+        "landing_source": source,
+        "landing_source_label": svn_direct.LANDING_LABELS.get(source, source),
+        "landing_wc": resolved,
+        "landing_reason": why,
+        "next": f"python -m app.cli mirror {bug['zentao_id']}"
+                + (" --full" if res_mode == "svn_direct" else ""),
+    }
+    if res_mode == "svn_direct" and resolved and not Path(resolved).exists():
+        payload["warn"] = f"{resolved} 在本机读不到（映射盘没接上？路径写错？）；后续命令仍会按它解析"
+    if res_mode == "svn_direct" and resolved:
+        payload["note"] = ("落码方式已记下，但还没验证它是 SVN 副本、也没验证 URL 归属——"
+                           "那两步在 mirror / checkout 里做，验不过整笔拒绝")
+    if res_mode == "svn_direct" and not resolved:
+        payload["error"] = ("这一条要落副本，但本机没定位到该仓库的检出：镜像同级目录里没有 "
+                           "URL 与产品仓库一致的 .svn。用 --wc <绝对路径> 点名，"
+                           "或把产品 bind-repo 到那份副本")
+        payload["ok"] = False
+    _out(payload)
+
+
+def _landing_report(item: dict) -> tuple[str, str, str, str]:
+    """Same four values the web cards show, without importing the web layer."""
+    from . import svn_direct
+
+    mode, wc, source = svn_direct.landing_for(item)
+    why = ""
+    if mode != "svn_direct":
+        wc, why = svn_direct.direct_preview(item)
+    elif source == "auto":
+        _w, why = svn_direct.direct_preview(item)
+    return mode, wc, source, why
+
+
 def cmd_push(args: argparse.Namespace) -> None:
     """Commit one item's declared files with `svn ci` -- direct mode, on request.
 
@@ -1201,7 +1270,7 @@ def cmd_push(args: argparse.Namespace) -> None:
                f"{args.message or bug['title']}").strip()
     target = svn_client.resolve_target(bug=bug)
     try:
-        wc = svn_direct.resolve(target)
+        wc = svn_direct.resolve(target, item=bug)
         result = svn_direct.push(wc, bug, files, message,
                                  owner_approved=bool(args.owner_approved),
                                  dry_run=bool(args.dry_run),
@@ -1257,7 +1326,7 @@ def cmd_revert_draft(args: argparse.Namespace) -> None:
         return
     target = svn_client.resolve_target(bug=bug)
     try:
-        wc = svn_direct.resolve(target)
+        wc = svn_direct.resolve(target, item=bug)
         result = svn_direct.revert(wc, bug)
     except (svn_direct.DirectError, svn_client.SvnError, ValueError) as exc:
         _out({"ok": False, "action": "revert", "error": str(exc)})
@@ -1586,6 +1655,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--files", required=True,
                    help="逗号分隔的改动文件（落码目录内相对路径）；不做整仓 add")
     p.set_defaults(func=cmd_draft)
+
+    p = sub.add_parser("landing",
+                       help="给某一条点名 / 清除 SVN 落码副本：产品仍绑镜像也能让这一条走副本，"
+                            "只记路径不改绑定也不跑 svn（AUTO_LOOP.md §1.9）")
+    p.add_argument("ref")
+    p.add_argument("--mode", default="", choices=["", "git_mirror", "svn_direct"],
+                   help="本条的落码决定；svn_direct 时不给 --wc 就由系统自动判定副本")
+    p.add_argument("--wc", default="", help="该副本的绝对路径（Windows 映射盘路径），不给就自动判定")
+    p.add_argument("--clear", action="store_true", help="清除本条的落码决定，回到产品绑定的模式")
+    p.set_defaults(func=cmd_landing)
 
     p = sub.add_parser("push",
                        help="svn_direct 专用：把本条登记的改动 svn ci 进版本库。"

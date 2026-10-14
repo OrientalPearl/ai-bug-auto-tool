@@ -42,6 +42,12 @@
       </span>
       <button class="btn" style="float:right;margin-left:6px" type="button"
               data-discussion-item="1" data-bug-id="{{ n.item_id }}" data-target="{{ n.target }}">在线讨论下达语</button>
+      {% if n.code_mode != 'svn_direct' %}
+      <button class="btn" style="float:right;margin-left:6px" type="button"
+              title="这一条改按 SVN 副本落码；副本自动判定：{{ n.landing_wc or '本机未定位到该仓库的检出' }}{% if n.landing_reason %} —— {{ n.landing_reason }}{% endif %}"
+              data-discussion-direct="1" data-bug-id="{{ n.item_id }}" data-target="{{ n.target }}"
+              data-slug="{{ ref }}" data-landing-wc="{{ n.landing_wc or '' }}">SVN 副本下达语</button>
+      {% endif %}
       <a class="btn" style="float:right" href="#/item/{{ n.target }}/{{ n.item_id }}">弹窗看完整详情</a>
     </h3>
     <p class="hint">

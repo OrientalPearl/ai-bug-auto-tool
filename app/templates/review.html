@@ -29,6 +29,12 @@
       <span class="badge badge-orange">待审查</span>
       <button class="btn" style="float:right;margin-left:6px" type="button"
               data-discussion-item="1" data-bug-id="{{ bug.id }}" data-target="{{ bug.target }}">在线讨论下达语</button>
+      {% if bug.code_mode != 'svn_direct' %}
+      <button class="btn" style="float:right;margin-left:6px" type="button"
+              title="这一条改按 SVN 副本落码；副本自动判定：{{ bug.landing_wc or '本机未定位到该仓库的检出' }}{% if bug.landing_reason %} —— {{ bug.landing_reason }}{% endif %}"
+              data-discussion-direct="1" data-bug-id="{{ bug.id }}" data-target="{{ bug.target }}"
+              data-slug="{{ ref }}" data-landing-wc="{{ bug.landing_wc or '' }}">SVN 副本下达语</button>
+      {% endif %}
       <a class="btn" style="float:right" href="#/item/{{ bug.target }}/{{ bug.id }}">弹窗看完整详情</a>
     </h3>
     <p class="hint">

@@ -202,24 +202,155 @@ def _find_yaml(starts: list[Path], *, hint: str = "") -> tuple[Path, dict[str, s
         + "。SSH 侧执行 svn 命令要求该代码库自己声明主机与用户，本系统不猜。" + hint)
 
 
-def resolve(target: RepoTarget, *, binding: dict | None = None) -> DirectWc:
+# ---------------------------------------------------------------------------
+# Which copy an item may land in (AUTO_LOOP.md §1.9)
+# ---------------------------------------------------------------------------
+
+LANDING_LABELS = {
+    "draft": "本条在册草稿（副本已领用，中途不换地方）",
+    "item": "条目点名（landing_wc）",
+    "mode": "条目声明走副本（landing_mode），路径自动判定",
+    "binding": "产品绑定（product_repos.svn_working_copy）",
+    "auto": "自动判定：镜像同级、仓库根 URL 与该产品一致的那份检出",
+}
+
+
+def direct_preview(item: dict | None, binding: dict | None = None) -> tuple[str, str]:
+    """``(copy, why)`` a direct round *would* use for this item, deciding nothing.
+
+    The card needs to show the target before the owner clicks, and the click itself
+    must not require typing a path -- so the same discovery the commands will use
+    runs here, read-only, and says out loud which copy was chosen and why.
+    """
+    from . import landing_scan
+
+    if binding is None:
+        pid = (item or {}).get("product_id")
+        binding = (db.get_product_repo(pid) if pid else None) or {}
+    wc = str((item or {}).get("landing_wc") or "").strip()
+    if wc:
+        return wc, "这一条已经点名了副本"
+    wc = str(binding.get("svn_working_copy") or "").strip()
+    if wc:
+        return wc, "产品绑定里配置的副本"
+    found = landing_scan.discover_binding(binding)
+    if not found:
+        return "", ""
+    return found[0]["path"], landing_scan.pick_reason(found[0], found)
+
+
+def default_direct_wc() -> str:
+    """The owner-side default copy from .env -- a pre-fill, and only if it *is* one.
+
+    ``SVN_WORKING_COPY`` already defaults to ``<project>/svn_workspace``, which is
+    this system's own promote scratch directory, not a checkout of anything; a
+    copied-down ``SVN_DIRECT_WC=`` therefore points at a directory SVN knows nothing
+    about. Reading the local manifest decides that instead of trusting the setting:
+    anything that is not an SVN 1.6/1.7 working copy is reported as "no default".
+    """
+    from . import landing_scan
+
+    raw = str(get_settings().svn_direct_wc or "").strip()
+    if not raw:
+        return ""
+    if (Path(raw) / ".svn").is_dir() or landing_scan.read_manifest(raw):
+        return raw
+    return ""
+
+
+def _draft_copy(item: dict | None) -> str:
+    """The copy this item already holds, if any -- a round never changes location."""
+    if not item or item.get("id") is None:
+        return ""
+    draft = db.get_live_draft_for_item(item["id"], item.get("target") or "bug")
+    return str((draft or {}).get("wc_path") or "").strip()
+
+
+def _auto_copy(binding: dict) -> tuple[str, str]:
+    """Discover the landing copy beside the mirror; ('', 'auto') when undecidable."""
+    from . import landing_scan
+
+    found = landing_scan.discover_binding(binding)
+    return (found[0]["path"], "auto") if found else ("", "auto")
+
+
+def landing_for(item: dict | None, binding: dict | None = None) -> tuple[str, str, str]:
+    """``(code_mode, wc_local, source)`` -- where this item's next edit may go.
+
+    The decision and the path are resolved on two separate chains:
+
+      decision: 在册草稿 > 条目 landing_mode > 产品绑定 code_mode（或条目点了名）
+      path:     草稿的 wc > 条目 landing_wc > 绑定的 svn_working_copy > 自动判定
+
+    Splitting them is what lets a direct round name nothing: the owner decides
+    "this one runs in place", and the copy is discovered. Nothing about discovery
+    can make an item direct on its own -- a directory merely sitting beside a
+    mirror must not switch a whole product's flow.
+    """
+    if binding is None:
+        pid = (item or {}).get("product_id")
+        binding = (db.get_product_repo(pid) if pid else None) or {}
+    held = _draft_copy(item)
+    if held:
+        return "svn_direct", held, "draft"
+    item_wc = str((item or {}).get("landing_wc") or "").strip()
+    declared = str((item or {}).get("landing_mode") or "").strip()
+    bound = str(binding.get("code_mode") or "git_mirror")
+    if declared == "git_mirror":
+        # An explicit "this one stays on the mirror" outranks a bound-direct product.
+        return "git_mirror", "", "mode"
+    # A stored path is never, by itself, the decision -- otherwise a leftover
+    # landing_wc would keep an item in the copy after its mode was cleared.
+    if declared == "svn_direct" or bound == "svn_direct":
+        source = "mode" if declared == "svn_direct" else "binding"
+        wc = item_wc or str(binding.get("svn_working_copy") or "").strip()
+        if item_wc:
+            source = "item"
+        elif not wc:
+            wc, source = _auto_copy(binding)
+        return "svn_direct", wc, source
+    return "git_mirror", "", "binding"
+
+
+def landing_reason(item: dict | None, binding: dict | None = None) -> str:
+    """One line explaining an *automatic* choice (the other sources need no essay)."""
+    mode, wc, source = landing_for(item, binding)
+    if source != "auto" or not wc:
+        return ""
+    from . import landing_scan
+
+    if binding is None:
+        pid = (item or {}).get("product_id")
+        binding = (db.get_product_repo(pid) if pid else None) or {}
+    found = landing_scan.discover_binding(binding)
+    chosen = next((c for c in found if c["path"] == wc), None)
+    return landing_scan.pick_reason(chosen, found) if chosen else ""
+
+
+def resolve(target: RepoTarget, *, binding: dict | None = None,
+            item: dict | None = None) -> DirectWc:
     """Turn a product binding into a verified working copy on the build server.
 
     Verified means: the directory is configured, it really is an SVN working
     copy, and what it points at belongs to the repository bound to that product.
     A copy of a different repository is refused -- an executor editing the wrong
     line's code is worse than a failed command.
+
+    ``item`` may carry a per-item landing override, which outranks the binding;
+    everything else about resolution is unchanged, so an override is still held to
+    the same URL-ownership proof as a bound copy.
     """
     if binding is None:
         binding = (db.get_product_repo(target.product_id) if target.product_id else None) or {}
-    wc_local = str(binding.get("svn_working_copy") or "").strip()
+    _mode, wc_local, source = landing_for(item, binding)
     if not wc_local:
         raise DirectError(
-            f"产品 {target.product_id or '(未绑定)'} 没有配置 SVN 工作副本，"
-            f"svn_direct 模式要求真正的工作目录。配置命令："
-            f"python -m app.cli bind-repo {target.product_id or '<产品ID>'} "
-            f"{target.repo_url or '<SVN仓库地址>'} --code-mode svn_direct "
-            f"--svn-working-copy <SVN工作副本>")
+            f"没有可落码的 SVN 工作副本（本轮模式来源：{LANDING_LABELS.get(source, source)}）。"
+            f"三选一：给这一条点名副本（页面「SVN 副本下达语」按钮，或 "
+            f"python -m app.cli landing <条目号> --wc <路径>）；或把产品绑成 direct：python -m app.cli bind-repo "
+            f"{target.product_id or '<产品ID>'} {target.repo_url or '<SVN仓库地址>'} "
+            f"--code-mode svn_direct --svn-working-copy <SVN工作副本>；"
+            f"或在 .env 配 SVN_DIRECT_WC=<路径> 后由按钮写进本条")
     local = Path(wc_local)
     starts = [local, Path(str(target.working_copy))] if target.working_copy else [local]
     cfg_path, ssh, paths = _find_yaml(
@@ -694,7 +825,7 @@ def describe(target: RepoTarget, item: dict, *, against_repo: bool = False,
     the caller asks for the full sweep with `--full`. The ownership proof still
     happens over a full scan -- in `checkout` and `draft`, once per round.
     """
-    wc = resolve(target)
+    wc = resolve(target, item=item)
     draft = db.get_live_draft_for_item(item["id"], item.get("target") or "bug")
     declared = list((draft or {}).get("files") or [])
     # No declared files and no --full means there is nothing of this item's to

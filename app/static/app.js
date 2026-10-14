@@ -467,6 +467,20 @@
     }
   }
 
+  function sendToClipboard(text, button) {
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(function () {
+        flashCopied(button);
+      }, function () {
+        copyViaTextArea(text);
+        flashCopied(button);
+      });
+    } else {
+      copyViaTextArea(text);
+      flashCopied(button);
+    }
+  }
+
   function copyDiscussionPrompt(button) {
     const bugId = Number(button.dataset.bugId || 0);
     const target = button.dataset.target === "task" ? "task" : "bug";
@@ -479,21 +493,53 @@
           window.alert("这条条目还没有可复制的在线讨论下达语。");
           return;
         }
-        if (navigator.clipboard && window.isSecureContext) {
-          navigator.clipboard.writeText(text).then(function () {
-            flashCopied(button);
-          }, function () {
-            copyViaTextArea(text);
-            flashCopied(button);
-          });
-        } else {
-          copyViaTextArea(text);
-          flashCopied(button);
-        }
+        sendToClipboard(text, button);
       })
       .catch(function (err) {
         window.alert("生成在线讨论下达语失败：" + (err && err.message ? err.message : "未知错误"));
       });
+  }
+
+  // The second 下达 button: it records the *decision* (this item lands in a copy)
+  // and then copies the text. No path is asked for and nothing is confirmed -- the
+  // copy is discovered by the same rule the commands use (a checkout beside the
+  // mirror whose repository root equals the product's bound repo), and the resolved
+  // target is printed inside the text that gets copied.
+  function copyDirectDiscussion(button) {
+    const bugId = Number(button.dataset.bugId || 0);
+    const target = button.dataset.target === "task" ? "task" : "bug";
+    const wc = String(button.dataset.landingWc || "").trim();
+    const slug = button.dataset.slug || ("#" + bugId);
+    if (!bugId) return;
+    if (!wc) {
+      window.alert("本机没定位到该产品仓库的 SVN 检出：镜像同级目录里没有 URL 与产品仓库一致的 .svn。\n"
+        + "二选一：\n"
+        + "  python -m app.cli landing " + slug + " --wc <副本绝对路径>\n"
+        + "  python -m app.cli bind-repo <产品ID> <仓库地址> --code-mode svn_direct --svn-working-copy <路径>");
+      return;
+    }
+    const body = "kind=" + encodeURIComponent(target)
+      + "&mode=" + encodeURIComponent("svn_direct") + "&next=" + encodeURIComponent("/");
+    fetch(`/bug/${bugId}/landing?kind=${encodeURIComponent(target)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body
+    }).then(function () {
+      return fetch(`/api/bug/${bugId}?kind=${target}`);
+    }).then(function (resp) { return resp.json(); }).then(function (data) {
+      if (!data || data.code_mode !== "svn_direct") {
+        window.alert("这一条没能切到副本落码（可能被拒或服务未加载新代码），已中止复制。");
+        return;
+      }
+      const text = String(data.discussion_prompt || "").trim();
+      if (!text) {
+        window.alert("这条条目没有可复制的下达语。");
+        return;
+      }
+      sendToClipboard(text, button);
+    }).catch(function (err) {
+      window.alert("切换落码方式失败：" + (err && err.message ? err.message : "未知错误"));
+    });
   }
 
   document.addEventListener("click", function (event) {
@@ -508,6 +554,12 @@
     if (discuss) {
       event.preventDefault();
       copyDiscussionPrompt(discuss);
+      return;
+    }
+    const direct = event.target.closest("[data-discussion-direct]");
+    if (direct) {
+      event.preventDefault();
+      copyDirectDiscussion(direct);
       return;
     }
     if (event.target.closest("[data-dialog-close]")) {

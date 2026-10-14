@@ -136,6 +136,12 @@ class Settings:
     # "推 SVN" action (AUTO_LOOP.md G11's only exception). Empty means: derive it
     # beside ssh.remote_workspace of that mirror, as <project>/svn_promote.
     svn_promote_root: str = field(default_factory=lambda: _env_str("SVN_PROMOTE_ROOT"))
+    # Owner-side default copy for `svn_direct` rounds (AUTO_LOOP.md §1.9). One value
+    # is enough because the mode is owner-present by definition: whoever sets it is
+    # whoever is holding that copy. It is the LAST resort -- an explicit per-item
+    # choice or a product bound as svn_direct always outranks it, so changing this
+    # can never silently move a bound product onto another copy.
+    svn_direct_wc: str = field(default_factory=lambda: _env_str("SVN_DIRECT_WC"))
 
     # --- i18n direct-commit channel (AUTO_LOOP.md G12) ---
     # Translation files held in a local draft branch always end up in conflicts,
@@ -217,6 +223,7 @@ class Settings:
             "zentao_task_status": self.zentao_task_status or "(不过滤)",
             "svn_repo_url": self.svn_repo_url or "(未配置)",
             "svn_working_copy": str(self.svn_working_copy),
+            "svn_direct_wc": self.svn_direct_wc or "（未配置：按产品绑定或条目覆盖解析）",
             "i18n_direct_commit": "true" if self.i18n_direct_commit else "false",
             "i18n_file_patterns": ", ".join(self.i18n_file_patterns) or "(空)",
             "branch_prefix": self.branch_prefix,

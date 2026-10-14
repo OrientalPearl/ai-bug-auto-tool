@@ -61,6 +61,7 @@
               {% endif %}
               <span>PRI {{ bug.pri }}</span>
               {% if bug.severity %}<span>S{{ bug.severity }}</span>{% endif %}
+              {% if bug.code_mode == 'svn_direct' %}<span class="badge badge-direct">svn_direct</span>{% endif %}
               <span>{{ bug.updated_at }}</span>
             </div>
             <div class="row-actions" style="margin-top:8px">
@@ -68,6 +69,15 @@
                       data-discussion-item="1" data-bug-id="{{ bug.id }}" data-target="{{ bug.target }}">
                 在线讨论下达语
               </button>
+              {% if bug.code_mode != 'svn_direct' %}
+              <button class="btn" type="button"
+                      title="这一条改按 SVN 副本落码；副本自动判定：{{ bug.landing_wc or '本机未定位到该仓库的检出' }}{% if bug.landing_reason %} —— {{ bug.landing_reason }}{% endif %}"
+                      data-discussion-direct="1" data-bug-id="{{ bug.id }}" data-target="{{ bug.target }}"
+                      data-slug="{{ ('T' ~ bug.zentao_id) if bug.target == 'task' else bug.zentao_id }}"
+                      data-landing-wc="{{ bug.landing_wc or '' }}">
+                SVN 副本下达语
+              </button>
+              {% endif %}
             </div>
           </article>
           {% endfor %}

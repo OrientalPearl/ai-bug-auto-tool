@@ -448,6 +448,19 @@ EXTRA_COLUMNS = (
     # The table is new enough that some databases already carry it without this
     # column; `init_db` creates it with the column, `migrate` patches the rest.
     ("svn_drafts", "baseline_files", "TEXT NOT NULL DEFAULT '[]'"),
+    # Per-item landing override for `svn_direct` rounds: the one copy this item may
+    # touch, named by the owner without rebinding the whole product (AUTO_LOOP.md
+    # §1.9). Empty means "follow the product binding and then the .env default".
+    ("bugs", "landing_wc", "TEXT NOT NULL DEFAULT ''"),
+    ("tasks", "landing_wc", "TEXT NOT NULL DEFAULT ''"),
+    # The *decision* and the *path* are separate: `landing_mode` says this item runs
+    # in place, and the path may then be discovered automatically. Auto-discovery
+    # must never be what makes a mirror item direct, or one directory appearing
+    # beside a mirror would silently switch every product's flow.
+    ("bugs", "landing_mode",
+     "TEXT NOT NULL DEFAULT '' CHECK (landing_mode IN ('','git_mirror','svn_direct'))"),
+    ("tasks", "landing_mode",
+     "TEXT NOT NULL DEFAULT '' CHECK (landing_mode IN ('','git_mirror','svn_direct'))"),
 )
 
 
@@ -821,6 +834,56 @@ def update_bug_detail(bug_id: int, fields: dict[str, Any]) -> dict | None:
     return update_item_detail(bug_id, fields, "bug")
 
 
+def set_item_landing(item_id: int, target: str, wc: str = None,
+                     mode: str = None) -> dict | None:
+    """Point one item at a landing mode and/or a specific copy, or clear both.
+
+    ``mode`` is the decision ('' | 'git_mirror' | 'svn_direct'); ``wc`` is only the
+    path and may stay empty, in which case `svn_direct` discovers the copy beside
+    the mirror. Which repository a discovered copy must belong to is decided at
+    execution time against the product's bound repo URL -- so naming no path here
+    can never, on its own, let an item edit another product line's code.
+    """
+    value = str(wc or "").strip() if wc is not None else None
+    if value and not Path(value).is_absolute():
+        raise ValueError(f"落码路径必须是绝对路径（收到 {value or '(空)'}）")
+    want = None if mode is None else db_norm_mode(mode)
+    if mode is not None and str(mode).strip() and want is None:
+        raise ValueError(f"落码模式只接受 git_mirror / svn_direct 或清空（收到 {mode}）")
+    sets: list[str] = []
+    params: list[Any] = []
+    if value is not None:
+        sets.append("landing_wc = ?")
+        params.append(value)
+    if mode is not None:
+        sets.append("landing_mode = ?")
+        params.append(want or "")
+        if not want and value is None:
+            # Clearing the decision clears the path too. Leaving a stale landing_wc
+            # behind would make the next "clear" look like it did nothing -- and a
+            # path must never be what puts an item back into the copy.
+            sets.append("landing_wc = ?")
+            params.append("")
+    if not sets:
+        return get_item(item_id, target)
+    sets.append("updated_at = ?")
+    params.append(now_str())
+    params.append(int(item_id))
+    execute(f"UPDATE {tables_for(target).item} SET {', '.join(sets)} WHERE id = ?", params)
+    return get_item(item_id, target)
+
+
+def db_norm_mode(mode: str) -> str | None:
+    """One of the two landing modes, or None when the value is not a mode."""
+    cleaned = str(mode or "").strip()
+    return cleaned if cleaned in CODE_MODES else None
+
+
+def set_item_landing_mode(item_id: int, target: str, mode: str) -> dict | None:
+    """Just the decision (used by the 副本下达 button, which names no path at all)."""
+    return set_item_landing(item_id, target, mode=mode)
+
+
 def update_item_detail(item_id: int, fields: dict[str, Any],
                        target: str = "bug") -> dict | None:
     """Store the enriched detail payload (steps HTML, notes, attachments)."""
@@ -1114,7 +1177,7 @@ def list_needs(status: str | None = "awaiting",
                    n.owner_reply, n.status, n.created_at, n.replied_at, n.done_at,
                    {need_kind}, '{tab.kind}' AS target,
                    i.zentao_id, i.title, i.pri, {severity},
-                   i.status AS item_status, i.branch
+                   i.status AS item_status, i.branch, i.product_id, i.landing_wc, i.landing_mode
               FROM {tab.need} n JOIN {tab.item} i ON i.id = n.{tab.fk}
               {where}
             """

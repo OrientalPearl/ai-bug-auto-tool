@@ -10,7 +10,7 @@ from typing import Any
 from flask import (Flask, abort, flash, jsonify, redirect, render_template,
                    request, send_from_directory, url_for)
 
-from . import db, svn_client, svn_promote, sync
+from . import db, svn_client, svn_direct, svn_promote, sync
 from .config import PROJECT_ROOT, get_settings, reload_settings
 from .zentao_client import ZentaoError
 from .zentao_session import make_client
@@ -139,7 +139,43 @@ def create_app() -> Flask:
     def api_bug(bug_id: int):
         item = _annotate_one(_item(bug_id))
         item["discussion_prompt"] = _discussion_prompt(item)
+        # The second 下达语 only means something for an item still on the mirror;
+        # a direct one would get byte-identical text and a second button that does
+        # nothing but confuse which one is current.
+        if item["code_mode"] != "svn_direct":
+            item["discussion_prompt_direct"] = _discussion_prompt(item, force_direct=True)
         return jsonify(item)
+
+    @app.route("/bug/<int:bug_id>/landing", methods=["POST"])
+    def bug_landing(bug_id: int):
+        """Decide (or undo) that this one item runs in a copy.
+
+        No path is asked for: which copy is discovered by the same rule the commands
+        use (same repository root as the bound repo, beside the mirror, preferring an
+        unheld one closest to HEAD). Recording the *decision* is still required,
+        because that is what keeps the 下达语 and the routing from disagreeing.
+        """
+        kind = _kind()
+        item = _item(bug_id)
+        form = _form()
+        mode = str(form.get("mode") or "").strip()
+        wc = str(form.get("wc") or "").strip()
+        back = str(form.get("next") or "/")
+        if mode == "clear":
+            mode, wc = "", ""
+        try:
+            updated = db.set_item_landing(bug_id, kind, wc or None, mode=mode)
+        except ValueError as exc:
+            flash(f"落码方式没记下：{exc}", "error")
+            return redirect(back)
+        shown, resolved, source, why = _landing(updated or item)
+        if shown == "svn_direct":
+            flash(f"{_slug(item)} 已按 SVN 副本落码："
+                  + (resolved or "（本机没定位到该仓库的检出，命令会拒绝并要求点名路径）")
+                  + (f" —— {why}" if why else ""), "ok")
+        else:
+            flash(f"{_slug(item)} 已取消，回到 {shown} 流程（产品绑定不变）。", "ok")
+        return redirect(back)
 
     # ------------------------------------------------------------------
     # 2) zentao sync
@@ -253,7 +289,7 @@ def create_app() -> Flask:
         kinds = _kind("all")
         targets = tuple(db.ITEM_KINDS) if kinds == "all" else (kinds,)
         return render_template("need_solution.html",
-                               needs=db.list_needs(status, targets),
+                               needs=_annotate_landing_only(db.list_needs(status, targets)),
                                current=status, kind_filter=kinds)
 
     @app.route("/need/<int:need_id>/reply", methods=["POST"])
@@ -917,8 +953,14 @@ def _rev_text(value: Any) -> str:
     return f"r{text}" if text.isdigit() else text
 
 
-def _discussion_prompt(item: dict[str, Any]) -> str:
-    """A single-item prompt that stays inside AI-BUG, but enters discussion mode."""
+def _discussion_prompt(item: dict[str, Any], *, force_direct: bool = False) -> str:
+    """A single-item prompt that stays inside AI-BUG, but enters discussion mode.
+
+    ``force_direct`` renders the same item as an in-place-copy round -- that is the
+    second 下达 button. Rendering changes nothing by itself: the commands only
+    follow the copy once the override is actually recorded, so the text says so out
+    loud when it is not (see the note appended below).
+    """
     slug = db.item_slug(item.get("zentao_id"), item.get("target") or "bug")
     target_word = "任务" if item.get("target") == "task" else "bug"
     product_id = int(item.get("product_id") or 0)
@@ -932,8 +974,9 @@ def _discussion_prompt(item: dict[str, Any]) -> str:
         files_text += f"（另 {len(files) - 6} 个）"
     status = STATUS_LABELS.get(item.get("status"), item.get("status") or "（未知）")
     repo_url = effective_trunk = effective_wc = i18n_wc = repo_note = "（未解析）"
-    code_mode = "git_mirror"
-    direct_wc = "（未配置）"
+    code_mode, direct_wc, landing_source, landing_why = _landing(item)
+    if force_direct:
+        code_mode, landing_source = "svn_direct", "mode"
     draft_note = "（无在册草稿）"
     draft = None
     try:
@@ -946,39 +989,54 @@ def _discussion_prompt(item: dict[str, Any]) -> str:
         effective_trunk = _prompt_line(target.trunk_url())
         effective_wc = _prompt_line(str(target.working_copy))
         i18n_wc = _prompt_line(str(target.svn_working_copy) if target.svn_working_copy else "（未配置）")
-        code_mode = target.code_mode or "git_mirror"
         repo_note = f"代码库来源={target.source}"
-        if code_mode == "svn_direct":
-            direct_wc = i18n_wc
-            # SQLite only -- resolving the Linux side path would mean an SSH probe on
-            # every dialog open, and `mirror` already does that once per round.
-            draft = db.get_live_draft_for_item(item["id"], item.get("target") or "bug")
-            if draft:
-                draft_note = (f"{draft['status']} · 基线 r{draft['base_rev'] or '未知'} · "
-                              f"登记 {len(draft['files'] or [])} 个文件 · 领用 {draft['claimed_at']}")
+    if code_mode == "svn_direct":
+        # SQLite only -- resolving the Linux side path would mean an SSH probe on
+        # every dialog open, and `mirror` already does that once per round.
+        draft = db.get_live_draft_for_item(item["id"], item.get("target") or "bug")
+        if draft:
+            draft_note = (f"{draft['status']} · 基线 r{draft['base_rev'] or '未知'} · "
+                          f"登记 {len(draft['files'] or [])} 个文件 · 领用 {draft['claimed_at']}")
+        direct_wc = _prompt_line(direct_wc) if direct_wc else (
+            f"（本机没定位到该仓库的检出：把产品绑到副本 "
+            f"`bind-repo <产品ID> <仓库地址> --code-mode svn_direct --svn-working-copy <路径>`，"
+            f"或给这一条点名 `python -m app.cli landing {slug} --wc <路径>`）")
     # Which directory is "the" directory depends on the landing mode, and in direct
     # mode several identical-URL copies exist on this machine -- so the printed paths
     # are a cross-check, and the executor is told to trust `mirror` over them.
     scope_lines = [
         f"代码库 repo_url：{repo_url}",
         f"trunk：{effective_trunk}",
-        f"落码模式 code_mode：{code_mode}",
+        f"落码模式 code_mode：{code_mode}"
+        f"（来源：{svn_direct.LANDING_LABELS.get(landing_source, landing_source)}）",
     ]
     if code_mode == "svn_direct":
         scope_lines += [
             f"SVN 工作副本（Windows 侧读改文件，本机还有多份 URL 相同的副本，只准动这一份）：{direct_wc}",
             f"本条在册草稿：{draft_note}",
         ]
+        if landing_why:
+            scope_lines.append(f"为什么是这一份：{landing_why}")
     else:
         scope_lines += [
             f"落码目录 working_copy（git-svn 镜像）：{effective_wc}",
             f"正式 SVN 工作副本 svn_working_copy（只有 G12 词条通道可写）：{i18n_wc}",
         ]
+    declared_direct = (str(item.get("landing_mode") or "").strip() == "svn_direct"
+                       or bool(str(item.get("landing_wc") or "").strip()))
+    if force_direct and not declared_direct:
+        # The one way this text could mislead: it tells the executor to work in a
+        # copy while the stored routing still says mirror, so the very first command
+        # would come back as a git-mirror checkout. Say it before that happens.
+        scope_lines.append(
+            f"注意：这一条还没登记成「按 SVN 副本落码」，现在跑 checkout / draft 仍会按产品绑定的 "
+            f"git 镜像执行。要真走副本：点页面上的「SVN 副本下达语」（它会先登记这条），或 "
+            f"python -m app.cli landing {slug} --mode svn_direct")
     scope_lines += [
         f"备注：{repo_note}",
         # Same --full rule as below: naming the bare probe here would tell the reader
         # to run the one version that deliberately does not look at the copy.
-        f"上面这些路径只作核对：真值是产品仓库绑定，动手前先 "
+        f"上面这些路径只作核对：真值是本条点名的副本或产品绑定，动手前先 "
         f"`python -m app.cli mirror {slug}{' --full' if code_mode == 'svn_direct' else ''}` 现读一遍，"
         "不一致就以命令报出的为准并 block 说明。",
         f"本系统命令一律在 {PROJECT_ROOT} 下执行（在代码库目录里跑 `python -m app.cli` 会 ModuleNotFoundError，"
@@ -1524,17 +1582,35 @@ def _dispatch_checklist(queues: list[dict[str, Any]]) -> list[dict[str, str]]:
     return items
 
 
+def _landing(item: dict[str, Any]) -> tuple[str, str, str, str]:
+    """``(mode, copy, where-that-came-from, why-auto)`` for one item.
+
+    For an item still on the mirror, ``copy`` is what a direct round *would* land on
+    -- resolved by the same discovery the commands use, so the card shows the real
+    target and the owner never has to type a path.
+    """
+    mode, wc, source = svn_direct.landing_for(item)
+    why = ""
+    if mode != "svn_direct":
+        wc, why = svn_direct.direct_preview(item)
+    elif source == "auto":
+        _w, why = svn_direct.direct_preview(item)
+    return mode, wc, source, why
+
+
 def _mode(item: dict[str, Any]) -> str:
-    """Landing spot of the product this item belongs to (AUTO_LOOP.md §1.9)."""
-    binding = db.get_product_repo(item.get("product_id")) or {}
-    mode = str(binding.get("code_mode") or "git_mirror")
-    return mode if mode in db.CODE_MODES else "git_mirror"
+    """Landing spot for this item: its own decision first, then its product binding."""
+    return svn_direct.landing_for(item)[0]
 
 
 def _annotate_one(item: dict[str, Any]) -> dict[str, Any]:
     """Attach the landing mode and, for direct items, the live SVN draft."""
-    mode = _mode(item)
+    mode, wc, source, why = _landing(item)
     item["code_mode"] = mode
+    item["landing_wc"] = wc
+    item["landing_source"] = source
+    item["landing_source_label"] = svn_direct.LANDING_LABELS.get(source, source)
+    item["landing_reason"] = why
     item["direct"] = (db.get_live_draft_for_item(item["id"], item.get("target") or "bug")
                       if mode == "svn_direct" else None)
     return item
@@ -1547,6 +1623,26 @@ def _annotate(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     renders, because a whole-copy `svn status` costs about a minute here.
     """
     return [_annotate_one(item) for item in items]
+
+
+def _annotate_landing_only(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Landing mode + copy for rows that are not items themselves (the 需方案 list).
+
+    Those rows carry their own ``id`` (the need's) plus an ``item_id``, so pushing
+    them through `_annotate_one` would look up a live draft under the wrong key.
+    All a card needs is which copy its 下达语 should name.
+    """
+    for row in rows:
+        stub = {"product_id": row.get("product_id"),
+                "landing_wc": row.get("landing_wc"),
+                "landing_mode": row.get("landing_mode")}
+        mode, wc, source, why = _landing(stub)
+        row["code_mode"] = mode
+        row["landing_wc"] = wc
+        row["landing_source"] = source
+        row["landing_source_label"] = svn_direct.LANDING_LABELS.get(source, source)
+        row["landing_reason"] = why
+    return rows
 
 
 def _direct_refusal(item: dict[str, Any], action: str) -> str:
