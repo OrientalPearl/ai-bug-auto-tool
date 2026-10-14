@@ -34,6 +34,31 @@ from . import db, svn_client, sync
 from .config import PROJECT_ROOT, get_settings
 
 
+def _code_mode(item: dict) -> str:
+    """Which landing spot this item's product uses: the mirror or a direct SVN copy.
+
+    Read straight from the binding so an item can never be routed into the other
+    mode's commands by an unrelated SVN error.
+    """
+    binding = db.get_product_repo(item.get("product_id")) or {}
+    return str(binding.get("code_mode") or "git_mirror")
+
+
+def _direct_unsupported(item: dict, action: str) -> dict[str, Any] | None:
+    """Refuse a git-mirror-only command for a direct-mode item, naming the way through."""
+    if _code_mode(item) != "svn_direct":
+        return None
+    equivalents = {
+        # Nothing to re-cut: there is no branch, and a newer trunk arrives with
+        # `svn update` on the declared files instead of a merge commit.
+        "recut": "svn_direct 模式下没有分支可重切：先 python -m app.cli checkout <条目号> "
+                 "--files <文件> 把那几个文件 update 到最新，再在原处接着改",
+    }
+    return {"ok": False, "action": action,
+            "error": f"该产品是 svn_direct 落码模式（直接改 SVN 工作副本），{action} 属于 git 镜像流程。"
+                     + equivalents.get(action, "")}
+
+
 def _utf8_streams() -> None:
     """Never let the console codepage kill an unattended run.
 
@@ -416,6 +441,7 @@ def cmd_commit(args: argparse.Namespace) -> None:
     _plan_gate_or_die(bug, "commit")
     payload = _normalized_analysis(args)
     _require_analysis_or_die(bug, payload)
+    mode = _code_mode(bug)
     target = svn_client.resolve_target(bug=bug)
     branch = bug.get("branch") or db.draft_branch(bug["zentao_id"], bug["target"],
                                                   target.branch_prefix)
@@ -425,7 +451,22 @@ def cmd_commit(args: argparse.Namespace) -> None:
 
     revision = args.revision
     svn_note = ""
-    if not revision and not args.no_svn:
+    if mode == "svn_direct":
+        # No auto-commit here: in direct mode the repository only ever moves when
+        # the owner says so (`push --owner-approved`), never as a side effect of
+        # registering that the work is done.
+        if not revision:
+            raise SystemExit(json.dumps({
+                "ok": False, "action": "commit", "code_mode": "svn_direct",
+                "error": "svn_direct 模式必须显式给出 --revision："
+                         "改动还留在副本里没提交就写 local@r<基线>（先 draft 拿号），"
+                         "你已经自己 svn ci 过就写 r<真实号>。本系统不会代你提交。",
+                "hint": "python -m app.cli draft <条目号> --files ... 之后 "
+                        "commit <条目号> --no-svn --revision local@r<基线> --analysis-file a.json",
+            }, ensure_ascii=False))
+        branch = branch if branch.startswith("svn-direct@") else f"svn-direct@r{revision.lstrip('r')}"
+        svn_note = "svn_direct：只登记改动与分析，版本库未做任何写入（G11）"
+    elif not revision and not args.no_svn:
         if not target.repo_url:
             raise SystemExit(json.dumps({
                 "ok": False,
@@ -450,6 +491,16 @@ def cmd_commit(args: argparse.Namespace) -> None:
         fields["files_changed"] = files
     db.set_item_status(bug["id"], "await_review", target=bug["target"], **fields)
 
+    # A real `r<号>` means the copy is no longer holding anything of this item's:
+    # free the working claim so the next item can be opened in direct mode.
+    landed = None
+    if mode == "svn_direct" and re.fullmatch(r"r?\d+", str(revision or "")):
+        from . import svn_direct
+
+        landed = svn_direct.mark_landed(bug, str(revision))
+        if landed:
+            svn_note = (svn_note + f"；草稿已登记为已入库 r{landed}，工作副本已释放").strip("；")
+
     # The written analysis travels with the commit so the review page has something to read.
     analysis_id = None
     if payload is not None:
@@ -471,8 +522,10 @@ def cmd_commit(args: argparse.Namespace) -> None:
         "branch": branch,
         "repo": target.repo_url or "(未配置)",
         "repo_source": target.source,
+        "code_mode": mode,
         "working_copy": str(target.working_copy),
         "note": svn_note,
+        "landed_release": landed,
         "status": "await_review",
         "analysis_id": analysis_id,
         "analysis_fields": sorted(k for k in (payload or {}) if not k.startswith("_")),
@@ -482,8 +535,23 @@ def cmd_commit(args: argparse.Namespace) -> None:
 
 
 def _i18n_target(args: argparse.Namespace) -> tuple[dict, Any]:
-    """Shared front part of the i18n commands: bug -> repo -> real SVN checkout."""
+    """Shared front part of the i18n commands: bug -> repo -> real SVN checkout.
+
+    A product that edits code in a real SVN copy (AUTO_LOOP.md §1.9) has no fast
+    lane: its entries travel with the code and go through the owner's own
+    verification, and the translation rules are the code line's business.
+    """
     bug = _bug_ref(args.ref)
+    if _code_mode(bug) == "svn_direct":
+        raise SystemExit(json.dumps({
+            "ok": False, "action": "i18n", "zentao_id": bug["zentao_id"],
+            "kind": bug["target"], "code_mode": "svn_direct",
+            "error": "该产品的词条不走本系统的 i18n 直连通道：svn_direct 模式下代码就改在这份 SVN 副本里，"
+                     "词条按目标代码库自己的 i18n skill 约定处理，并与代码一起 draft 登记、由主人提交",
+            "hint": "python -m app.cli draft "
+                    f"{db.item_slug(bug['zentao_id'], bug['target'])} "
+                    "--message \"...\" --files <词条文件>",
+        }, ensure_ascii=False))
     target = svn_client.require_target(bug=bug)
     return bug, target
 
@@ -642,6 +710,8 @@ def cmd_report(_args: argparse.Namespace) -> None:
     counts = db.counts_by_status()
     queue = db.fetch_task_queue(limit=1000)
     sweepable, unregistered = _handoff_leftovers()
+    live_drafts = db.list_live_drafts()
+    stale_ids = {d["id"] for d in db.stale_live_drafts(get_settings().stale_claim_minutes)}
     def _ids(sql: str) -> list[str]:
         found = []
         for target in db.ITEM_KINDS:
@@ -670,6 +740,12 @@ def cmd_report(_args: argparse.Namespace) -> None:
         # delete action (that is an approval prompt) to get rid of them.
         "handoff_leftovers": [i["file"] for i in sweepable],
         "handoff_held_unregistered": [i["file"] for i in unregistered],
+        # Direct mode has no branch to park work on: a held working copy is the
+        # thing that blocks the next item, so it belongs in the same summary.
+        "svn_direct_held": [
+            {"item": db.item_slug(d["zentao_id"], d["target"]), "wc": d["wc_path"],
+             "status": d["status"], "files": len(d["files"]),
+             "stale": d["id"] in stale_ids} for d in live_drafts],
     })
 
 
@@ -703,6 +779,12 @@ def cmd_repos(_args: argparse.Namespace) -> None:
             "effective_source": target.source,
             "working_copy": str(target.working_copy),
             "svn_working_copy": str(target.svn_working_copy or ""),
+            "code_mode": target.code_mode,
+            # Where the executor actually writes code: the mirror, or the copy.
+            "landing_spot": (str(target.svn_working_copy or "(未配置)")
+                             if target.code_mode == "svn_direct"
+                             else str(target.working_copy)),
+            "svn_remote_copy": str((repo or {}).get("svn_remote_copy") or ""),
             "trunk": target.trunk_url(),
             "branch_root": target.branch_root_url(),
             "build_command": (repo or {}).get("build_command", ""),
@@ -725,7 +807,14 @@ def cmd_bind_repo(args: argparse.Namespace) -> None:
     current = db.get_product_repo(args.product_id) or {}
     # column -> parser dest; an omitted flag keeps the stored value instead of blanking it.
     fields_arg = (("trunk_path", "trunk_path"), ("branch_root", "branch_root"),
-                  ("working_copy", "working_copy"), ("branch_prefix", "branch_prefix"),
+                  ("working_copy", "working_copy"),
+                  # The flag existed before it was ever wired up: without this
+                  # entry `--svn-working-copy` parsed, printed, and was dropped,
+                  # so the i18n channel and svn_direct could only be configured
+                  # through the web page.
+                  ("svn_working_copy", "svn_working_copy"),
+                  ("code_mode", "code_mode"), ("svn_remote_copy", "svn_remote_copy"),
+                  ("branch_prefix", "branch_prefix"),
                   ("build_command", "build"), ("test_command", "test"),
                   ("note", "note"), ("product_name", "name"))
 
@@ -762,9 +851,17 @@ def cmd_bind_repo(args: argparse.Namespace) -> None:
             kept.append(column)
         payload[column] = value
 
-    repo = db.bind_product_repo(args.product_id, payload)
+    try:
+        repo = db.bind_product_repo(args.product_id, payload)
+    except ValueError as exc:
+        raise SystemExit(json.dumps(
+            {"ok": False, "action": "bind-repo", "error": str(exc)}, ensure_ascii=False))
     _out({"ok": True, "action": "bind-repo", "repo": repo,
           "kept_columns": kept,
+          "code_mode": repo.get("code_mode") or "git_mirror",
+          "landing_spot": (str(repo.get("svn_working_copy") or "")
+                           if (repo.get("code_mode") or "git_mirror") == "svn_direct"
+                           else str(repo.get("working_copy") or "")),
           "trunk": svn_client.resolve_target(product_id=args.product_id).trunk_url()})
 
 
@@ -793,15 +890,31 @@ def cmd_detail(args: argparse.Namespace) -> None:
 
 
 def cmd_mirror(args: argparse.Namespace) -> None:
-    """Read-only look at one item's draft branch inside the mirror.
+    """Read-only look at one item's draft (mirror branch, or direct SVN copy).
 
-    The executor is meant to ask the mirror questions through this command rather
-    than typing ``ssh ... git ...`` itself: one allow-listed entry point keeps an
-    unattended run out of the IDE's approval prompts.
+    The executor is meant to ask the landing spot questions through this command
+    rather than typing ``ssh ... git ...`` or ``ssh ... svn ...`` itself: one
+    allow-listed entry point keeps an unattended run out of the IDE's approval
+    prompts.
     """
+    bug = _bug_ref(args.ref)
+    if _code_mode(bug) == "svn_direct":
+        from . import svn_direct
+
+        target = svn_client.resolve_target(bug=bug)
+        try:
+            report = svn_direct.describe(target, bug, against_repo=bool(args.repo),
+                                         full=bool(args.full))
+        except svn_direct.DirectError as exc:
+            _out({"ok": False, "action": "mirror", "code_mode": "svn_direct",
+                  "zentao_id": bug["zentao_id"], "kind": bug["target"], "error": str(exc)})
+            return
+        _out({"ok": not report.get("error"), "action": "mirror", "zentao_id": bug["zentao_id"],
+              "kind": bug["target"], "status": bug["status"], **report})
+        return
+
     from . import svn_promote
 
-    bug = _bug_ref(args.ref)
     state = svn_promote.draft_state(bug, base_ref=args.base or "")
     _out({
         "ok": not state.error, "action": "mirror", "zentao_id": bug["zentao_id"],
@@ -825,16 +938,55 @@ def cmd_mirror(args: argparse.Namespace) -> None:
 
 
 def cmd_checkout(args: argparse.Namespace) -> None:
-    """Put the mirror onto this item's draft branch (create it from trunk if new).
+    """Open this item's landing spot: a draft branch in the mirror, or the SVN copy.
 
-    The mirror's readiness gates (trunk ref present, index checked out) are
-    checked by the same call, so the executor gets one command instead of three
-    raw ``ssh`` probes it would otherwise have to be approved for.
+    The readiness gates are checked by the same call, so the executor gets one
+    command instead of several raw ``ssh`` probes it would otherwise have to be
+    approved for.
     """
-    from . import svn_promote
-
     bug = _bug_ref(args.ref)
     _plan_gate_or_die(bug, "checkout")
+    if _code_mode(bug) == "svn_direct":
+        from . import svn_direct
+
+        files = [f.strip() for f in str(getattr(args, "files", "") or "").split(",")
+                 if f.strip()]
+        target = svn_client.resolve_target(bug=bug)
+        try:
+            wc = svn_direct.resolve(target)
+            result = svn_direct.open_draft(wc, bug, files, note=getattr(args, "note", "") or "")
+        except (svn_direct.DirectError, svn_client.SvnError, ValueError) as exc:
+            _out({"ok": False, "action": "checkout", "code_mode": "svn_direct",
+                  "zentao_id": bug["zentao_id"], "kind": bug["target"],
+                  "error": str(exc), "status": bug["status"]})
+            return
+        branch = f"svn-direct@r{result['base_rev']}"
+        db.set_item_status(bug["id"], "fixing", target=bug["target"], branch=branch)
+        slug = db.item_slug(bug["zentao_id"], bug["target"])
+        _out({
+            "ok": True, "action": "checkout", "code_mode": "svn_direct",
+            "zentao_id": bug["zentao_id"], "kind": bug["target"],
+            "branch": branch, "mode": "svn_direct_claim",
+            "base": result["base_rev"], "draft_id": result["draft_id"],
+            "wc_local": wc.local_path, "wc_remote": wc.remote_path, "url": wc.url,
+            "declared": files, "baseline_count": result["baseline"],
+            "declared_already_dirty": result["declared_already_dirty"],
+            "updated": result["updated"], "status": "fixing",
+            "summary": (f"已领取 {wc.local_path}（r{result['base_rev']}），"
+                        f"点名 {len(files)} 个文件；领之前该副本已有 "
+                        f"{result['baseline']} 处别人的改动，已按基线排除"),
+            "note": ("改动就直接落在这份 SVN 工作副本里；改完 draft 登记，"
+                     "验证由主人自己做，本系统不代提交"
+                     if not result["declared_already_dirty"] else
+                     "注意：点名的文件里有领副本之前就已是改动状态的，draft 会标 contaminated"),
+            "next": f"python -m app.cli draft {slug} --message "
+                    f"\"{_subject_prefix(bug)} #{bug['zentao_id']} <一句话>\" "
+                    f"--files {','.join(files) or '<改动文件>'}",
+        })
+        return
+
+    from . import svn_promote
+
     result = svn_promote.checkout_draft(bug, base=args.base or "", carry=args.carry or "")
     if result.ok:
         db.set_item_status(bug["id"], "fixing", target=bug["target"], branch=result.branch)
@@ -916,6 +1068,36 @@ def cmd_draft(args: argparse.Namespace) -> None:
         raise SystemExit(json.dumps(
             {"ok": False, "error": "--files 必填：逗号分隔的改动文件（镜像内相对路径），"
                                    "本命令不做整仓 add"}, ensure_ascii=False))
+    if _code_mode(bug) == "svn_direct":
+        from . import svn_direct
+
+        target = svn_client.resolve_target(bug=bug)
+        try:
+            wc = svn_direct.resolve(target)
+            result = svn_direct.record(wc, bug, files, message=message)
+        except (svn_direct.DirectError, svn_client.SvnError, ValueError) as exc:
+            _out({"ok": False, "action": "draft", "code_mode": "svn_direct",
+                  "zentao_id": bug["zentao_id"], "kind": bug["target"], "error": str(exc)})
+            return
+        slug = db.item_slug(bug["zentao_id"], bug["target"])
+        _out({
+            "ok": True, "action": "draft", "code_mode": "svn_direct",
+            "zentao_id": bug["zentao_id"], "kind": bug["target"],
+            "branch": f"svn-direct@r{result['base_rev']}",
+            "draft_id": result["draft_id"], "files": result["files"],
+            "summary": result["summary"], "added_files": result["added_files"],
+            "behind": result["behind"], "contaminated": result["contaminated"],
+            "ambiguous": result["ambiguous"], "baseline_count": result["baseline_count"],
+            "warning": result.get("warning", ""),
+            "revision": f"local@r{result['base_rev']}",
+            "note": "SVN 没有本地提交：这一步登记的是副本里的未提交改动与 diff 摘要，"
+                    "版本库里什么都还没发生",
+            "next": (f"python -m app.cli commit {slug} --message \"<一句话根因>\" "
+                     f"--files {','.join(result['files'])} --no-svn "
+                     f"--revision local@r{result['base_rev']} --analysis-file a.json"),
+        })
+        return
+
     try:
         result = svn_promote.draft_commit(bug, message, files)
     except svn_promote.PromoteError as exc:
@@ -949,6 +1131,10 @@ def cmd_recut(args: argparse.Namespace) -> None:
 
     bug = _bug_ref(args.ref)
     _plan_gate_or_die(bug, "recut")
+    blocked = _direct_unsupported(bug, "recut")
+    if blocked:
+        _out({**blocked, "zentao_id": bug["zentao_id"], "kind": bug["target"]})
+        return
     message = str(args.message or "").strip()
     if not args.dry_run:
         want = f"{_subject_prefix(bug)} #{bug['zentao_id']}"
@@ -985,6 +1171,187 @@ def cmd_recut(args: argparse.Namespace) -> None:
     })
 
 
+def cmd_push(args: argparse.Namespace) -> None:
+    """Commit one item's declared files with `svn ci` -- direct mode, on request.
+
+    The owner does this by hand in the normal case; this command exists for the
+    case where they ask the AI to do it, which is why `--owner-approved` is not
+    optional (AUTO_LOOP.md §1.9). Nothing here runs for a git-mirror product: that
+    flow promotes through the review page instead.
+    """
+    from . import svn_direct
+
+    bug = _bug_ref(args.ref)
+    if _code_mode(bug) != "svn_direct":
+        _out({"ok": False, "action": "push", "zentao_id": bug["zentao_id"],
+              "kind": bug["target"],
+              "error": "push 只服务 svn_direct 落码模式；"
+                       "git 镜像流程的入库走审查页「正式推入 SVN」（app/svn_promote.py）"})
+        return
+    _plan_gate_or_die(bug, "push")
+    draft = db.get_live_draft_for_item(bug["id"], bug["target"])
+    files = [f.strip() for f in str(args.files or "").split(",") if f.strip()]
+    if not files:
+        files = list((draft or {}).get("files") or [])
+    if not files:
+        _out({"ok": False, "action": "push", "error":
+              "没有提交清单：先 checkout + draft 登记改动文件，再来 push"})
+        return
+    message = (f"{_subject_prefix(bug)} #{bug['zentao_id']} "
+               f"{args.message or bug['title']}").strip()
+    target = svn_client.resolve_target(bug=bug)
+    try:
+        wc = svn_direct.resolve(target)
+        result = svn_direct.push(wc, bug, files, message,
+                                 owner_approved=bool(args.owner_approved),
+                                 dry_run=bool(args.dry_run),
+                                 trunk_url=target.trunk_url(),
+                                 allow_dirty_base=bool(args.allow_dirty_base))
+    except (svn_direct.DirectError, svn_client.SvnError, ValueError) as exc:
+        _out({"ok": False, "action": "push", "code_mode": "svn_direct",
+              "zentao_id": bug["zentao_id"], "kind": bug["target"],
+              "committed": False, "error": str(exc)})
+        return
+    revision = result.get("revision") or ""
+    recorded = None
+    comment = {"ok": False, "detail": "dry-run 未登记"}
+    if revision and not args.dry_run:
+        branch = f"svn-direct@{revision}"
+        recorded = db.add_revision(bug["id"], revision, branch=branch, message=message,
+                                   author=args.author or get_settings().svn_username or "owner",
+                                   files=files, target=bug["target"])
+        db.set_item_status(bug["id"], "merged", target=bug["target"],
+                           branch=branch, files_changed=files)
+        comment = sync.comment_commit(bug["zentao_id"], branch, revision,
+                                      extra=args.extra or "改动已由 svn_direct 通道提交入库",
+                                      target=bug["target"])
+    _out({
+        "ok": True, "action": "push", "code_mode": "svn_direct",
+        "zentao_id": bug["zentao_id"], "kind": bug["target"],
+        "dry_run": result["dry_run"], "revision": revision,
+        "files": result["files"], "precheck": result["precheck"],
+        "contaminated": result.get("contaminated") or [],
+        "committed": bool(revision and not args.dry_run),
+        "revision_record": recorded, "status": "merged" if revision and not args.dry_run
+                              else bug["status"],
+        "note": result.get("note") or "已提交并登记真实 r 号；工作副本已释放",
+        "zentao_comment": comment,
+    })
+
+
+def cmd_revert_draft(args: argparse.Namespace) -> None:
+    """Throw away one item's uncommitted changes in the SVN copy (owner action)."""
+    from . import svn_direct
+
+    bug = _bug_ref(args.ref)
+    if _code_mode(bug) != "svn_direct":
+        _out({"ok": False, "action": "revert", "zentao_id": bug["zentao_id"],
+              "kind": bug["target"],
+              "error": "revert 只服务 svn_direct 落码模式；git 镜像流程的丢弃走审查页「拒绝并回滚」"})
+        return
+    if not args.confirm:
+        _out({"ok": False, "action": "revert", "zentao_id": bug["zentao_id"],
+              "kind": bug["target"],
+              "error": "svn revert 会丢掉这份副本里的改动，不可恢复。"
+                       "确认要做就再加 --confirm（这是主人动作，执行器不该自行加）"})
+        return
+    target = svn_client.resolve_target(bug=bug)
+    try:
+        wc = svn_direct.resolve(target)
+        result = svn_direct.revert(wc, bug)
+    except (svn_direct.DirectError, svn_client.SvnError, ValueError) as exc:
+        _out({"ok": False, "action": "revert", "error": str(exc)})
+        return
+    if result["status"] == "reverted":
+        db.set_item_status(bug["id"], "closed", target=bug["target"])
+    _out({
+        "ok": result["status"] == "reverted", "action": "revert",
+        "code_mode": "svn_direct", "zentao_id": bug["zentao_id"], "kind": bug["target"],
+        **result,
+        "status": bug["status"] if result["status"] != "reverted" else "closed",
+        "note": result.get("note") or ("改动已回滚，工作副本已释放"
+                                       if result["status"] == "reverted"
+                                       else "仍有残留改动，草稿保持在册"),
+    })
+
+
+def cmd_drafts(args: argparse.Namespace) -> None:
+    """List held SVN working copies, and release a claim left behind by a dead run."""
+    from . import svn_direct
+
+    if args.release:
+        bug = _bug_ref(args.release)
+        draft = db.get_live_draft_for_item(bug["id"], bug["target"])
+        if draft is None:
+            _out({"ok": False, "action": "drafts",
+                  "error": f"{db.item_slug(bug['zentao_id'], bug['target'])} 没有在册的 SVN 草稿"})
+            return
+        target = svn_client.resolve_target(bug=bug)
+        try:
+            wc = svn_direct.resolve(target)
+            left = svn_direct.status(wc, paths=draft.get("files") or [])
+        except (svn_direct.DirectError, svn_client.SvnError) as exc:
+            _out({"ok": False, "action": "drafts", "error": str(exc)})
+            return
+        dirty = [p for p in left.real if p in set(draft.get("files") or [])] if left.state == "ok" else []
+        if dirty and left.state == "ok":
+            _out({"ok": False, "action": "drafts", "draft_id": draft["id"],
+                  "dirty": dirty,
+                  "error": "这些文件的改动还在副本里，先决定它们去哪儿（提交或 revert），"
+                           "不能只把登记抹掉：那会让改动失去归属"})
+            return
+        db.close_svn_draft(draft["id"], "reverted",
+                           note="人工释放占用（状态读不出时按未知处理，不默认干净）"
+                           if left.state != "ok" else "人工释放占用：副本已无本条改动")
+        _out({"ok": True, "action": "drafts", "released": draft["id"],
+              "state": left.state, "note": "该工作副本现在可以被下一条条目领取"})
+        return
+
+    live = db.list_live_drafts()
+    stale = db.stale_live_drafts(get_settings().stale_claim_minutes)
+    _out({
+        "ok": True, "action": "drafts",
+        "count": len(live),
+        "stale_minutes": get_settings().stale_claim_minutes,
+        "drafts": [{"id": d["id"], "item": db.item_slug(d["zentao_id"], d["target"]),
+                    "status": d["status"], "wc": d["wc_path"], "base_rev": d["base_rev"],
+                    "files": d["files"], "baseline_count": len(d["baseline_files"]),
+                    "claimed_at": d["claimed_at"],
+                    "stale": any(s["id"] == d["id"] for s in stale)} for d in live],
+        "note": ("一份 SVN 工作副本同一时刻只允许一条未提交改动；"
+                 "release 只抹登记，前提是副本里已经没有那条的改动"),
+    })
+
+
+def _direct_held(zentao_id: int | None = None,
+                 kinds: tuple[str, ...] = db.ITEM_KINDS) -> list[dict]:
+    """Live SVN drafts whose item has nothing registered yet -- direct-mode `reconcile`.
+
+    SVN keeps no branch and no local commit, so an online session that ends before
+    `draft`/`commit` leaves its changes in the copy with no trace here. Starting
+    from the claim table keeps this cheap: it never walks the item tables and
+    never touches a working copy.
+    """
+    rows = []
+    for draft in db.list_live_drafts():
+        if zentao_id and int(draft.get("zentao_id") or 0) != int(zentao_id):
+            continue
+        if draft["target"] not in kinds:
+            continue
+        item = db.get_item(draft["item_id"], draft["target"]) or {}
+        registered = [str(r.get("revision") or "") for r in (item.get("revisions") or [])]
+        landed = [r for r in registered if re.fullmatch(r"r?\d+", r)]
+        local = [r for r in registered if r.startswith("local@")]
+        if landed or local:
+            continue
+        rows.append({"item": db.item_slug(draft["zentao_id"], draft["target"]),
+                     "draft_id": draft["id"], "status": draft["status"],
+                     "wc": draft["wc_path"], "base_rev": draft["base_rev"],
+                     "files": draft["files"], "claimed_at": draft["claimed_at"],
+                     "why": "副本里有在册草稿，库里没有 local@/r 登记（没收口，或改动其实没做）"})
+    return rows
+
+
 def cmd_reconcile(args: argparse.Namespace) -> None:
     """Compare the database with the draft branches that exist on the mirrors."""
     zentao_id = None
@@ -993,6 +1360,7 @@ def cmd_reconcile(args: argparse.Namespace) -> None:
         target, zentao_id = db.parse_ref(args.ref)
         kinds = (target,)
     result = sync.reconcile_drafts(apply=args.apply, zentao_id=zentao_id, targets=kinds)
+    result["svn_direct_held"] = _direct_held(zentao_id=zentao_id, kinds=kinds)
     _out({"ok": True, "action": "reconcile", **result})
 
 
@@ -1181,18 +1549,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_tmp_clean)
 
     p = sub.add_parser("mirror",
-                       help="只读探测某条目的草稿分支（tip / 领先几笔 / 改了哪些文件）；"
-                            "看镜像一律走这条，不要自己拼 ssh + git 命令")
+                       help="只读探测某条目在落码位置的草稿（git 镜像：分支 tip / 领先几笔 / 改了哪些文件；"
+                            "svn_direct：副本 URL、基线 r 号、本条在册改动与 diff 摘要、副本被谁占用）；"
+                            "看落码位置一律走这条，不要自己拼 ssh + git/svn 命令")
     p.add_argument("ref")
-    p.add_argument("--base", default="", help="增量基准，默认取上一轮推入的草稿提交")
+    p.add_argument("--base", default="", help="增量基准，默认取上一轮推入的草稿提交（git 镜像模式）")
+    p.add_argument("--repo", action="store_true",
+                   help="svn_direct：顺带问仓库这些文件有没有新版本（会标 stale）")
+    p.add_argument("--full", action="store_true",
+                   help="svn_direct：扫整份副本而不只是本条登记的文件（慢，实测本库约 1 分钟）")
     p.set_defaults(func=cmd_mirror)
 
     p = sub.add_parser("checkout",
-                       help="把镜像切到这条目的草稿分支（没有就从 origin/trunk 建）；"
-                            "顺带做镜像就绪判定，执行器不用自己拼 ssh + git checkout。"
+                       help="把落码位置开到这条条目上：git 镜像建/切草稿分支，"
+                            "svn_direct 领取 SVN 工作副本并记下改动基线。"
                             "任务若没有已确认的方案，本命令直接拒绝（G13）")
     p.add_argument("ref")
     p.add_argument("--base", default="", help="建分支的基线，默认 refs/remotes/origin/trunk")
+    p.add_argument("--files", default="",
+                   help="svn_direct：本条要动的文件（逗号分隔，副本内相对路径）。"
+                        "只 update 这些文件，并把此刻已存在的他人改动记为归属基线")
+    p.add_argument("--note", default="", help="svn_direct：领取原因，写进草稿记录备查")
     p.add_argument("--carry", default="",
                    help="逗号分隔的路径：工作区上这几处未提交改动归本条所有，切分支前先备份、"
                         "切完逐文件 sha1 校验放回；点名集合必须与工作区真实脏文件完全相等，"
@@ -1200,14 +1577,44 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_checkout)
 
     p = sub.add_parser("draft",
-                       help="在镜像的 bugfix 分支上落草稿提交（只 add --files 列出的文件）；"
-                            "执行器不要自己拼 ssh + git commit，那会卡在授权弹窗上")
+                       help="落一次改动：git 镜像只 add --files 列出的文件并提交；"
+                            "svn_direct 不提交任何东西，只证明并登记副本里的未提交改动"
+                            "（存在性、真实改动、归属、落后 trunk、大小写歧义）")
     p.add_argument("ref")
     p.add_argument("--message", required=True,
                    help="提交说明，缺陷以 fix #<禅道ID> 开头、任务以 feat #<禅道ID> 开头（G8）")
     p.add_argument("--files", required=True,
-                   help="逗号分隔的改动文件（镜像内相对路径）；不做整仓 add")
+                   help="逗号分隔的改动文件（落码目录内相对路径）；不做整仓 add")
     p.set_defaults(func=cmd_draft)
+
+    p = sub.add_parser("push",
+                       help="svn_direct 专用：把本条登记的改动 svn ci 进版本库。"
+                            "默认拒绝，必须主人当面要求并带 --owner-approved（G11 的 direct 例外）")
+    p.add_argument("ref")
+    p.add_argument("--message", default="", help="提交说明前缀自动补 fix #<ID> / feat #<ID>（G8）")
+    p.add_argument("--files", default="", help="提交清单，默认取 draft 登记过的那一份")
+    p.add_argument("--dry-run", action="store_true", help="只跑预检，不执行 svn ci")
+    p.add_argument("--owner-approved", action="store_true",
+                   help="声明这是主人当面要求的代提交；不带就拒绝执行")
+    p.add_argument("--allow-dirty-base", action="store_true",
+                   help="明知文件在领副本之前就是脏的，仍要把那些改动一起带走")
+    p.add_argument("--author", default="", help="提交作者，默认取 SVN_USERNAME")
+    p.add_argument("--extra", default="", help="附加到禅道评论的一句话")
+    p.set_defaults(func=cmd_push)
+
+    p = sub.add_parser("revert",
+                       help="svn_direct 专用：丢掉本条在 SVN 副本里的未提交改动（只碰登记过的文件）")
+    p.add_argument("ref")
+    p.add_argument("--confirm", action="store_true",
+                   help="确认不可恢复的丢弃动作；这是主人动作，执行器不该自己加")
+    p.set_defaults(func=cmd_revert_draft)
+
+    p = sub.add_parser("drafts",
+                       help="列出当前被占用的 SVN 工作副本（svn_direct 的串行单位），"
+                            "并释放上一次跑批留下的失联占用")
+    p.add_argument("--release", default="", metavar="条目号",
+                   help="释放某条目的占用；副本里还有它的改动时拒绝，逼你先决定改动去向")
+    p.set_defaults(func=cmd_drafts)
 
     p = sub.add_parser("recut",
                        help="把更新的 trunk 提交合进本条草稿分支，让护栏的基准变成 trunk"
@@ -1360,8 +1767,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="执行器改码目录（git-svn 镜像）；留空则沿用已存值，"
                         "新绑定自动用 svn_workspace/p<产品ID>-<仓库哈希>")
     p.add_argument("--svn-working-copy", default=None,
-                   help="正式 SVN 工作副本（你日常开发那一份），多语言直连通道专用；"
-                        "留空则沿用已存值")
+                   help="正式 SVN 工作副本（你日常开发那一份）：git 镜像方式下是多语言直连通道专用，"
+                        "svn_direct 方式下就是改码目录；留空则沿用已存值")
+    p.add_argument("--code-mode", default=None, choices=list(db.CODE_MODES),
+                   help="落码模式：git_mirror=改 git-svn 镜像里的草稿分支（默认）；"
+                        "svn_direct=直接在 SVN 工作副本里改（在线协作，本系统不代提交）")
+    p.add_argument("--svn-remote-copy", default=None,
+                   help="svn_direct 那份副本在编译服务器上的路径；"
+                        "留空则由该库 CLAUDE.local.yaml 的 path_aliases 换算，换不出就拒绝")
     p.add_argument("--branch-prefix", default=None, help="留空则沿用已存值")
     p.add_argument("--build", default=None, help="该库的编译命令，供 AI 修复后执行")
     p.add_argument("--test", default=None, help="该库的测试命令，供 AI 修复后执行")

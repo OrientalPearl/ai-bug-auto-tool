@@ -47,8 +47,10 @@ class RepoTarget:
     branch_prefix: str
     source: str = "global"          # "global" | "product"
     # The human's real SVN checkout of this product (not the git mirror).
-    # Only the i18n channel is allowed to write there.
+    # In `git_mirror` mode only the i18n channel may write there; in
+    # `svn_direct` mode (AUTO_LOOP.md §1.9) it is where code is edited at all.
     svn_working_copy: Path | None = None
+    code_mode: str = "git_mirror"   # "git_mirror" | "svn_direct"
 
     def trunk_url(self) -> str:
         return f"{self.repo_url.rstrip('/')}{('/' + self.trunk_path.strip('/')) if self.trunk_path.strip('/') else ''}"
@@ -175,6 +177,7 @@ def resolve_target(bug: dict | None = None, product_id: int | None = None) -> Re
             branch_prefix=str(binding.get("branch_prefix") or "") or settings.branch_prefix,
             source="product",
             svn_working_copy=_opt_path(binding.get("svn_working_copy")),
+            code_mode=str(binding.get("code_mode") or "git_mirror"),
         )
 
     target = global_target()
@@ -385,7 +388,21 @@ def is_i18n_path(rel_path: str, patterns: list[str] | None = None) -> bool:
 
 
 def i18n_working_copy(target: RepoTarget) -> Path:
-    """The product's real SVN checkout -- the only place `svn ci` may run."""
+    """The product's real SVN checkout -- the only place `svn ci` may run.
+
+    In `svn_direct` mode (AUTO_LOOP.md §1.9) this whole channel is off. That copy
+    is where code is edited in place, and translation entries there follow the
+    code line's own i18n rules: the two lines have already diverged (3.0's single
+    source is no longer a `.po` file at all), so a `*.po,*.mo` whitelist would
+    point the executor at files that line's own rules forbid editing by hand.
+    """
+    if target.code_mode == "svn_direct":
+        raise SvnError(
+            f"产品 {target.product_id or '(未绑定)'} 走的是 svn_direct 落码模式（直接改 SVN 工作副本）："
+            "多语言不再由本系统的 i18n-up/i18n-commit 直连通道负责，"
+            "请按目标代码库自己的 i18n skill 约定处理词条"
+            "（3.0 与 2.3 已经不同，3.0 的词条真源不是 po/mo）。"
+            "词条与代码同在一份副本里，改完随本条代码一起给你审查。")
     if target.svn_working_copy is None:
         raise SvnError(
             f"产品 {target.product_id or '(未绑定)'} 没有配置正式 SVN 工作副本，"
@@ -528,6 +545,38 @@ def _step(name: str, ok: bool | None, detail: str) -> dict:
     return {"name": name, "ok": ok, "detail": detail}
 
 
+def _preflight_direct(target: RepoTarget) -> list[dict]:
+    """Direct-mode checks: SSH endpoint, path derivation, copy identity, occupancy.
+
+    Deliberately no `svn status` here: a whole-copy sweep of this line costs about
+    a minute (measured), which a multi-repo self test must not pay per product.
+    """
+    from . import svn_direct            # lazy: svn_direct imports this module
+
+    steps: list[dict] = []
+    if target.svn_working_copy is None:
+        steps.append(_step("SVN 工作副本", False,
+                           "svn_direct 模式必须配置 svn_working_copy："
+                           "bind-repo <pid> <仓库地址> --code-mode svn_direct "
+                           "--svn-working-copy <副本>"))
+        return steps
+    try:
+        wc = svn_direct.resolve(target)
+    except (svn_direct.DirectError, SvnError, OSError) as exc:
+        steps.append(_step("SSH 侧工作副本", False, str(exc)))
+        return steps
+    steps.append(_step("SSH 端点与路径", True,
+                       f"{wc.remote.user}@{wc.remote.host}:{wc.remote.port} -> {wc.remote_path}"
+                       f"（Windows 视图 {wc.local_path}）"))
+    steps.append(_step("svn info", True,
+                       f"svn {wc.svn_version}；URL {wc.url}；当前 r{wc.revision}"))
+    holder = db.get_live_draft_for_wc(wc.remote_path)
+    steps.append(_step("副本占用", None,
+                       f"当前由 {db.draft_holder_label(holder)} 持有" if holder
+                       else "无在册草稿（一份副本同一时刻只允许一条未提交改动）"))
+    return steps
+
+
 def preflight_target(target: RepoTarget) -> list[dict]:
     """Read-only checks for one repository."""
     steps: list[dict] = []
@@ -575,6 +624,13 @@ def preflight_target(target: RepoTarget) -> list[dict]:
 
     # The i18n channel is the only write path into the human's own checkout.
     i18n_wc = target.svn_working_copy
+    if target.code_mode == "svn_direct":
+        steps.append(_step("落码模式", True,
+                           "svn_direct：直接在这份 SVN 工作副本里改码（AUTO_LOOP.md §1.9），"
+                           "本系统不代提交；多语言按该代码库自己的 i18n skill 走，"
+                           "i18n-up/i18n-commit 通道对该产品关闭"))
+        steps.extend(_preflight_direct(target))
+        return steps
     if i18n_wc is None:
         steps.append(_step("多语言工作副本", None,
                            "未配置：bind-repo --svn-working-copy 指定正式 SVN 工作副本后，"

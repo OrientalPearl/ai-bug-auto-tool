@@ -15,6 +15,7 @@
 - 代码库：**一个禅道产品 = 一个代码仓库**，绑定关系存在 `product_repos` 表；未绑定的产品回落到 `.env` 的 `SVN_REPO_URL`
 - **落码位置 = `repos` 输出里该产品的 `working_copy`（git-svn 镜像目录），不是正式 SVN 工作副本**；
   执行器只在这里 `git commit`，远端写入（dcommit / push / svn ci）一律由主人做，详见「落码位置」一节
+  （产品绑成 `code_mode=svn_direct` 时改走「落码位置第二种方式」一节，落码目录换成 `landing_spot`）
 - Web 管理台：`http://127.0.0.1:5000`（「产品仓库」页可以可视化地绑定/解绑）
 - 执行器命令（全部输出 JSON，直接读结果，不要猜）：
 
@@ -134,6 +135,43 @@ python -m app.cli doctor                   # 禅道通道分步诊断
 - 绑定关系要落进本系统（闸门 G3 的判据）：
   `python -m app.cli bind-repo <产品ID> <SVN仓库地址> --name "<产品名>" --working-copy <镜像目录>`
 
+## 落码位置第二种方式：svn_direct（直接改 SVN 工作副本，主人在线）
+
+产品的 `code_mode` 决定走哪条通道：**先跑 `python -m app.cli repos` 看该产品的 `code_mode` 与 `landing_spot`**
+（`git_mirror` = 上面那节，落码目录是镜像；`svn_direct` = 本节，落码目录是那份真正的 SVN 检出）。
+绑成 `svn_direct` 的产品**不许套用镜像流程**，按下面这套走（规则本体见 `AUTO_LOOP.md` §1.9 与 §2.0）：
+
+- **开工前先问占用与就绪**：`python -m app.cli mirror <条目号>`，看 `code_mode` / `url` / `revision` /
+  `mirror_ready` / `held_by_this_item` / `dirt.state`；`held_by` 指向别的条目 → 这条开不了工，
+  `block` 或等那条收尾，**不许在同一份副本里叠两条条目的改动**（SVN 没有分支可以隔开两个人）。
+- **领取副本**：`python -m app.cli checkout <条目号> --files <打算动的文件,逗号分隔> [--note "<领用原因>"]`。
+  它只 `svn update` 点名的这几个文件，并把「此刻副本里已存在的他人改动」记成**归属基线**
+  （真实开发副本永远不干净，实测 `trunk/3.0-86` 领用前就有 187 个已修改的入库文件 + 18409 个未跟踪条目，
+  按「工作区必须干净」判这条通道在任何副本上都开不了工）。
+- **改码就在这份副本里**：Windows 映射盘**只用来读代码与编辑**，任何 `svn` 命令都在 SSH 侧（编译服务器）执行；
+  编译与测试按该代码库自己的规程做。
+- **登记改动（不提交）**：`python -m app.cli draft <条目号> --message "fix #<ID> <一句话>" --files <同一批文件>`。
+  这一步不提交任何东西，它逐文件证明：路径存在、该文件确有改动（M/A/D/R）、领用之后新增的改动都在这份声明里；
+  任一不成立（含「声明的文件其实没改动」「有冲突文件」「全副本状态读不出来」）整笔拒绝。
+  同时报三个字段 `behind` / `contaminated` / `ambiguous`。
+  **`contaminated`（领副本之前就是脏的）与 `ambiguous`（同目录存在只差大小写的同名条目）必须写进分析结论的
+  `unverified`，不许看到警告就当没事**；`behind` 要先重新 `checkout --files` 拉到最新再重验。
+- **收口登记**：`python -m app.cli commit <条目号> --no-svn --revision local@r<基线> --files ... --analysis-file a.json`
+  （`local@r<基线>` = 改完了、等主人验证；这一模式下 `--revision` **必须显式给**，不给会被命令拒绝）。
+  主人自己 `svn ci` 之后回填真实号：`commit <条目号> --no-svn --revision r<真实号> ...`
+  —— 登记 `r` 号的同时副本占用被释放，下一条才可以领用这份副本。
+- **丢弃改动**只走 `python -m app.cli revert <条目号> --confirm`（只 revert 本条登记过的文件）。
+- `recut` 对 direct 条目会被直接拒绝：没有分支可重切，先 `checkout --files` 把文件重新拉到最新再改。
+- **串行单位是这份 SVN 副本**：一份副本同一时刻只允许一条在册未提交改动（库里由部分唯一索引强制）。
+  占用情况看 `python -m app.cli drafts`，上一轮跑死留下的失联占用用 `python -m app.cli drafts --release <条目号>`
+  释放（**副本里还有那条改动时会拒绝释放**，先决定改动去向再释放）。共用同一副本的产品必须并入同一条队列。
+- 本模式是**主人在线的协作轮**，不是无人值守连跑轮：不要把 `AUTO_LOOP.md` §0 / §3.1 的连跑下达语粘到
+  direct 队列上（`/dispatch` 页会为 direct 组生成独立的范围说明语）。
+- 本模式下的**硬性禁止**：`svn ci`（代提交只有主人在场并显式 `push <条目号> --owner-approved` 才做，
+  且还要过「清单与草稿逐文件相等」「无 contaminated」「trunk 需 `SVN_ALLOW_TRUNK_WRITE=true`」三道锁）、
+  `git svn dcommit` / `git push`、`i18n-up` / `i18n-commit`（这两个命令对这类产品会直接拒绝：词条按该代码库
+  自己的 i18n skill 处理，随代码一起 `draft` 登记、由主人一并提交）、整仓 `svn revert`、在 Windows 侧跑 svn。
+
 ## 代码库自带的 AI 知识体系（定位代码前先读它）
 
 这套体系分三层，前两层在镜像目录里直接读得到（`AUTO_LOOP.md` §1.6 有逐项实测清单）：
@@ -173,6 +211,8 @@ python -m app.cli doctor                   # 禅道通道分步诊断
    硬喂换来一个 400 会把这条任务打断；按文字与代码取证继续，并在 `unverified` 里写明「某图不可读」
 3. `python -m app.cli claim <禅道ID>` 占住任务（置 fixing），避免其他子任务重复领同一条
 4. 确认这条 bug 属于哪个产品、哪份代码、镜像工作副本在哪：`python -m app.cli repos`；
+   输出的 **`code_mode` 决定这条走哪条通道**（`git_mirror` 按本节走；`svn_direct` 整节改走
+   「落码位置第二种方式：svn_direct」，那时 `landing_spot` 才是它真正改码的目录）；
    **镜像就绪与否直接问 `python -m app.cli mirror <禅道ID>`**（`mirror_ready` = SSH 侧三条判据，
    另给 `worktree_clean` 与镜像当前停在哪个分支），ready=false 时不许开工，直接 `block` 写明「镜像未就绪」；
    `worktree_clean` 只数**真实改动**（`dirty_real` / `dirty_paths`），该库 §1.5 那常年几十行结构性噪音
@@ -243,6 +283,8 @@ python -m app.cli block <禅道ID> --question "..." --options "..." --advice "..
 
 1. 一个禅道产品对应一个代码仓库，绑定存 `product_repos` 表，管理入口是 Web「产品仓库」页或 `bind-repo` 命令；
    `repo_url` 记仓库地址（git-svn 方式下 = 镜像的上游 SVN 地址），`working_copy` 记**执行器实际改码的目录**（= 镜像目录）；
+   `code_mode` 是绑定的第三维（`git_mirror` 默认 / `svn_direct`），它决定实际改码目录到底是 `working_copy`
+   还是 `svn_working_copy` —— 走哪条通道一律以 `python -m app.cli repos` 输出的 `code_mode` / `landing_spot` 为判据；
 2. 即使在默认方式（本系统不跑 svn）下也必须绑定：闸门 G3 要靠它判断「我改的文件是不是这个产品的仓库」，
    审查页也要显示这条 bug 属于哪个仓库；
 3. 可选方式下 `branch` / `commit` 接收禅道 ID 后自动解析仓库：产品有绑定 → 用产品仓库；没有 → 用 `.env` 的
@@ -387,6 +429,18 @@ python -m app.cli block <禅道ID> --question "..." --options "..." --advice "..
     主人没确认之前不许 `checkout` / 改码 / `draft` / `commit`（G13，命令也会直接拒绝你）；
     也不许把 `plan` 里自己写的建议当成已批准 —— 批准只来自主人答复（`owner_reply`）。
     反过来也不许给缺陷瞎出方案：缺陷没有 `plan` 这一步，能修就修、修不动就 `block`
+
+34. **svn_direct 产品（`AUTO_LOOP.md` §1.9）的专属禁令**：不许 `svn ci`（代提交只有主人当面要求并显式
+    `push <条目号> --owner-approved` 才做，且还要过「提交清单与 `draft` 登记逐文件相等」+「清单里没有
+    `contaminated` 文件，否则要 `--allow-dirty-base`」+「副本指向 trunk 时 `.env` 的
+    `SVN_ALLOW_TRUNK_WRITE=true`」三道锁）、不许 `git svn dcommit` / `git push`（镜像那套根本不存在）、
+    不许用 `i18n-up` / `i18n-commit`（对这类产品命令会直接拒绝，词条按该代码库自己的 i18n skill 走、
+    随代码一起 `draft` 登记）、不许整仓 `svn revert`（丢弃只能用 `revert <条目号> --confirm`，
+    且只碰本条登记过的文件）、不许在 Windows 映射盘侧跑任何 svn 命令（所有 svn 都在 SSH 侧执行）、
+    不许在同一份 SVN 副本里叠两条条目的改动（`mirror` 的 `held_by` 指向别条就 `block`）
+35. direct 模式的 `commit` **必须显式给 `--revision`**：改动还在副本里没进库就写 `local@r<基线>`，
+    主人已 `svn ci` 就写 `r<真实号>`；不带 `--revision` 会被命令拒绝，也不许把 `local@r…` 当成「已入库」
+    回报（同 18）；`draft` 报的 `contaminated` / `ambiguous` 必须写进分析结论的「未验证」，不许忽略（同 14）
 
 ## 停止条件
 

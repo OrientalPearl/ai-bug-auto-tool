@@ -17,7 +17,8 @@
   <p class="hint">
     产品 <b>{{ selected.ids }}</b>（{{ selected.names }}）· 待办 {{ selected.pending }} / 共 {{ selected.bugs }}
     {% if selected.tasks %}· 任务 {{ selected.task_pending }} / {{ selected.tasks }}{% endif %} ·
-    落码目录 <code class="wc">{{ selected.working_copy }}</code><br>
+    落码目录 <code class="wc">{{ selected.working_copy }}</code>
+    （落码模式 <b>{{ selected.code_mode }}</b> · 正文 {{ bases[selected.base] }}{% if selected.base_switched %} ← 已自动换{% endif %}）<br>
     <b>{{ selected.serial }}</b>{% if selected.mixed %}
     —— 上面这段里已经写了「只做与本目录相关的部分」，跨目录的产品请各生成一条分别下达。{% endif %}
   </p>
@@ -45,9 +46,11 @@
     <div class="row-actions">
       <label class="field-check"><input type="radio" name="base" value="0" {% if base == '0' %}checked{% endif %}> §0 最短下达语</label>
       <label class="field-check"><input type="radio" name="base" value="0.5" {% if base == '0.5' %}checked{% endif %}> §0.5 在线讨论轮</label>
+      <label class="field-check"><input type="radio" name="base" value="0.6" {% if base == '0.6' %}checked{% endif %}> §0.6 svn_direct 在线协作轮</label>
       <label class="field-check"><input type="radio" name="base" value="3.1" {% if base == '3.1' %}checked{% endif %}> §3.1 主循环（调度器）</label>
       <button class="btn-primary" type="submit">生成下达语</button>
-      <span class="hint">勾几个都行；同一次勾选只应该覆盖<b>同一个落码目录</b>的产品。</span>
+      <span class="hint">勾几个都行；同一次勾选只应该覆盖<b>同一个落码目录</b>的产品。
+        <b>svn_direct 的队列会自动换成 §0.6</b>——§0 / §3.1 是连跑语，那份副本一次只承载一条未提交改动。</span>
     </div>
   </form>
 </div>
@@ -74,6 +77,11 @@
         <td><b>{{ q.ids }}</b><div class="hint">{{ q.names }}</div></td>
         <td>
           <div class="wc">{{ q.working_copy }}</div>
+          {% if q.code_mode == 'svn_direct' %}
+          <div><span class="badge badge-direct">svn_direct</span> <span class="hint">改的是未提交的真实副本</span></div>
+          {% elif q.code_mode == 'mixed' %}
+          <div><span class="badge badge-red">落码模式混了</span> <span class="hint">不能并成一条下达</span></div>
+          {% endif %}
           {% if not q.bound %}
           <div class="hint" style="color:#d93025">未绑定仓库：会落到全局目录，很可能是你日常开发那份代码</div>
           {% endif %}
@@ -83,7 +91,7 @@
         <td>{{ q.serial }}</td>
         <td>
           <div class="row-actions">
-            <a class="btn" href="?ids={{ q.picked }}&amp;base={{ base }}">选这组</a>
+            <a class="btn" href="?ids={{ q.picked }}&amp;base={{ q.base or base }}">选这组</a>
             <button class="btn" type="button" data-copy="q-{{ q.no }}">复制</button>
           </div>
         </td>
@@ -94,7 +102,8 @@
 
   {% for q in queues %}
   <details class="scope-detail">
-    <summary>第 {{ q.no }} 号下达语 · 产品 {{ q.ids }} · {{ bases[base] }}</summary>
+    <summary>第 {{ q.no }} 号下达语 · 产品 {{ q.ids }} · {{ bases[q.base] }}
+      {% if q.base_switched %}（这一组是 svn_direct，正文已从你选的 {{ bases[base] }} 自动换成 §0.6）{% endif %}</summary>
     <pre class="prompt copyable" data-copy-src="q-{{ q.no }}">{{ q.dispatch }}</pre>
   </details>
   {% endfor %}
@@ -134,6 +143,8 @@
     </h3>
     <p class="hint">
       {% if p.title.startswith('0.5') %}在线讨论版：仍然在 AI-BUG 任务系统里工作，但这一轮只回忆单条条目的现值并讨论，不进入执行。
+      {% elif p.title.startswith('0.6') %}svn_direct 在线协作轮：改的是未提交的真实 SVN 副本，一次一条、改完停下等你验证；
+        上面「串行队列」里 direct 那几组已经自动用这段当正文，不必单独粘。
       {% elif p.title.startswith('0') %}不挑产品时的整段下达语；要指定产品请用上面的「串行队列」里那条。
       {% elif p.title.startswith('3.1') %}调度器版：主对话只排队不下场改码，改码交给子任务。
       {% elif p.title.startswith('3.2') %}子任务版：<b>不用你粘</b>，主循环会按这个模板逐条生成；<code>&lt;禅道ID&gt;</code> 由它替换。

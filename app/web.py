@@ -27,7 +27,8 @@ STATUS_LABELS = {
 
 # Headings in AUTO_LOOP.md whose code block is meant to be pasted verbatim;
 # the 下达 page renders them instead of duplicating the text.
-LOOP_PROMPT_SECTIONS = (r"^## 0\. ", r"^## 0\.5 ", r"^### 3\.1 ", r"^### 3\.2 ", r"^## 9\.")
+LOOP_PROMPT_SECTIONS = (r"^## 0\. ", r"^## 0\.5 ", r"^## 0\.6 ",
+                        r"^### 3\.1 ", r"^### 3\.2 ", r"^## 9\.")
 
 # Kanban shows three stacked bands instead of one column per status:
 # (key, label, hint, statuses) in the order the owner reads them.
@@ -55,8 +56,16 @@ CLOSE_MERGED_RESOLUTION = "已修复合入"
 DISPATCH_BASES = {
     "0": "§0 最短下达语",
     "0.5": "§0.5 在线讨论轮",
+    "0.6": "§0.6 svn_direct 在线协作轮",
     "3.1": "§3.1 主循环（调度器）",
 }
+
+# §0 and §3.1 both tell the executor to take the next batch without asking. That is
+# exactly wrong for an `svn_direct` queue, where the resource is one working copy
+# holding one uncommitted change set -- so a direct group is served §0.6 instead.
+# §0.5 is a discussion round (no edits at all), which stays mode-neutral.
+DIRECT_BASE = "0.6"
+UNATTENDED_BASES = ("0", "3.1")
 
 
 def create_app() -> Flask:
@@ -128,7 +137,7 @@ def create_app() -> Flask:
 
     @app.route("/api/bug/<int:bug_id>")
     def api_bug(bug_id: int):
-        item = _item(bug_id)
+        item = _annotate_one(_item(bug_id))
         item["discussion_prompt"] = _discussion_prompt(item)
         return jsonify(item)
 
@@ -275,7 +284,8 @@ def create_app() -> Flask:
     def review_page():
         kinds = _kind("all")
         targets = tuple(db.ITEM_KINDS) if kinds == "all" else (kinds,)
-        return render_template("review.html", queue=db.list_review_queue(targets),
+        return render_template("review.html",
+                               queue=_annotate(db.list_review_queue(targets)),
                                kind_filter=kinds)
 
     @app.route("/review/<int:bug_id>/pass", methods=["POST"])
@@ -323,7 +333,7 @@ def create_app() -> Flask:
         and typed the log message itself. ``mode=dry`` runs the identical checks
         (mirror, base, trunk drift, pending list) without writing anywhere.
         """
-        bug = _item(bug_id)
+        bug = _annotate_one(_item(bug_id))
         payload = _form()
         message = str(payload.get("message") or "").strip()
         dry = str(payload.get("mode") or "push") == "dry"
@@ -338,6 +348,15 @@ def create_app() -> Flask:
                 return jsonify(data)
             flash(text, level)
             return redirect(url_for("review_page"))
+
+        if bug["code_mode"] == "svn_direct":
+            # This route is the git-mirror promotion path. A direct item has no
+            # draft commit to promote: its work is sitting uncommitted in a real
+            # SVN working copy, and committing that is the owner's own call.
+            text = _direct_refusal(bug, "push")
+            return reply({"ok": False, "summary": text, "detail": text,
+                          "code_mode": "svn_direct", "direct": bug.get("direct"),
+                          "status": bug["status"], "unchanged": True}, "error", text)
 
         if bug["status"] != "await_review" and not dry:
             text = (f"{_word(bug)} #{_slug(bug)} 当前状态是"
@@ -445,7 +464,7 @@ def create_app() -> Flask:
         refuses -- typically because another session has HEAD on that branch --
         nothing is changed on the bug either.
         """
-        bug = _item(bug_id)
+        bug = _annotate_one(_item(bug_id))
         payload = _form()
         reason = str(payload.get("reject_reason") or "").strip()
         inline = request.headers.get("X-Requested-With") == "fetch-dialog"
@@ -455,6 +474,15 @@ def create_app() -> Flask:
                 return jsonify(data)
             flash(text, level)
             return redirect(url_for("review_page"))
+
+        if bug["code_mode"] == "svn_direct":
+            # Rolling back means `svn revert` inside the owner's own working copy.
+            # That is not something a page click does on their behalf: the CLI
+            # equivalent needs an explicit --confirm for the same reason.
+            text = _direct_refusal(bug, "revert")
+            return reply({"ok": False, "summary": text, "detail": text,
+                          "code_mode": "svn_direct", "direct": bug.get("direct"),
+                          "status": bug["status"], "unchanged": True}, "error", text)
 
         if bug["status"] not in ("await_review", "rejected"):
             text = (f"{_word(bug)} #{_slug(bug)} 当前状态是"
@@ -706,6 +734,8 @@ def create_app() -> Flask:
             "branch_root": form.get("branch_root") or "/branches",
             "working_copy": form.get("working_copy", ""),
             "svn_working_copy": form.get("svn_working_copy", ""),
+            "code_mode": form.get("code_mode") or "git_mirror",
+            "svn_remote_copy": form.get("svn_remote_copy", ""),
             "branch_prefix": form.get("branch_prefix", ""),
             "build_command": form.get("build_command", ""),
             "test_command": form.get("test_command", ""),
@@ -738,11 +768,17 @@ def create_app() -> Flask:
         rows = _repo_rows()
         queues = _dispatch_queues(rows)
         for group in queues:
-            group["dispatch"] = _dispatch_text(group, prompts, base)
+            used, switched = _effective_base(group, base)
+            group["base"] = used
+            group["base_switched"] = switched
+            group["dispatch"] = _dispatch_text(group, prompts, used)
             group["picked"] = str(group["ids"]).replace(", ", "+")
         selected = _selected_queue(",".join(request.args.getlist("ids")), rows)
         if selected:
-            selected["dispatch"] = _dispatch_text(selected, prompts, base)
+            used, switched = _effective_base(selected, base)
+            selected["base"] = used
+            selected["base_switched"] = switched
+            selected["dispatch"] = _dispatch_text(selected, prompts, used)
             selected["picked"] = str(selected["ids"]).replace(", ", "+")
         return render_template(
             "dispatch.html",
@@ -792,6 +828,8 @@ def _kanban_bands(kind: str = "all") -> list[dict[str, Any]]:
     bands: list[dict[str, Any]] = []
     for key, label, hint, statuses in KANBAN_BANDS:
         groups = [columns[s] for s in statuses if columns.get(s) and columns[s]["count"]]
+        for group in groups:
+            _annotate(group.get("bugs") or [])
         bands.append({
             "key": key,
             "label": label,
@@ -800,6 +838,16 @@ def _kanban_bands(kind: str = "all") -> list[dict[str, Any]]:
             "total": sum(group["count"] for group in groups),
         })
     return bands
+
+
+def _fill_project_root(text: str) -> str:
+    """Resolve the rules file's ``<AI-BUG 项目根>`` placeholder.
+
+    AUTO_LOOP.md leaves the working directory symbolic because only this deployment
+    knows it -- and the executor has no way to guess it: running the CLI from inside
+    the code library fails at the import, so the prompt has to carry the real path.
+    """
+    return text.replace("<AI-BUG 项目根>", str(PROJECT_ROOT))
 
 
 def _loop_prompts() -> list[dict[str, Any]]:
@@ -834,7 +882,7 @@ def _loop_prompts() -> list[dict[str, Any]]:
                 wanted = None
             continue
         if line.startswith("```"):
-            found.append({"title": title, "code": "\n".join(body).rstrip()})
+            found.append({"title": title, "code": _fill_project_root("\n".join(body).rstrip())})
             wanted = None
             body = []
             in_fence = False
@@ -884,6 +932,9 @@ def _discussion_prompt(item: dict[str, Any]) -> str:
         files_text += f"（另 {len(files) - 6} 个）"
     status = STATUS_LABELS.get(item.get("status"), item.get("status") or "（未知）")
     repo_url = effective_trunk = effective_wc = i18n_wc = repo_note = "（未解析）"
+    code_mode = "git_mirror"
+    direct_wc = "（未配置）"
+    draft_note = "（无在册草稿）"
     try:
         target = svn_client.resolve_target(product_id=product_id) if product_id else None
     except svn_client.SvnError as exc:
@@ -894,7 +945,82 @@ def _discussion_prompt(item: dict[str, Any]) -> str:
         effective_trunk = _prompt_line(target.trunk_url())
         effective_wc = _prompt_line(str(target.working_copy))
         i18n_wc = _prompt_line(str(target.svn_working_copy) if target.svn_working_copy else "（未配置）")
+        code_mode = target.code_mode or "git_mirror"
         repo_note = f"代码库来源={target.source}"
+        if code_mode == "svn_direct":
+            direct_wc = i18n_wc
+            # SQLite only -- resolving the Linux side path would mean an SSH probe on
+            # every dialog open, and `mirror` already does that once per round.
+            draft = db.get_live_draft_for_item(item["id"], item.get("target") or "bug")
+            if draft:
+                draft_note = (f"{draft['status']} · 基线 r{draft['base_rev'] or '未知'} · "
+                              f"登记 {len(draft['files'] or [])} 个文件 · 领用 {draft['claimed_at']}")
+    # Which directory is "the" directory depends on the landing mode, and in direct
+    # mode several identical-URL copies exist on this machine -- so the printed paths
+    # are a cross-check, and the executor is told to trust `mirror` over them.
+    scope_lines = [
+        f"代码库 repo_url：{repo_url}",
+        f"trunk：{effective_trunk}",
+        f"落码模式 code_mode：{code_mode}",
+    ]
+    if code_mode == "svn_direct":
+        scope_lines += [
+            f"SVN 工作副本（Windows 侧读改文件，本机还有多份 URL 相同的副本，只准动这一份）：{direct_wc}",
+            f"本条在册草稿：{draft_note}",
+        ]
+    else:
+        scope_lines += [
+            f"落码目录 working_copy（git-svn 镜像）：{effective_wc}",
+            f"正式 SVN 工作副本 svn_working_copy（只有 G12 词条通道可写）：{i18n_wc}",
+        ]
+    scope_lines += [
+        f"备注：{repo_note}",
+        f"上面这些路径只作核对：真值是产品仓库绑定，动手前先 `python -m app.cli mirror {slug}` 现读一遍，"
+        "不一致就以命令报出的为准并 block 说明。",
+        f"本系统命令一律在 {PROJECT_ROOT} 下执行（在代码库目录里跑 `python -m app.cli` 会 ModuleNotFoundError，"
+        "IDE 工作区挂了代码库不等于能在那儿跑命令）。",
+    ]
+    if code_mode == "svn_direct":
+        recall_lines = [
+            "进入讨论前，先在这个系统里回忆现值：",
+            f"1. python -m app.cli status {slug}",
+            f"2. python -m app.cli detail {slug}",
+            f"3. python -m app.cli mirror {slug}   # direct 模式下它报 wc_local / wc_remote / held_by / dirt.state",
+            "4. 如需确认代码库绑定，再看 python -m app.cli repos",
+        ]
+        forbid_lines = [
+            "本轮禁止：",
+            "- 不改代码，不 checkout / draft / commit / push / revert / recut / promote",
+            "- 不把这条收口为“已完成 / 已修复 / 可推”",
+            "- 没有我的“进入执行”指令，不得开始实现",
+        ]
+        execute_lines = [
+            "如果后面我说“进入执行”，按 svn_direct 在线协作轮（AUTO_LOOP.md §0.6 / §1.9）做，一次只做这一条：",
+            f"  1) python -m app.cli mirror {slug}",
+            f"  2) python -m app.cli checkout {slug} --files <要动的文件>   # 领副本 + 记归属基线",
+            "  3) 改码 → 编译 / 测试（svn 子命令一律 SSH 侧，Windows 盘只读与编辑）",
+            f'  4) python -m app.cli draft {slug} --message "fix #{slug} <根因>" --files <同一批文件>   # 不提交，只做归属证明',
+            f"  5) python -m app.cli commit {slug} --no-svn --revision local@r<基线> --files ... --analysis-file a.json",
+            "     登记完停下来等我验证；我自己 svn ci 后回填 r 号，或当面叫你 push --owner-approved（先 --dry-run）。",
+            "     这份副本在我验证前一直被这条占着 —— 不许接着开下一条。",
+        ]
+    else:
+        recall_lines = [
+            "进入讨论前，先在这个系统里回忆现值：",
+            f"1. python -m app.cli status {slug}",
+            f"2. python -m app.cli detail {slug}",
+            f"3. python -m app.cli mirror {slug}",
+            "4. 如需确认代码库绑定，再看 python -m app.cli repos",
+        ]
+        forbid_lines = [
+            "本轮禁止：",
+            "- 不改代码，不 checkout / draft / commit / recut / promote",
+            "- 不把这条收口为“已完成 / 已修复 / 可推”",
+            "- 没有我的“进入执行”指令，不得开始实现",
+        ]
+        execute_lines = [
+            "如果后面我说“进入执行”，你再回到 AGENTS.md / AUTO_LOOP.md 的执行流程与 G1-G13。"
+        ]
     return "\n".join([
         "【单条在线讨论下达语】",
         "先读 AGENTS.md 与 AUTO_LOOP.md。",
@@ -907,17 +1033,9 @@ def _discussion_prompt(item: dict[str, Any]) -> str:
         f"标题：{_prompt_line(item.get('title'))}",
         f"当前状态：{status}",
         f"所属产品：#{product_id or '（无）'} {item.get('product_name') or '（无）'}",
-        f"代码库 repo_url：{repo_url}",
-        f"trunk：{effective_trunk}",
-        f"落码目录 working_copy：{effective_wc}",
-        f"正式 SVN 工作副本 svn_working_copy：{i18n_wc}",
-        f"备注：{repo_note}",
+        *scope_lines,
         "",
-        "进入讨论前，先在这个系统里回忆现值：",
-        f"1. python -m app.cli status {slug}",
-        f"2. python -m app.cli detail {slug}",
-        f"3. python -m app.cli mirror {slug}",
-        "4. 如需确认代码库绑定，再看 python -m app.cli repos",
+        *recall_lines,
         "",
         "然后再进入在线讨论模式，只输出：",
         "- 这条最近一次修改与当前状态摘要",
@@ -926,10 +1044,7 @@ def _discussion_prompt(item: dict[str, Any]) -> str:
         "- 推荐方案",
         "- 待我拍板点",
         "",
-        "本轮禁止：",
-        "- 不改代码，不 checkout / draft / commit / recut / promote",
-        "- 不把这条收口为“已完成 / 已修复 / 可推”",
-        "- 没有我的“进入执行”指令，不得开始实现",
+        *forbid_lines,
         "",
         "这条的当前已知上下文：",
         f"- 当前分支：{_prompt_line(item.get('branch'))}",
@@ -944,16 +1059,56 @@ def _discussion_prompt(item: dict[str, Any]) -> str:
         "现在只讨论这个问题：",
         "<把这次要讨论的修改点写在这里>",
         "",
-        "如果后面我说“进入执行”，你再回到 AGENTS.md / AUTO_LOOP.md 的执行流程与 G1-G13。"
+        *execute_lines,
+    ])
+
+
+def _direct_scope_lines(group: dict[str, Any]) -> str:
+    """The scope paragraph for a `svn_direct` queue (AUTO_LOOP.md §1.9).
+
+    This is the owner-present mode: no draft branch, no local commit, no
+    unattended loop. The copy itself is the resource, so the wording has to carry
+    who holds it and what "done" means (changes registered, owner verifies).
+    """
+    slug_example = "<禅道ID>"
+    return "\n".join([
+        "这一组走 **svn_direct 落码模式**：代码直接改在那份 SVN 工作副本里，"
+        "**本轮是主人在线的协作轮，不是无人值守连跑轮**。没有分支、没有草稿提交、也没有 patch。",
+        f"开工前先看落码位置就绪与归属：`python -m app.cli mirror {slug_example}`，"
+        "看 code_mode / url / wc_local / wc_remote / revision / held_by / held_by_this_item / "
+        "mirror_ready / dirt.state；"
+        "`wc_local` 是 Windows 侧读改文件的目录、`wc_remote` 是 SSH 侧跑 svn 的目录，这两个才是本条唯一准改的那份副本——"
+        "同一台机器上有多份 SVN URL 完全相同的副本"
+        "（实测 trunk/3.0 有 3.0-86 / 3.0-A / 3.0-B / 3.0.new 四份），IDE 工作区里同时挂着它们时，"
+        "只准动 mirror 点名的那一份，其余不许打开、不许改、不许 revert；"
+        "`held_by` 指向别的条目就 block，不要在同一份副本里叠两条改动。",
+        f"领取副本：`python -m app.cli checkout {slug_example} --files <要动的文件>` —— "
+        "它只 update 这几个文件，并把此刻副本里**已存在**的他人改动记成归属基线；"
+        "之后凡是不在基线里、又不在本条声明里的改动都会被拒绝登记。",
+        f"改完落账：`python -m app.cli draft {slug_example} --message \"fix #{slug_example} <一句话>\" "
+        "--files a,b` —— 它逐文件证明「路径存在、真的改了、归属本条、没落后于仓库」，"
+        "并把 `svn status` 字母与 +/- 行数存成摘要；**这一步不做任何提交**。",
+        f"收口：`python -m app.cli commit {slug_example} --no-svn --revision local@r<基线> "
+        "--analysis-file a.json --files a,b`（分析结论仍是必交付物，REQUIRE_ANALYSIS 照旧生效）。",
+        "**提交由主人自己做**：验证通过后主人手敲 svn ci，然后回填 `commit ... --revision r<真实号>`；"
+        "确实要本系统代提交，必须主人当面要求并带 `--owner-approved`（`push <条目号> --dry-run` 先预检），"
+        "执行器绝不主动提交，也不碰 `git svn dcommit` / `git push`。",
+        "所有 svn 动作都在 SSH 侧（编译服务器）发生，Windows 映射盘只用来读代码与编辑文件；"
+        "主机/用户/Linux 路径一律由该库的 CLAUDE.local.yaml 换算，换不出就拒绝，绝不猜。",
+        "本库有只差大小写的同名文件对：改完必须让 `draft` 的逐文件证明替你把关，"
+        "它报「声明的文件没有任何改动」就说明改动落到了另一个拼名上，此时停下来 block，别硬提。",
+        "一份副本同一时刻只允许一条未提交改动 → 严格串行：上一条 `commit` 登记完（或主人提交完回填 r 号、"
+        "或 `revert` 丢弃）才允许开下一条；想并行只能给另一个产品另配一份副本。",
     ])
 
 
 def _make_group(index: int, rows: list[dict[str, Any]]) -> dict[str, Any]:
     """One serial queue: the products that share a single landing directory."""
-    directories = {row["effective_wc"] or "(无法解析)" for row in rows}
+    directories = {row["landing_dir"] or "(无法解析)" for row in rows}
+    modes = {row.get("code_mode") or "git_mirror" for row in rows}
     group: dict[str, Any] = {
         "no": index,
-        "working_copy": rows[0]["effective_wc"] or "(无法解析)",
+        "working_copy": rows[0]["landing_dir"] or "(无法解析)",
         "products": rows,
         "bugs": sum(int(row["bugs"] or 0) for row in rows),
         "pending": sum(int(row["pending"] or 0) for row in rows),
@@ -963,15 +1118,19 @@ def _make_group(index: int, rows: list[dict[str, Any]]) -> dict[str, Any]:
         "error": next((row["error"] for row in rows if row["error"]), ""),
         "mixed": len(directories) > 1,
         "directories": sorted(directories),
+        # A queue that mixes the two landing modes cannot be handed over as one
+        # prompt: half the products would be told to touch the wrong directory.
+        "code_mode": next(iter(modes)) if len(modes) == 1 else "mixed",
         "ids": ", ".join(str(row["product_id"]) for row in rows),
         "names": "、".join((row["product_name"] or f"产品 {row['product_id']}") for row in rows),
     }
     if group["mixed"]:
-        group["serial"] = f"所选产品跨了 {len(directories)} 个目录 → 必须拆成多条下达语"
+        group["serial"] = f"所选产品跨了 {len(directories)} 个落码目录 → 必须拆成多条下达语"
     elif len(rows) > 1:
-        group["serial"] = f"{len(rows)} 个产品共用这一份镜像 → 只能开一条串行队列"
+        group["serial"] = (f"{len(rows)} 个产品共用这一份{'SVN 工作副本' if group['code_mode'] == 'svn_direct' else '镜像'}"
+                           " → 只能开一条串行队列")
     else:
-        group["serial"] = "单产品独占镜像 → 可与其他队列并行"
+        group["serial"] = "单产品独占落码目录 → 可与其他队列并行"
     return group
 
 
@@ -979,12 +1138,13 @@ def _dispatch_queues(rows: list[dict[str, Any]] | None = None) -> list[dict[str,
     """Products grouped by the directory the executor would actually touch.
 
     One directory is one serial queue (AUTO_LOOP §5): two products sharing a
-    mirror must never be worked on in parallel, so the grouping is the thing a
-    human needs to see before starting a second main loop.
+    mirror -- or one real SVN working copy in direct mode -- must never be worked
+    on in parallel, so the grouping is what a human needs to see before starting
+    a second main loop.
     """
     buckets: dict[str, list[dict[str, Any]]] = {}
     for row in (rows if rows is not None else _repo_rows()):
-        buckets.setdefault(row["effective_wc"] or "(无法解析)", []).append(row)
+        buckets.setdefault(row["landing_dir"] or "(无法解析)", []).append(row)
     queues = [_make_group(index, items)
               for index, (_, items) in enumerate(sorted(
                   buckets.items(),
@@ -1002,6 +1162,9 @@ def _scope_block(group: dict[str, Any], base_label: str) -> str:
     verbatim (and keeps updating itself), only this part is filled per selection.
     """
     discussion_only = "在线讨论" in base_label
+    # Everything below forks on this: a direct queue edits an uncommitted real
+    # working copy, so the unattended-loop wording would be wrong in two places.
+    direct = group.get("code_mode") == "svn_direct"
     lines = [f"【本轮范围 · {base_label} · 产品 {group['ids']}】"]
     if discussion_only:
         lines.append(f"只围绕禅道产品 ID ∈ {{{group['ids']}}}（{group['names']}）范围内的 bug 与 task 讨论；"
@@ -1020,7 +1183,16 @@ def _scope_block(group: dict[str, Any], base_label: str) -> str:
         lines.append("注意：所选产品跨了 " + " / ".join(group["directories"]) +
                      " 这几个落码目录，不能并成一条队列；本轮只做其中与本目录相关的产品，"
                      "其余的另开一条下达。")
-    lines.append(f"落码目录 working_copy = {group['working_copy']}")
+    # Two different "directories" get conflated the moment the owner opens a second
+    # IDE workspace: the code library is where edits happen, but the CLI only runs
+    # from the project root -- `python -m app.cli` from inside the library cannot even
+    # import the package (实测 ModuleNotFoundError).
+    lines.append(f"本系统命令一律在 {PROJECT_ROOT} 下执行（`app` 包要能 import，在代码库目录里跑会直接"
+                 " ModuleNotFoundError）；IDE 工作区里挂了代码库不等于能在那个目录跑命令。")
+    lines.append(f"落码目录 = {group['working_copy']}"
+                 + (f"（落码模式 {group['code_mode']}）" if group.get("code_mode") else "")
+                 + " —— 这一行只用来核对：真值是产品仓库绑定，动手前用 `mirror <禅道ID>` 现读一遍，"
+                   "两者不一致就以命令报出的为准并 block 说明。")
     unbound = [str(p["product_id"]) for p in group["products"] if p["source"] != "product"]
     if unbound and len(unbound) < len(group["products"]):
         lines.append(f"其中产品 {'、'.join(unbound)} 还没有绑定代码库（会落到全局目录）："
@@ -1029,6 +1201,8 @@ def _scope_block(group: dict[str, Any], base_label: str) -> str:
     elif unbound:
         lines.append("这些产品都还没有绑定代码库（会落到上面的全局目录）：本轮一律不许落码，"
                      "逐条 block 写明「产品未绑定代码库」，等主人 bind-repo 之后再接手。")
+    elif direct:
+        lines.append(_direct_scope_lines(group))
     else:
         lines.append("开工前先验镜像就绪：`python -m app.cli mirror <禅道ID>`，看 mirror_ready / index_ok / "
                      "worktree_clean（§1.5 三条判据的内部实现）；不就绪就直接 block，不改码，"
@@ -1050,7 +1224,11 @@ def _scope_block(group: dict[str, Any], base_label: str) -> str:
                      "看差异用 --ignore-cr-at-eol）、未跟踪的 CLAUDE.md / CLAUDE.local.yaml / .trae。")
     no_i18n = [str(p["product_id"]) for p in group["products"]
                if p["source"] == "product" and not p.get("i18n_wc")]
-    if no_i18n:
+    if direct:
+        lines.append("词条不在本系统的通道里：svn_direct 模式下按目标代码库自己的 i18n skill 约定处理，"
+                     "改完随代码一起 `draft` 登记、由主人一并审查提交；"
+                     "`i18n-up` / `i18n-commit` 对这些产品会被直接拒绝，不要绕。")
+    elif no_i18n:
         lines.append(f"产品 {'、'.join(no_i18n)} 没配「正式 SVN 工作副本」（svn_working_copy）→ "
                      "G12 词条直连通道不可用：本轮不许打开或修改任何 .po/.mo/.pot/.qm 词条文件，"
                      "需要改词条就 block 写明「未配正式SVN工作副本，词条待主人处理」；"
@@ -1062,26 +1240,42 @@ def _scope_block(group: dict[str, Any], base_label: str) -> str:
         lines.append("本组跨了多个目录：同一目录内部严格串行，不同目录之间才可以并行 —— "
                      "更稳妥的做法是每个目录各下达一条。")
     elif len(group["products"]) > 1:
-        lines.append(f"{len(group['products'])} 个产品共用这一份镜像 → 严格串行：一条 bug 提交完"
-                     "（或 block 登记完）才允许开下一条，同一时刻只能有一个分支被 checkout；"
-                     "禁止为了并行再开第二个主对话动这个目录。")
+        lines.append(f"{len(group['products'])} 个产品共用这一份"
+                     + ("SVN 工作副本" if direct else "镜像")
+                     + " → 严格串行：一条改动登记完"
+                     + ("（还要等主人提交并回填 r 号放开副本）" if direct else "")
+                     + "才允许开下一条，同一时刻只能有一个操作方动这个目录；"
+                       "禁止为了并行再开第二个主对话动这个目录。")
     else:
         lines.append("本队列独占这个目录 → 可以和其他目录的队列并行，但这个目录同时只允许一个操作方。")
     lines.append("取队列后自行过滤，只留本产品/本目录的条目：python -m app.cli tasks --limit 20"
                  "（返回里 kind=task 的是任务、queue_kind=plan_needed 的是还欠方案；"
                  "只做本产品的条目）")
-    lines.append("运行中这四类情况按 §3.4 自己解决，禁止停下来等我（无人值守时等待就是卡死）：")
+    # The 无人值守 rule "never wait, skip it and take the next one" is actively wrong
+    # here: the owner is present, and the copy this item is holding has not been
+    # released -- moving on would stack a second change set onto the first.
+    if direct:
+        lines.append("运行中这四类情况：a) 与 d) 自己解决，b) 与 c) 停下来告诉我 —— 本轮主人在场，等待不是卡死，"
+                     "而这份副本正被本条占着，跳去开下一条会把两条改动叠在一起：")
+    else:
+        lines.append("运行中这四类情况按 §3.4 自己解决，禁止停下来等我（无人值守时等待就是卡死）：")
     lines.append("  a) 模型/接口限流（rate limit、429、overloaded、quota、502/503、稍后再试）"
                  "→ 等 5 分钟重试同一步，最多 3 次（RETRY_WAIT/RETRY_MAX），期间不改状态、不 block、不退循环；"
-                 "3 次用完才 block 写「上游限流未恢复」，随后继续下一条；写类动作（评论、i18n-commit）不重试")
-    lines.append("  b) 任何需要授权的动作一律不许触发也不许等待：密码弹窗、SSH 密码登录（只准免密 key）、"
+                 "3 次用完才 block 写「上游限流未恢复」；写类动作（评论、i18n-commit）不重试")
+    lines.append("  b) 任何需要授权的动作一律不许触发：密码弹窗、SSH 密码登录（只准免密 key）、"
                  "IDE 命令审批、**删除文件的确认**、沙箱越权提示、sudo、yes/no 交互、提问工具；"
                  "实测最常见的就是「清理用完的 a_<ID>.json」这类删除 —— 长文本交给 --analysis-file / "
                  "--block-file，命令入库后会自己回收那份文件（返回里的 handoff_removed），"
                  "跑完用 tmp-clean --apply 清场，你全程不必做任何删除；"
-                 "少触发审批的第二办法是别自己造命令 —— 看镜像/开分支/落草稿/对账都用 §1.8 的 "
-                 "mirror、checkout、draft、reconcile；"
-                 "确实绕不开授权就 block 写清「要主人做什么授权/为什么/影响面/怎么回滚」，接着做下一条")
+                 "少触发审批的第二办法是别自己造命令 —— "
+                 + ("看落码位置/领副本/落账/对账用 mirror、checkout、draft、reconcile"
+                    if direct else
+                    "看镜像/开分支/落草稿/对账都用 §1.8 的 mirror、checkout、draft、reconcile"))
+    if direct:
+        lines.append("     确实绕不开授权就 block 写清「要主人做什么授权/为什么/影响面/怎么回滚」，然后停下等我，"
+                     "副本放开之前不许开下一条")
+    else:
+        lines.append("     也不许等待：确实绕不开授权就 block 写清「要主人做什么授权/为什么/影响面/怎么回滚」，接着做下一条")
     lines.append("  c) 出现「本地文件比仓库新，是否比较」：自己在 SSH 侧 status + diff --ignore-cr-at-eol 取证 —— "
                  "只剩 CRLF/$Id$/大小写对偶/.trae 就当 §1.5 的结构性噪音照常做；"
                  "是别人写的真实改动就不覆盖、不 stash、不 revert、不 checkout 复原，block 写明摘要")
@@ -1090,6 +1284,19 @@ def _scope_block(group: dict[str, Any], base_label: str) -> str:
                  "在 unverified 里注明哪张图不可读；不许因为一张图中止这条，更不许中止整轮")
     lines.append("以下整段是 AUTO_LOOP.md 原文，规则以它为准：")
     return "\n".join(lines)
+
+
+def _effective_base(group: dict[str, Any], base: str) -> tuple[str, bool]:
+    """Which AUTO_LOOP section this queue's body actually comes from.
+
+    A direct queue must not be handed a 连跑 body: §0 / §3.1 both say "take the next
+    batch without asking", and the next item on a `svn_direct` queue needs the same
+    working copy this one is still holding uncommitted. §0.5 is a discussion round
+    (it edits nothing), so it stays valid for either mode.
+    """
+    if group.get("code_mode") == "svn_direct" and base in UNATTENDED_BASES:
+        return DIRECT_BASE, True
+    return base, False
 
 
 def _dispatch_text(group: dict[str, Any], prompts: dict[str, str], base: str) -> str:
@@ -1163,6 +1370,37 @@ def _dispatch_checklist(queues: list[dict[str, Any]]) -> list[dict[str, str]]:
         elif group["bound"]:
             add("ok", f"队列 #{group['no']}：产品 {group['ids']} 独占 {group['working_copy']}，"
                       f"可以和其他队列并行。")
+
+    # svn_direct queues obey the same serial rule, but the resource is a working
+    # copy that holds uncommitted changes, and the owner is in the loop: pasting
+    # the unattended prompt onto one of these groups would be wrong twice over.
+    direct_groups = [g for g in queues if g.get("code_mode") == "svn_direct"]
+    mixed_groups = [g for g in queues if g.get("code_mode") == "mixed"]
+    for group in mixed_groups:
+        add("err", f"队列 #{group['no']}（产品 {group['ids']}）里既有 git_mirror 又有 svn_direct："
+                   "两种落码模式不能并成一条下达语，按「产品仓库」页逐个分开下达。")
+    for group in direct_groups:
+        if not group["working_copy"] or group["working_copy"] == "(无法解析)":
+            add("err", f"队列 #{group['no']} 是 svn_direct，但没配 SVN 工作副本："
+                       "代码没地方改。补齐：python -m app.cli bind-repo <产品ID> \"<SVN仓库地址>\" "
+                       "--code-mode svn_direct --svn-working-copy <该副本路径>",
+                "python -m app.cli svn-check --all")
+        else:
+            add("info", f"队列 #{group['no']}（产品 {group['ids']}）是 svn_direct：改动直接落在 "
+                        f"{group['working_copy']}，本轮要你在线——AI 改完只登记（local@r基线），"
+                        "由你验证后自己 svn ci，或明确叫 AI 用 push --owner-approved 代提交。"
+                        "这一组的正文已自动换成 §0.6 在线协作轮（选了 §0 / §3.1 也一样），不会把连跑语下发过去。")
+    held = db.list_live_drafts()
+    stale_ids = {d["id"] for d in db.stale_live_drafts(settings.stale_claim_minutes)}
+    for draft in held:
+        add("warn" if draft["id"] in stale_ids else "info",
+            f"SVN 副本 {draft['wc_path']} 正被 "
+            f"{db.item_slug(draft['zentao_id'], draft['target'])} 占用"
+            f"（{draft['status']}，登记 {len(draft['files'])} 个文件，基线 r{draft['base_rev'] or '未知'}）"
+            + ("；已超过 STALE_CLAIM_MINUTES，多半是上一轮没收口" if draft["id"] in stale_ids else "")
+            + "，同一副本上的其他条目这条开不了工。",
+            f"python -m app.cli drafts --release "
+            f"{db.item_slug(draft['zentao_id'], draft['target'])}")
 
     add("info", "每条队列开跑前验一次镜像就绪：执行器直接用 "
                 "`python -m app.cli mirror <禅道ID>`，看输出里的 mirror_ready / index_ok / worktree_clean "
@@ -1254,6 +1492,47 @@ def _dispatch_checklist(queues: list[dict[str, Any]]) -> list[dict[str, str]]:
     return items
 
 
+def _mode(item: dict[str, Any]) -> str:
+    """Landing spot of the product this item belongs to (AUTO_LOOP.md §1.9)."""
+    binding = db.get_product_repo(item.get("product_id")) or {}
+    mode = str(binding.get("code_mode") or "git_mirror")
+    return mode if mode in db.CODE_MODES else "git_mirror"
+
+
+def _annotate_one(item: dict[str, Any]) -> dict[str, Any]:
+    """Attach the landing mode and, for direct items, the live SVN draft."""
+    mode = _mode(item)
+    item["code_mode"] = mode
+    item["direct"] = (db.get_live_draft_for_item(item["id"], item.get("target") or "bug")
+                      if mode == "svn_direct" else None)
+    return item
+
+
+def _annotate(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Annotate a whole page's worth of items.
+
+    Reads only the database: the working copy itself is never probed while a page
+    renders, because a whole-copy `svn status` costs about a minute here.
+    """
+    return [_annotate_one(item) for item in items]
+
+
+def _direct_refusal(item: dict[str, Any], action: str) -> str:
+    """What to tell the owner when a git-mirror action is clicked on a direct item."""
+    slug = db.item_slug(item["zentao_id"], item.get("target") or "bug")
+    draft = db.get_live_draft_for_item(item["id"], item.get("target") or "bug") or {}
+    files = "、".join((draft.get("files") or [])[:6]) or "（还没登记）"
+    if action == "push":
+        return (f"这条属于 svn_direct 落码模式：改动就在那份 SVN 工作副本里（基线 "
+                f"r{draft.get('base_rev') or '未知'}，登记文件 {files}），"
+                "本系统不代你提交。自己验证后手敲 svn ci 即可，"
+                f"或者要求 AI 代提交：python -m app.cli push {slug} --owner-approved "
+                f"--message \"<提交说明>\"；提交完把真实 r 号回填到「通过」里。")
+    return (f"这条属于 svn_direct 落码模式：要丢弃改动请在副本里对登记过的文件做 svn revert，"
+            f"或直接执行 python -m app.cli revert {slug} --confirm"
+            f"（只 revert 本条登记的 {files}，不碰别人的改动）。")
+
+
 def _repo_form(product_id: int | None) -> dict[str, Any]:
     """Prefill values for the bind form: existing binding, else global defaults."""
     settings = get_settings()
@@ -1274,6 +1553,8 @@ def _repo_form(product_id: int | None) -> dict[str, Any]:
         "branch_root": binding.get("branch_root") or "/branches",
         "working_copy": binding.get("working_copy") or "",
         "svn_working_copy": binding.get("svn_working_copy") or "",
+        "code_mode": str(binding.get("code_mode") or "git_mirror"),
+        "svn_remote_copy": binding.get("svn_remote_copy") or "",
         "branch_prefix": binding.get("branch_prefix") or settings.branch_prefix,
         "build_command": binding.get("build_command") or "",
         "test_command": binding.get("test_command") or "",
@@ -1305,12 +1586,19 @@ def _repo_row(product_id: int, name: str, bugs: int, pending: int,
         "trunk_path": binding.get("trunk_path") or "",
         "working_copy": binding.get("working_copy") or "",
         "svn_working_copy": binding.get("svn_working_copy") or "",
+        "code_mode": str(binding.get("code_mode") or "git_mirror"),
+        "svn_remote_copy": binding.get("svn_remote_copy") or "",
         "build_command": binding.get("build_command") or "",
         "test_command": binding.get("test_command") or "",
         "source": target.source if target else "",
         "effective_trunk": target.trunk_url() if target else "",
         "effective_wc": str(target.working_copy) if target else "",
         "i18n_wc": str(target.svn_working_copy) if target and target.svn_working_copy else "",
+        # The directory the executor would actually touch under this mode, and
+        # therefore the unit the serial queue is built on (§5 / §1.9).
+        "landing_dir": (str(target.svn_working_copy)
+                        if target and target.code_mode == "svn_direct" and target.svn_working_copy
+                        else str(target.working_copy) if target else ""),
         "error": error,
     }
 

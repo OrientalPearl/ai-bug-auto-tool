@@ -189,7 +189,24 @@
     html += `<h4>需方案记录</h4>` + (needs ? `<ul class="tight">${needs}</ul>` : `<p class="muted">无</p>`);
     html += `<h4>审查记录</h4>` + (reviews ? `<ul class="tight">${reviews}</ul>` : `<p class="muted">无</p>`);
 
-    if (b.status === "await_review") {
+    if (b.code_mode === "svn_direct") {
+      // Direct mode has nothing to promote: the changes sit uncommitted in a real
+      // SVN working copy, and committing them is the owner's own action. The
+      // dialog therefore shows the measured change set and the two commands, and
+      // offers no push button at all.
+      const d = b.direct || null;
+      html += `
+        <h4>SVN 副本里的改动（svn_direct · 本系统不代提交）</h4>
+        ${d ? `
+          <p class="hint">副本 <code>${esc(d.wc_path)}</code> · 基线 <b>r${esc(d.base_rev || "未知")}</b>
+            · 状态 <b>${esc(d.status)}</b> · 领用 ${esc(d.claimed_at || "")}
+            （同一副本同一时刻只允许这一条的未提交改动）</p>
+          <pre style="white-space:pre-wrap;max-height:200px;overflow:auto">${esc(d.diff_stat || "（draft 还没落摘要）")}</pre>`
+            : `<p class="muted">（这条没有在册的 SVN 草稿：改动还没 draft 登记，或已提交/回滚放开副本）</p>`}
+        <p class="hint">你验证后自己 <code>svn ci</code>，然后回填真实 r 号点「通过」；
+          要 AI 代提交必须你当面要求：<code>python -m app.cli push ${esc(slug)} --owner-approved --message "..."</code>
+          （先加 <code>--dry-run</code> 看预检）；要丢弃：<code>python -m app.cli revert ${esc(slug)} --confirm</code>。</p>`;
+    } else if (b.status === "await_review") {
       html += `
         <h4>推入 SVN（正式进库，只有主人能做）</h4>
         <form method="post" action="${action("svn-push", b)}" data-json="1">
@@ -208,15 +225,20 @@
         </form>`;
     }
     if (b.status === "await_review" || b.status === "rejected") {
+      const rejectHint = b.code_mode === "svn_direct"
+        ? "确认打回？改动不回滚：AI 下一轮在同一份 SVN 副本里接着改（这条继续持有副本）。"
+        : `确认打回？改动不回滚：AI 下一轮在原分支 ${esc(b.branch || "（未建分支）")} 上继续改，最终几轮改动一起推入 SVN。`;
       html += `
         <h4>拒绝这次修改（两种处置，都不会碰 trunk）</h4>
         <form method="post" action="/review/${esc(b.id)}/reject?kind=${esc(b.target || "bug")}"
-              data-confirm="确认打回？改动不回滚：AI 下一轮在原分支 ${esc(b.branch || '（未建分支）')} 上继续改，最终几轮改动一起推入 SVN。">
+              data-confirm="${rejectHint}">
           <div class="row-actions">
             <input type="text" name="reject_reason" placeholder="错在哪里（必填，AI 会照着改）" style="flex:1">
-            <button class="btn btn-reject" type="submit">打回重做（保留草稿）</button>
+            <button class="btn btn-reject" type="submit">打回重做（保留改动）</button>
           </div>
-        </form>
+        </form>`;
+      if (b.code_mode !== "svn_direct") {
+        html += `
         <form method="post" action="${action("reject-rollback", b)}" data-json="1">
           <div class="row-actions">
             <input type="text" name="reject_reason" placeholder="拒绝原因（必填，会进留痕与禅道）" style="flex:1">
@@ -224,6 +246,7 @@
               data-ask="确认拒绝并回滚？这会删除镜像里的草稿分支 ${esc(b.branch || '（无分支）')}（提交先存进 refs/rejected 以便取回），并把这条置为已结案（已完结）。trunk 不受影响。">拒绝并回滚 → 已结案</button>
           </div>
         </form>`;
+      }
     }
 
     // Closing is the owner's call, and the answer to a blocker is allowed to be
@@ -603,6 +626,84 @@
     if (saved !== null) band.open = saved === "1";
     band.addEventListener("toggle", function () {
       if (window.localStorage) window.localStorage.setItem(key, band.open ? "1" : "0");
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // one-column card lists (/review, /need): each card starts as its title row
+  // only. A card carries an analysis, a change list and up to three action
+  // forms, so a page of them was unreadable; the title row is the fold target.
+  // A click on a control inside that row (dialog link, 下达语 button) is never a
+  // fold request, and the state is remembered per browser like the kanban bands.
+  // ------------------------------------------------------------------
+  function foldCards() {
+    return Array.prototype.slice.call(
+      document.querySelectorAll(".grid-cards .panel[data-fold]"));
+  }
+
+  // Collapsed a card keeps its title row plus the one-line status under it -- that
+  // is what you scan for. Everything below (analysis, change list, action forms)
+  // is what makes a card a screen tall, so that is what hides.
+  function foldParts(panel) {
+    const head = panel.querySelector("h3");
+    if (!head) return null;
+    const parts = [head];
+    const next = head.nextElementSibling;
+    if (next && next.matches("p.hint")) parts.push(next);
+    return parts;
+  }
+
+  function setFold(panel, parts, open, remember) {
+    panel.classList.toggle("fold-open", open);
+    parts[0].setAttribute("aria-expanded", open ? "true" : "false");
+    Array.prototype.forEach.call(panel.children, function (child) {
+      if (parts.indexOf(child) < 0) child.hidden = !open;
+    });
+    if (remember && window.localStorage) {
+      try { window.localStorage.setItem(`fold:${panel.dataset.fold}`, open ? "1" : "0"); }
+      catch (err) { /* private mode: the page works, it just is not remembered */ }
+    }
+  }
+
+  function isControl(node) {
+    return !!(node && node.closest
+      && node.closest("a, button, select, option, input, label, code"));
+  }
+
+  foldCards().forEach(function (panel) {
+    const parts = foldParts(panel);
+    if (!parts) return;
+    parts.forEach(function (part, index) {
+      if (index === 0) part.classList.add("fold-head");
+      part.classList.add("fold-part");
+      part.addEventListener("click", function (ev) {
+        if (isControl(ev.target)) return;
+        setFold(panel, parts, !panel.classList.contains("fold-open"), true);
+      });
+    });
+    parts[0].setAttribute("role", "button");
+    parts[0].tabIndex = 0;
+    parts[0].addEventListener("keydown", function (ev) {
+      if (ev.key !== "Enter" && ev.key !== " ") return;
+      if (isControl(ev.target)) return;
+      ev.preventDefault();
+      setFold(panel, parts, !panel.classList.contains("fold-open"), true);
+    });
+    let saved = null;
+    if (window.localStorage) {
+      try { saved = window.localStorage.getItem(`fold:${panel.dataset.fold}`); }
+      catch (err) { saved = null; }
+    }
+    setFold(panel, parts, saved === "1", false);
+  });
+
+  document.querySelectorAll("[data-fold-all]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      const open = btn.dataset.foldAll === "1";
+      foldCards().forEach(function (panel) {
+        const parts = foldParts(panel);
+        if (parts) setFold(panel, parts, open, true);
+      });
     });
   });
 

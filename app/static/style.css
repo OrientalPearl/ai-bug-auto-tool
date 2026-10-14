@@ -145,6 +145,9 @@ main { padding: 18px; }
 .badge-green { background: var(--merged); }
 .badge-dark-green { background: var(--closed); }
 .badge-grey { background: var(--pending); }
+/* Landing-mode badge: a product whose code is edited straight in an SVN working
+   copy (AUTO_LOOP.md §1.9), as opposed to the default git-svn mirror. */
+.badge-direct { background: #0f6d63; }
 /* A Zentao task runs the same pipeline as a bug; the badge is what tells them
    apart on every list, and the left border marks the whole card/panel. */
 .badge-task { background: #5b3fd6; }
@@ -206,7 +209,19 @@ table.grid tr:hover td { background: #fafbfc; }
 
 .panel { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-bottom: 14px; }
 .panel h3 { margin: 0 0 10px; font-size: 15px; }
-.grid-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 12px; }
+/* Card lists are one column at every width (平板 / 显示器 / 手机): these cards each
+   carry an analysis, a change list and several action forms, so three columns made
+   every column a separate scroll. Collapsed by default -- see the fold rules below. */
+.grid-cards { display: grid; grid-template-columns: 1fr; gap: 12px; }
+.fold-part { cursor: pointer; }
+.fold-part:hover { background: #f7f8fa; }
+.fold-head { cursor: pointer; margin: 0 0 4px; overflow: hidden; }
+.fold-head::before { content: "\25B8"; color: var(--muted); margin-right: 7px; font-size: 12px; }
+.fold-open > .fold-head::before { content: "\25BE"; }
+.fold-open > p.hint { margin-top: 0; }
+.fold-tools { margin: 0 0 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* `hidden` must win over the display values these cards use. */
+[hidden] { display: none !important; }
 .stat { display: flex; gap: 16px; flex-wrap: wrap; }
 .stat div { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; }
 .stat b { font-size: 20px; display: block; }

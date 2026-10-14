@@ -22,10 +22,15 @@
 </div>
 
 {% if needs %}
+<div class="fold-tools">
+  <button class="btn" type="button" data-fold-all="1">全部展开</button>
+  <button class="btn" type="button" data-fold-all="0">全部折叠</button>
+  <span class="hint">一列排开，默认只留标题那一行；点标题行展开，展开与否记在本浏览器里。</span>
+</div>
 <div class="grid-cards">
   {% for n in needs %}
   {% set ref = ('T' ~ n.zentao_id) if n.target == 'task' else n.zentao_id %}
-  <div class="panel{% if n.target == 'task' %} panel-task{% endif %}">
+  <div class="panel{% if n.target == 'task' %} panel-task{% endif %}" data-fold="need-{{ n.id }}">
     <h3>
       禅道 #{{ ref }} · {{ n.title }}
       {% if n.target == 'task' %}<span class="badge badge-task">任务</span>{% endif %}

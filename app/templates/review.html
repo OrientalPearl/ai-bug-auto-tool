@@ -2,7 +2,9 @@
 {% block content %}
 <div class="page-head">
   <h2>审查清单（待审查 await_review）</h2>
-  <span class="muted">AI 只提交到分支；要正式进库就在「弹窗看完整详情」里写提交说明后点「正式推入 SVN」（可先「预检」），合入 trunk 与禅道结案由你完成</span>
+  <span class="muted">AI 只提交到分支；要正式进库就在「弹窗看完整详情」里写提交说明后点「正式推入 SVN」（可先「预检」），合入 trunk 与禅道结案由你完成。
+    绑成 <b>svn_direct</b> 的产品（卡片上有青色徽标）不一样：改动直接在那份 SVN 工作副本里没提交，
+    本系统不代提交，也不做「推入 SVN」—— 你验证后自己 <code>svn ci</code>，再回填真实 r 号点「通过」</span>
 </div>
 
 <div class="inline" style="margin:0 0 12px">
@@ -13,10 +15,15 @@
 </div>
 
 {% if queue %}
+<div class="fold-tools">
+  <button class="btn" type="button" data-fold-all="1">全部展开</button>
+  <button class="btn" type="button" data-fold-all="0">全部折叠</button>
+  <span class="hint">一列排开，默认只留标题那一行；点标题行展开分析结论、改动清单与处置按钮，展开与否记在本浏览器里。</span>
+</div>
 <div class="grid-cards">
   {% for bug in queue %}
   {% set ref = ('T' ~ bug.zentao_id) if bug.target == 'task' else bug.zentao_id %}
-  <div class="panel{% if bug.target == 'task' %} panel-task{% endif %}">
+  <div class="panel{% if bug.target == 'task' %} panel-task{% endif %}" data-fold="review-{{ bug.id }}">
     <h3>禅道 #{{ ref }} · {{ bug.title }}
       {% if bug.target == 'task' %}<span class="badge badge-task">任务</span>{% endif %}
       <span class="badge badge-orange">待审查</span>
@@ -26,6 +33,7 @@
     </h3>
     <p class="hint">
       pri {{ bug.pri }}{% if bug.severity %} / S{{ bug.severity }}{% endif %} ·
+      {% if bug.code_mode == 'svn_direct' %}<span class="badge badge-direct">svn_direct</span> ·{% endif %}
       分支 <code>{{ bug.branch or '未记录' }}</code> ·
       更新时间 {{ bug.updated_at }}
     </p>
@@ -47,7 +55,27 @@
     <ul class="tight mono">{% for f in bug.files_changed %}<li>{{ f }}</li>{% endfor %}</ul>
     {% else %}<p class="muted">（未登记文件列表）</p>{% endif %}
 
-    <h4 class="hint" style="color:#23272f;font-weight:600">关联提交（git:=本地草稿未进正式库 / 纯数字=SVN 已进库 / PENDING=未提交）</h4>
+    {% if bug.code_mode == 'svn_direct' %}
+    <h4 class="hint" style="color:#23272f;font-weight:600">
+      SVN 副本里的改动
+      <span class="badge">svn_direct</span>
+      {% if bug.direct %}<span class="badge badge-orange">{{ bug.direct.status }}</span>{% endif %}
+    </h4>
+    {% if bug.direct %}
+    <p class="hint">副本 <code>{{ bug.direct.wc_path }}</code> · 基线 <b>r{{ bug.direct.base_rev or '未知' }}</b>
+      · 领用时间 {{ bug.direct.claimed_at }}
+      （同一副本同一时刻只允许这一条的未提交改动）</p>
+    <pre style="white-space:pre-wrap; max-height:200px; overflow:auto; background:#f7f8fa; padding:8px; border:1px solid #e3e6ec; border-radius:4px; font-size:12px">{{ bug.direct.diff_stat or '（draft 还没落摘要）' }}</pre>
+    <p class="hint">版本库里还没有这次改动：验证通过后你自己 <code>svn ci</code>，
+      再在这里填真实 r 号点「通过」；要叫 AI 代提交就用
+      <code>python -m app.cli push {{ ref }} --owner-approved --message "..."</code>（先 <code>--dry-run</code> 预检）。
+      要丢弃改动：<code>python -m app.cli revert {{ ref }} --confirm</code>。</p>
+    {% else %}
+    <p class="muted">（这条没有在册的 SVN 草稿：要么改动还没 draft 登记，要么已经提交/回滚放开了副本）</p>
+    {% endif %}
+    {% endif %}
+
+    <h4 class="hint" style="color:#23272f;font-weight:600">关联提交（git:=本地草稿未进正式库 / local@r:=SVN 副本里待你提交的改动 / 纯数字=SVN 已进库 / PENDING=未提交）</h4>
     {% if bug.revisions %}
     <ul class="tight">
       {% for r in bug.revisions %}
@@ -82,6 +110,15 @@
     </ul>
     {% endif %}
 
+    {% if bug.code_mode == 'svn_direct' %}
+    <form method="post" action="{{ url_for('review_pass', bug_id=bug.id, kind=bug.target) }}"
+          data-confirm="确认审查通过？svn_direct 的改动在那份 SVN 副本里：你已自己 svn ci 就填真实 r 号，还没提交就留空（留空不代表已入库）。">
+      <div class="row-actions">
+        <input type="text" name="merged_revision" placeholder="你 svn ci 之后的真实 r 号（没提交就留空）" style="width:260px">
+        <button class="btn btn-pass" type="submit">通过（已提交）</button>
+      </div>
+    </form>
+    {% else %}
     <form method="post" action="{{ url_for('review_pass', bug_id=bug.id, kind=bug.target) }}"
           data-confirm="确认审查通过？合入 trunk 后请把 trunk 修订号填入下方。">
       <div class="row-actions">
@@ -89,15 +126,21 @@
         <button class="btn btn-pass" type="submit">通过</button>
       </div>
     </form>
+    {% endif %}
 
     <form method="post" action="{{ url_for('review_reject', bug_id=bug.id, kind=bug.target) }}"
-          data-confirm="确认打回？改动不回滚：AI 下一轮在原分支上继续改，最终几轮改动一起推入 SVN。">
+          data-confirm="确认打回？改动不回滚：AI 下一轮{% if bug.code_mode == 'svn_direct' %}在同一份 SVN 副本里接着改（这条继续持有副本）{% else %}在原分支上继续改，最终几轮改动一起推入 SVN{% endif %}。">
       <div class="row-actions">
         <input type="text" name="reject_reason" placeholder="打回原因（必填）" style="flex:1">
         <button class="btn btn-reject" type="submit">打回</button>
       </div>
     </form>
 
+    {% if bug.code_mode == 'svn_direct' %}
+    <p class="hint">这条不走「拒绝并回滚」按钮：改动就在 <code>{{ (bug.direct or {}).get('wc_path') or '该产品的 SVN 工作副本' }}</code> 里没提交，
+      要丢弃由你自己做 —— <code>python -m app.cli revert {{ ref }} --confirm</code>
+      （只 revert 本条登记过的文件，别人的改动一律不碰）。</p>
+    {% else %}
     <form method="post" action="{{ url_for('bug_reject_rollback', bug_id=bug.id, kind=bug.target) }}"
           data-confirm="确认拒绝并回滚？这会删除镜像里的草稿分支 {{ bug.branch or '（无分支）' }}（提交先存进 refs/rejected 以便取回），并把这条置为已结案。trunk 不受影响。">
       <div class="row-actions">
@@ -105,6 +148,7 @@
         <button class="btn btn-reject" type="submit">拒绝并回滚 → 已完结</button>
       </div>
     </form>
+    {% endif %}
   </div>
   {% endfor %}
 </div>

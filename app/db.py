@@ -212,6 +212,15 @@ CREATE TABLE IF NOT EXISTS product_repos (
     branch_root    TEXT    NOT NULL DEFAULT '/branches',
     working_copy   TEXT    NOT NULL DEFAULT '',
     svn_working_copy TEXT  NOT NULL DEFAULT '',
+    -- Where the executor writes code: the git-svn mirror (`git_mirror`, the
+    -- original and still the default) or a plain SVN working copy edited in
+    -- place (`svn_direct`, the owner-present mode -- see AUTO_LOOP.md §1.9).
+    code_mode      TEXT    NOT NULL DEFAULT 'git_mirror'
+                   CHECK (code_mode IN ('git_mirror','svn_direct')),
+    -- Optional explicit Linux path for `svn_direct`; empty means derive it from
+    -- the mirror's CLAUDE.local.yaml path_aliases, and a failed derivation is a
+    -- refusal, never a guess.
+    svn_remote_copy TEXT   NOT NULL DEFAULT '',
     branch_prefix  TEXT    NOT NULL DEFAULT '',
     build_command  TEXT    NOT NULL DEFAULT '',
     test_command   TEXT    NOT NULL DEFAULT '',
@@ -220,6 +229,44 @@ CREATE TABLE IF NOT EXISTS product_repos (
     created_at     TEXT    NOT NULL,
     updated_at     TEXT    NOT NULL
 );
+
+-- ---------------------------------------------------------------------
+-- svn_direct drafts (AUTO_LOOP.md §1.9). SVN has no local commit, so the
+-- "draft" of an item is the set of uncommitted changes sitting in a real SVN
+-- working copy. SVN cannot express "one branch per item", so the working copy
+-- itself is the exclusive resource: at most one live draft may hold a given
+-- `wc_path`, which a partial unique index enforces in the database rather than
+-- in an advisory check the caller can forget.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS svn_drafts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id       INTEGER NOT NULL,
+    target        TEXT    NOT NULL DEFAULT 'bug'
+                  CHECK (target IN ('bug','task')),
+    zentao_id     INTEGER NOT NULL DEFAULT 0,
+    product_id    INTEGER,
+    wc_path       TEXT    NOT NULL,
+    wc_url        TEXT    NOT NULL DEFAULT '',
+    remote_wc     TEXT    NOT NULL DEFAULT '',
+    base_rev      TEXT    NOT NULL DEFAULT '',
+    files         TEXT    NOT NULL DEFAULT '[]',
+    -- The real modifications already in the copy when this item claimed it. A
+    -- developer working copy of this line is never clean (measured: 187 tracked
+    -- files already modified in `trunk/3.0-86`), so ownership cannot be proved
+    -- against "clean" -- it is proved against this snapshot. Anything appearing
+    -- later that this item did not declare is somebody else's work.
+    baseline_files TEXT   NOT NULL DEFAULT '[]',
+    diff_stat     TEXT    NOT NULL DEFAULT '',
+    status        TEXT    NOT NULL DEFAULT 'editing'
+                  CHECK (status IN ('editing','recorded','pushed','reverted')),
+    revision      TEXT    NOT NULL DEFAULT '',
+    note          TEXT    NOT NULL DEFAULT '',
+    claimed_at    TEXT    NOT NULL,
+    updated_at    TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_svndraft_item ON svn_drafts(item_id, target);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_svndraft_wc_live
+    ON svn_drafts(wc_path) WHERE status IN ('editing','recorded');
 
 -- ---------------------------------------------------------------------
 -- Zentao tasks (任务). Same workflow as bugs, own tables: a task number and a
@@ -395,6 +442,12 @@ EXTRA_COLUMNS = (
     ("svn_revisions", "git_commit", "TEXT NOT NULL DEFAULT ''"),
     ("need_solution", "done_at", "TEXT"),
     ("product_repos", "svn_working_copy", "TEXT NOT NULL DEFAULT ''"),
+    ("product_repos", "code_mode",
+     "TEXT NOT NULL DEFAULT 'git_mirror' CHECK (code_mode IN ('git_mirror','svn_direct'))"),
+    ("product_repos", "svn_remote_copy", "TEXT NOT NULL DEFAULT ''"),
+    # The table is new enough that some databases already carry it without this
+    # column; `init_db` creates it with the column, `migrate` patches the rest.
+    ("svn_drafts", "baseline_files", "TEXT NOT NULL DEFAULT '[]'"),
 )
 
 
@@ -433,8 +486,16 @@ def query_one(sql: str, params: Iterable[Any] = ()) -> dict | None:
 
 
 def execute(sql: str, params: Iterable[Any] = ()) -> int:
+    """Run one statement and return the new row id.
+
+    A mapping is passed through untouched: sqlite3 binds a *sequence* to named
+    placeholders positionally by order of appearance, so `tuple({...})` silently
+    writes the keys as values -- and a `WHERE id = :did` then matches nothing and
+    the UPDATE no-ops without any error at all.
+    """
     with tx() as conn:
-        cur = conn.execute(sql, tuple(params))
+        bound = params if isinstance(params, dict) else tuple(params)
+        cur = conn.execute(sql, bound)
         return cur.lastrowid or 0
 
 
@@ -1393,9 +1454,21 @@ def has_analysis(item_id: int, target: str = "bug") -> bool:
 
 REPO_COLUMNS = {
     "product_name", "repo_url", "trunk_path", "branch_root", "working_copy",
-    "svn_working_copy",
+    "svn_working_copy", "code_mode", "svn_remote_copy",
     "branch_prefix", "build_command", "test_command", "note", "enabled",
 }
+
+CODE_MODES = ("git_mirror", "svn_direct")
+
+
+def _normalize_code_mode(value: Any) -> str:
+    """An empty/unknown value means the historical mode, never a silent svn_direct."""
+    mode = str(value or "").strip().replace("-", "_").lower()
+    if not mode:
+        return "git_mirror"
+    if mode not in CODE_MODES:
+        raise ValueError(f"code_mode 只能是 {' / '.join(CODE_MODES)}，收到：{value}")
+    return mode
 
 
 def _repo_enabled(value: Any) -> int:
@@ -1424,6 +1497,8 @@ def bind_product_repo(product_id: int, fields: dict[str, Any]) -> dict:
                if key in fields and fields[key] is not None}
     if "enabled" in updates:
         updates["enabled"] = _repo_enabled(updates["enabled"])
+    if "code_mode" in updates:
+        updates["code_mode"] = _normalize_code_mode(updates["code_mode"])
 
     with tx() as conn:
         exists = conn.execute(
@@ -1434,15 +1509,20 @@ def bind_product_repo(product_id: int, fields: dict[str, Any]) -> dict:
                 raise ValueError("新建绑定必须提供 repo_url")
             row = {key: updates.get(key, "") for key in REPO_COLUMNS}
             row["enabled"] = updates.get("enabled", 1)
+            # "" would break the column's CHECK: a new binding is always the
+            # historical mirror flow unless the caller says otherwise.
+            row["code_mode"] = updates.get("code_mode", "git_mirror")
             conn.execute(
                 """
                 INSERT INTO product_repos (product_id, product_name, repo_url, trunk_path,
                                            branch_root, working_copy, svn_working_copy,
+                                           code_mode, svn_remote_copy,
                                            branch_prefix, build_command, test_command,
                                            note, enabled, created_at, updated_at)
                 VALUES (:product_id, :product_name, :repo_url, :trunk_path, :branch_root,
-                        :working_copy, :svn_working_copy, :branch_prefix, :build_command,
-                        :test_command, :note, :enabled, :ts, :ts)
+                        :working_copy, :svn_working_copy, :code_mode, :svn_remote_copy,
+                        :branch_prefix, :build_command, :test_command,
+                        :note, :enabled, :ts, :ts)
                 """,
                 {**row, "product_id": pid, "ts": ts},
             )
@@ -1498,6 +1578,159 @@ def products_in_use() -> list[dict]:
          ORDER BY (SUM(bugs) + SUM(tasks)) DESC, product_id ASC
         """
     )
+
+
+# ---------------------------------------------------------------------------
+# svn_drafts -- the live uncommitted change set of one item in `svn_direct` mode
+# (AUTO_LOOP.md §1.9). A working copy can host exactly one live draft; that is a
+# database guarantee (partial unique index), not a convention the caller can skip.
+# ---------------------------------------------------------------------------
+
+DRAFT_STATUSES = ("editing", "recorded", "pushed", "reverted")
+LIVE_DRAFT_STATUSES = ("editing", "recorded")
+
+SVN_DRAFT_FIELDS = {
+    "wc_url", "remote_wc", "base_rev", "files", "baseline_files", "diff_stat",
+    "status", "revision", "note",
+}
+
+
+def _decode_draft(row: dict | None) -> dict | None:
+    if row is None:
+        return None
+    row = dict(row)
+    row["files"] = _json_load(row.get("files")) or []
+    row["baseline_files"] = _json_load(row.get("baseline_files")) or []
+    return row
+
+
+def draft_holder_label(draft: dict) -> str:
+    """Human-readable "who is holding this working copy" for a refusal message."""
+    slug = item_slug(draft.get("zentao_id") or 0, draft.get("target") or "bug")
+    return (f"{slug}（{draft.get('status')}，自 {draft.get('claimed_at')} 起持有 "
+            f"{draft.get('wc_path')}）")
+
+
+def get_svn_draft(draft_id: int) -> dict | None:
+    return _decode_draft(query_one("SELECT * FROM svn_drafts WHERE id = ?", (int(draft_id),)))
+
+
+def get_live_draft_for_item(item_id: int, target: str = "bug") -> dict | None:
+    """This item's live draft, wherever it lives. Never returns a pushed/reverted one."""
+    return _decode_draft(query_one(
+        f"SELECT * FROM svn_drafts WHERE item_id = ? AND target = ? "
+        f"AND status IN ({','.join('?' * len(LIVE_DRAFT_STATUSES))}) "
+        f"ORDER BY id DESC LIMIT 1",
+        (int(item_id), target, *LIVE_DRAFT_STATUSES)))
+
+
+def get_live_draft_for_wc(wc_path: str) -> dict | None:
+    """The one item that currently owns this working copy, if any."""
+    return _decode_draft(query_one(
+        f"SELECT * FROM svn_drafts WHERE wc_path = ? "
+        f"AND status IN ({','.join('?' * len(LIVE_DRAFT_STATUSES))}) "
+        f"ORDER BY id DESC LIMIT 1",
+        (str(wc_path), *LIVE_DRAFT_STATUSES)))
+
+
+def claim_svn_draft(item: dict, *, wc_path: str, wc_url: str = "", remote_wc: str = "",
+                    base_rev: str = "", baseline: list[str] | None = None,
+                    note: str = "") -> dict:
+    """Take (or refresh) the working copy for this item.
+
+    Re-claiming from the same item is an update, not a new row: a round-two
+    `checkout` must not stack a second holder on the same directory. `baseline`
+    is the set of tracked files that were already modified at claim time -- the
+    reference every later ownership proof is measured against.
+    """
+    wc = str(wc_path)
+    ts = now_str()
+    stamp = _json_dump(list(baseline or []))
+    mine = get_live_draft_for_item(item["id"], item.get("target") or "bug")
+    other = get_live_draft_for_wc(wc)
+    if other and (other["item_id"] != item["id"] or other["target"] != (item.get("target") or "bug")):
+        raise ValueError(
+            f"工作副本 {wc} 已被 {draft_holder_label(other)} 占用："
+            "SVN 没有本地分支，一份副本同一时刻只能承载一条条目的未提交改动。"
+            "先让那条收尾（登记或 svn revert），再来领这条。")
+    if mine and mine["wc_path"] != wc:
+        raise ValueError(
+            f"该条目已持有另一份副本 {mine['wc_path']}（{mine['status']}）："
+            "先把那一处的改动收掉再换副本，避免同一条目留下两份未提交改动。")
+
+    if mine:
+        updates = {"wc_url": wc_url, "remote_wc": remote_wc, "base_rev": base_rev,
+                   "baseline_files": stamp, "note": note, "updated_at": ts}
+        sets = ", ".join(f"{key} = :{key}" for key in updates)
+        execute(f"UPDATE svn_drafts SET {sets} WHERE id = :did",
+                {**updates, "did": mine["id"]})
+        return get_svn_draft(mine["id"])
+
+    draft_id = execute(
+        """
+        INSERT INTO svn_drafts (item_id, target, zentao_id, product_id, wc_path, wc_url,
+                                remote_wc, base_rev, files, baseline_files, diff_stat,
+                                status, revision, note, claimed_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, '', 'editing', '', ?, ?, ?)
+        """,
+        (item["id"], item.get("target") or "bug", int(item.get("zentao_id") or 0),
+         item.get("product_id"), wc, wc_url, remote_wc, base_rev, stamp, note, ts, ts),
+    )
+    created = get_svn_draft(draft_id)
+    if created is None:
+        # A concurrent claim won the partial unique index: report it like the
+        # pre-check above instead of pretending the claim succeeded.
+        holder = get_live_draft_for_wc(wc) or {}
+        raise ValueError(f"占用工作副本 {wc} 失败，当前持有者是 {draft_holder_label(holder)}"
+                         if holder else f"占用工作副本 {wc} 失败")
+    return created
+
+
+def update_svn_draft(draft_id: int, fields: dict[str, Any]) -> dict | None:
+    """Write the measured change set (files / diff_stat / status / base_rev ...)."""
+    updates = {key: value for key, value in fields.items() if key in SVN_DRAFT_FIELDS}
+    if "status" in updates and updates["status"] not in DRAFT_STATUSES:
+        raise ValueError(f"未知的草稿状态：{updates['status']}")
+    if "files" in updates:
+        updates["files"] = _json_dump(updates["files"] or [])
+    if not updates:
+        return get_svn_draft(draft_id)
+    updates["updated_at"] = now_str()
+    sets = ", ".join(f"{key} = :{key}" for key in updates)
+    execute(f"UPDATE svn_drafts SET {sets} WHERE id = :did", {**updates, "did": int(draft_id)})
+    return get_svn_draft(draft_id)
+
+
+def close_svn_draft(draft_id: int, status: str, revision: str = "",
+                    note: str = "") -> dict | None:
+    """Free the working copy: `pushed` (already in the repository) or `reverted`."""
+    if status not in DRAFT_STATUSES:
+        raise ValueError(f"未知的草稿状态：{status}")
+    fields = {"status": status}
+    if revision:
+        fields["revision"] = revision
+    if note:
+        fields["note"] = note
+    return update_svn_draft(draft_id, fields)
+
+
+def stale_live_drafts(minutes: int) -> list[dict]:
+    """Live drafts claimed more than `minutes` ago (0 disables the scan)."""
+    if minutes <= 0:
+        return []
+    return [_decode_draft(row) for row in query_all(
+        f"SELECT * FROM svn_drafts WHERE status IN "
+        f"({','.join('?' * len(LIVE_DRAFT_STATUSES))}) "
+        f"AND claimed_at < datetime('now', 'localtime', ?) ORDER BY claimed_at",
+        (*LIVE_DRAFT_STATUSES, f"-{int(minutes)} minutes"))]
+
+
+def list_live_drafts() -> list[dict]:
+    """Every held working copy -- what /dispatch and `report` need to see."""
+    return [_decode_draft(row) for row in query_all(
+        f"SELECT * FROM svn_drafts WHERE status IN "
+        f"({','.join('?' * len(LIVE_DRAFT_STATUSES))}) ORDER BY wc_path, id",
+        tuple(LIVE_DRAFT_STATUSES))]
 
 
 # ---------------------------------------------------------------------------

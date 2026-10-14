@@ -7,7 +7,7 @@
 - 服务地址：<http://127.0.0.1:5000>
 - 数据库：`bug_system.db`（已建好全部表）
 - AI 执行器规则：`AGENTS.md`（Trae 读它干活）
-- 自动连跑下达手册：`AUTO_LOOP.md`（一条跑完自动下一条 + 提交闸门 G1–G13 + 多语言直连通道 + 可复制指令）
+- 自动连跑下达手册：`AUTO_LOOP.md`（一条跑完自动下一条 + 提交闸门 G1–G13 + 多语言直连通道 + svn_direct 落码模式 + 可复制指令）
 - 能力清单 / 接口协议：`CAPABILITIES.md`
 - 账号密码配置：`.env`（已被 `.gitignore` 忽略）
 
@@ -78,6 +78,30 @@ I18N_FILE_PATTERNS=*.po,*.mo,*.pot,*.qm    # 白名单：只有命中的文件�
 缺陷拉 `status=active` 且 `assignedTo=我` 的 bug（等价 browseType=assigntome），每条落库 id/标题/steps/severity/pri/module/assignedTo/openedBuild；
 任务拉 `ZENTAO_TASK_STATUS` 白名单内且指派给我的 task，落库 id/标题/pri/迭代/关联需求/截止时间，
 正文与**所属产品**要逐条抓详情才有（列表接口不带回产品，而产品决定这条落哪个仓库）。
+
+### 落码模式：镜像还是直接改 SVN 副本
+
+绑定里除了「产品 → 仓库」还有第三维 `code_mode`，决定 AI 把改动落在哪儿：
+
+- `git_mirror`（**默认**，行为与以前完全一致）：改动落在 git-svn 镜像（`working_copy`）的 `bugfix/zentao-<ID>`
+  分支上，`draft` 落一笔本地 `git commit`，登记 `--revision git:<短哈希>`，进正式库由主人点「正式推入 SVN」；
+- `svn_direct`：改动直接落在真正的 SVN 检出（`svn_working_copy`）里。SVN 没有本地提交，所以 `draft` 不提交
+  任何东西、只登记未提交改动与 diff 摘要，形态是 `--revision local@r<基线>`；主人验证后自己 `svn ci`，
+  再回填 `--revision r<真实号>`（登记 r 号即释放这份副本）。这一模式是**主人在线的协作轮**，
+  不是无人值守连跑轮（详见 `AUTO_LOOP.md` §1.9）。
+
+切换就一条命令（Linux 侧路径换算不出来会直接拒绝、绝不猜，真实源是该代码库根的 `CLAUDE.local.yaml`
+的 `path_aliases` / `ssh.*`；副本不在镜像同级目录时补 `--svn-remote-copy`）：
+
+```
+python -m app.cli bind-repo <产品ID> "<SVN仓库根地址>" --code-mode svn_direct \
+        --svn-working-copy <该副本的 Windows 映射盘路径>      # 可选 --svn-remote-copy <Linux 路径>
+python -m app.cli repos        # code_mode / landing_spot / svn_remote_copy 直接显示出来
+```
+
+**svn_direct 下本系统不代提交**（要代提交必须主人当面要求并 `push <ID> --owner-approved`，还要过三重锁），
+**多语言也不走 `i18n-up` / `i18n-commit`**——这两个命令对这类产品会被拒绝，词条按该代码库自己的 i18n skill
+处理，随代码一起 `draft` 登记、由主人一并提交。
 
 ### 认证通道 `ZENTAO_AUTH_MODE`
 
@@ -328,6 +352,9 @@ python -m app.cli status T5417            # 读任务（另带 迭代/关联需�
 python -m app.cli mirror 1024             # 只读探测镜像上这条的草稿分支：tip / 领先几笔 / 改了哪些文件 / 就绪与占用
                                      # 返回里的 lock.state = absent|stale|hold|busy|odd（只报告，mirror 从不删锁）
 python -m app.cli checkout 1024 [--base <基线>]  # 在镜像里建/切 bugfix/zentao-1024（默认基线 origin/trunk）；任务用 T5417 → bugfix/zentao-T5417
+                                     # svn_direct 产品走另一套实现：checkout 1024 --files a.c,b.c [--note "<领用原因>"]
+                                     #   = 领取那份 SVN 工作副本（只 svn update 点名的文件，并把此刻已存在的他人改动记成归属基线），
+                                     #   分支记 svn-direct@r<基线>；同一副本被别的条目占着 → 拒绝并点名占用者
                                      # **任务方案未经主人确认 → 直接拒绝（G13）**，error 里附可直接执行的 plan 命令
                                      # 镜像未就绪、或工作区有别人未提交的**真实**改动 → 拒绝且不改状态（不替你 stash）；
                                      # 该库那几十行常年结构性噪音（.trae/ 符号链接、CRLF、$Id$）不拦，另计入 dirty_noise
@@ -338,17 +365,32 @@ python -m app.cli draft 1024 --message "fix #1024 <根因>" --files a.c,b.c
                                      # 说明前缀：缺陷 fix #<ID>、任务 feat #<ID>（G8）；任务方案未确认 → 直接拒（G13）
                                      # 说明不以 fix #<ID>/feat #<ID> 开头 / 清单为空 / 路径越界 / HEAD 不在这条分支 → 直接拒
                                      # 陈锁同样先自动回收；不满足回收条件（非 0 字节 / 太新 / 有活 git）就拒绝并告诉你该删哪个文件
+                                     # svn_direct 产品不提交任何东西：逐文件证明「路径存在、确有改动(M/A/D/R)、领用后新增的改动都在声明里」，
+                                     #   登记 diff 摘要（svn status 字母 + 每文件 +/- 行数），返回 revision=local@r<基线>；
+                                     #   behind / contaminated / ambiguous 三项警示（落后的先重新 up 再重验）必须写进分析结论的「未验证」，不许忽略
+python -m app.cli push 1024 --owner-approved [--dry-run] [--files a.c,b.c] [--message "..."]
+                                     # svn_direct 专用：把本条 draft 登记的改动 svn ci 进库（登记真实 r 号 + 置 merged + 释放副本）
+                                     # 不带 --owner-approved 一律拒绝；还有三重锁：清单与草稿逐文件相等、无 contaminated
+                                     #   （否则要 --allow-dirty-base）、指向 trunk 时 .env 的 SVN_ALLOW_TRUNK_WRITE=true；预检落后/冲突整笔拒
+python -m app.cli revert 1024 --confirm
+                                     # svn_direct 专用：丢掉本条在 SVN 副本里的未提交改动，只碰 draft 登记过的文件（拒绝整仓 revert）
+                                     # 不带 --confirm 只报拒绝；git_mirror 产品调用会被拒并回指审查页「拒绝并回滚」
+python -m app.cli drafts [--release 1024]
+                                     # 列出被占用的 SVN 工作副本（direct 模式的串行单位）：谁占的、状态、文件数、基线 r 号、是否 stale
+                                     # --release 只抹登记：副本里还有那条改动时拒绝释放，先决定改动去向（提交或 revert）
 python -m app.cli reconcile [1024|T5417] [--apply]
                                      # 对账：镜像上有草稿提交、库里没登记的（跑完没收口）；--apply 才认领成待审查
                                      # 不带编号时两种条目都扫（--kinds 可只看一种）
 python -m app.cli tmp-clean [--apply]
                                      # 回收留在项目根的交接文件（a_<ID>.json / a_T<ID>.json / blk_<ID>.json / py_<ID>.py / _tmp_*）
                                      # 默认只报告；分析未入库的那份一定留着。执行器不必自己去删文件
-python -m app.cli repos                   # 每个产品的缺陷数/待处理/任务数/待出方案与生效仓库
+python -m app.cli repos                   # 每个产品的缺陷数/待处理/任务数/待出方案与生效仓库（输出含 code_mode / landing_spot / svn_remote_copy）
 python -m app.cli bind-repo 25 <仓库地址> --name "产品名" --build "..." --test "..."
                                      # 加 --working-copy <git 镜像> 指定改码目录，加 --svn-working-copy <正式SVN副本> 开多语言通道
+                                     # 落码模式换成直接改 SVN 副本：--code-mode svn_direct --svn-working-copy <该副本路径>（可选 --svn-remote-copy <Linux 路径>）
 python -m app.cli i18n-up 1024 --files i18n/zh_CN.po
                                      # G12 第 1 步：改词条前先 svn update（只碰白名单文件，返回 conflict 就别动手）
+                                     # code_mode=svn_direct 的产品会被直接拒绝（i18n-commit 同样拒绝）：词条走该代码库自己的 i18n skill，随代码一起 draft 登记
 python -m app.cli i18n-commit 1024 --files i18n/zh_CN.po --message "补充 xx 词条" [--dry-run]
                                      # G12 第 2 步：改完立即单独 svn ci（含 trunk），真实 r 号自动登记 + 回写禅道评论
                                      # 白名单外的文件、副本外的路径、没有本地改动 —— 一律拒绝且不提交
@@ -361,6 +403,8 @@ python -m app.cli analyze 1024 --kind commit --analysis-file a.json
 python -m app.cli commit 1024 --message "..." --files a.py --summary "..." --verify "..." --no-svn --revision r123 --analysis-file a.json
                                      # = 存 analyses + 写 svn_revisions + await_review + 回写禅道评论（默认不跑 svn）
                                      # REQUIRE_ANALYSIS=true 时：没有分析结论的 commit 会被直接拒绝
+                                     # svn_direct 产品**必须显式给 --revision**：改动还留在副本里写 local@r<基线>（先 draft 拿号），
+                                     #   主人已经 svn ci 就写 r<真实号>（登记 r 号的同时释放这份副本的占用）；不带 --revision 直接拒绝
 python -m app.cli block 1024 --question "..." --options "A..;B.." --advice "建议A"
                                      # = 写需方案记录 + need_solution 状态 + 回写禅道「AI 阻塞」
 python -m app.cli plan T5417 --question "<需求理解 + 修改细则>" --options "A…;B…" --advice "建议A" [--plan-file plan_T5417.json]
@@ -405,10 +449,22 @@ tasks(id, zentao_id UNIQUE, title, pri, status, branch,
                    # product_id 只能从 /task-view-<id>.json 的动作记录里解出来（列表接口不带），
                    # 它决定这条任务落哪个仓库；steps 里的正文来自关联需求的 storySpec
 product_repos(product_id PK, product_name, repo_url, trunk_path, branch_root,
-              working_copy, svn_working_copy,
+              working_copy, svn_working_copy, code_mode, svn_remote_copy,
               branch_prefix, build_command, test_command, note,
               enabled, created_at, updated_at)
                    # 一个产品 = 一个仓库；enabled=0 或删行则回落全局 SVN_*
+                   # code_mode = git_mirror（默认：改码在 working_copy 那个 git-svn 镜像）
+                   #             / svn_direct（改码在 svn_working_copy 那份真正的 SVN 检出）
+                   # svn_remote_copy = svn_direct 那份副本在编译服务器上的路径；留空则由该库根的
+                   #             CLAUDE.local.yaml 换算，换不出来命令会直接拒绝（不猜）
+svn_drafts(id, item_id, target[bug|task], zentao_id, product_id, wc_path, wc_url, remote_wc,
+           base_rev, files, baseline_files, diff_stat,
+           status[editing|recorded|pushed|reverted], revision, note, claimed_at, updated_at)
+                   # svn_direct（AUTO_LOOP.md §1.9）的在册草稿 = 那份副本里一组未提交的改动
+                   # **一份 SVN 副本同一时刻只允许一条在册未提交改动**：由
+                   # CREATE UNIQUE INDEX ... ON svn_drafts(wc_path) WHERE status IN ('editing','recorded')
+                   # 这个部分唯一索引在库里强制，不是靠调用方自觉
+                   # baseline_files = 领用副本时该副本里已存在的他人改动；之后每笔改动的归属都拿它比对
 need_solution(id, bug_id, question, ai_options, ai_advice, owner_reply,
               status[awaiting|replied|done], created_at, replied_at, done_at)
 task_needs(id, task_id, need_kind[plan|block], question, ai_options, ai_advice,
@@ -478,6 +534,18 @@ meta(key, value)          # 最近同步时间等杂项
     「HTTP 200 + `self.location='/user-deny-….html'`」表示拒绝，旧判据把它当成功。
     现在系统识别这类拒绝页并改用 `/task-comment-<id>-<actionId>.json`；若仍被拒，说明该账号对这条任务
     没有留言权限，评论原文在 `sync_log` 表里留痕，页面流程不受影响。
+14. **执行器报「工作副本被 … 占用」** → 这是 `svn_direct`（`AUTO_LOOP.md` §1.9）的串行约束，不是故障：
+    一份 SVN 副本同一时刻只允许承载一条条目的未提交改动（库里用部分唯一索引强制）。
+    看谁在占用：`python -m app.cli drafts`（列出副本、条目号、状态、基线 r 号、是否 `stale`）；
+    上一轮跑死留下的失联占用用 `python -m app.cli drafts --release <条目号>` 释放——
+    **副本里还有那条改动时它会拒绝释放**，先决定改动去向（`push`/主人 `svn ci`，或 `revert <条目号> --confirm`）
+    再释放，免得改动失去归属。
+15. **direct 模式的条目在审查弹窗点「推入 SVN / 拒绝并回滚」被拒** → 设计如此：这两个按钮走的是
+    git 镜像那条通道（`app/svn_promote.py`），而 direct 条目的改动是 SVN 副本里**未提交**的工作，
+    页面不会代你提交或丢弃。对应命令：入库 = 你自己验证后 `svn ci`，再
+    `python -m app.cli commit <条目号> --no-svn --revision r<真实号> ...` 回填（确实要 AI 代提交：
+    `python -m app.cli push <条目号> --owner-approved`，先加 `--dry-run` 看预检）；
+    丢弃 = `python -m app.cli revert <条目号> --confirm`。
 
 ## 9. 目录结构
 
@@ -491,6 +559,7 @@ app/zentao_client.py 禅道 REST v1 客户端（token 认证，只读 + 评论�
 app/zentao_session.py禅道会话客户端（登录 + /xxx.json 内部接口 + 附件下载 + 任务列表/详情/留言，识别拒绝页）
 app/zentao_parse.py  禅道响应解析（描述/图片/备注/附件 共用一层；任务详情与 storySpec、产品号反解）
 app/svn_client.py    svn 命令封装（按产品解析仓库、分支、提交、log、trunk 保护）
+app/svn_direct.py    svn_direct 落码通道（AUTO_LOOP.md §1.9）：SSH 侧跑 svn，副本换算/领用/登记/预检/回滚与占用
 app/sync.py          同步、批量抓详情、回写编排（按 kind 分流，一种失败不拖另一种）
 app/web.py           Flask 页面与接口
 app/cli.py           AI 执行器命令行（全部输出单条 JSON）

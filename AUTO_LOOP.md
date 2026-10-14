@@ -23,9 +23,11 @@
 
 ## 0. 最短下达语（直接粘）
 
-不必手抄：打开 Web 的「下达任务」页 `/dispatch`，本节与 §3.1 / §3.2 / §9 的提示词都是从这份文件
+不必手抄：打开 Web 的「下达任务」页 `/dispatch`，本节与 §0.5 / §0.6 / §3.1 / §3.2 / §9 的提示词都是从这份文件
 现场读出来的（规则改了页面跟着改），每段一个复制按钮；页面还会**按落码目录（或你勾选的产品）生成
-已经填好产品 ID、镜像目录与串行要求的下达语**——一个目录一条，粘给一个主对话。顶部另有开跑前检查清单。
+已经填好产品 ID、镜像目录与串行要求的下达语**——一个目录一条，粘给一个主对话。
+`svn_direct` 的队列会被自动换成 §0.6 的正文（你选 §0 / §3.1 也一样），不会把连跑语下发过去。
+顶部另有开跑前检查清单。
 
 ```
 读 AGENTS.md 与 AUTO_LOOP.md，无人值守处理禅道 bug 与任务，按 AUTO_LOOP.md 的【提交闸门 G1–G13】判定可否提交：
@@ -120,6 +122,42 @@ svn_working_copy：<正式 SVN 工作副本，没有就写未配置>
 <把这次要讨论的修改点写在这里>
 
 如果后面我说“进入执行”，你再回到 AGENTS.md / AUTO_LOOP.md 的执行流程与 G1–G13。
+```
+
+## 0.6 svn_direct 在线协作轮（直接粘）
+
+这一段是 `svn_direct` 落码模式（§1.9）的正文，替代 §0 / §3.1 —— 那两段都是「一批跑完立刻取下一批」的连跑语，
+而 direct 模式改的是**未提交的真实 SVN 工作副本**，一份副本一次只承载一条改动，连跑会把第二条叠到第一条身上。
+所以这一轮的纪律是「一次一条、改完停下等你验证」，不是无人值守。
+
+Web「下达任务」页 `/dispatch` 会按落码模式自动换正文：direct 队列给你这段，mirror 队列仍给你选的 §0 / §0.5 / §3.1。
+
+```
+读 AGENTS.md 与 AUTO_LOOP.md（重点 §1.9 与 §2.0），本轮是 svn_direct 在线协作轮：我就在旁边，不是无人值守。
+
+0) 本系统命令一律在 <AI-BUG 项目根> 下执行（`app` 包要能 import；换到代码库目录跑会 ModuleNotFoundError）。
+   代码的读与改在 SVN 工作副本里做，那个目录由下一条命令现读，不要自己认路径。
+1) python -m app.cli mirror <禅道ID>
+   以这条命令报出的 wc_local（Windows 侧读改文件）/ wc_remote（SSH 侧跑 svn）为**唯一落码位置**，
+   再看 url / revision / held_by / mirror_ready / dirt.state；
+   工作区里可能同时挂着多份 SVN URL 相同的副本（例：3.0-86 / 3.0-A / 3.0-B / 3.0.new），
+   只准动 mirror 点名的那一份，其余一律不许打开、不许改、不许 revert。
+   `held_by` 指向别的条目 → 这条开不了工，block 或等那条收尾。
+2) python -m app.cli checkout <禅道ID> --files <你打算动的文件,逗号分隔>
+   只 svn update 这几个文件，并把此刻副本里已存在的他人改动记成归属基线。
+3) 改码 → 按该代码库自己的规程编译、测试。所有 svn 子命令都在 SSH 侧跑，Windows 映射盘只读与编辑。
+4) python -m app.cli draft <禅道ID> --message "fix #<ID> <根因>" --files <同一批文件>
+   这一步不提交任何东西，只做逐文件归属证明；draft 报的 behind / contaminated / ambiguous
+   必须原样写进分析结论的「未验证」。
+5) python -m app.cli commit <禅道ID> --no-svn --revision local@r<基线> --files ... --analysis-file a.json
+   登记完就**停下来**，把改了哪些文件、diff 摘要、未验证项报给我，等我验证。
+6) 我说「可以提交」→ 我自己 svn ci，然后把真实 r 号回填 commit；
+   我明确说「你来提交」→ 才用 python -m app.cli push <禅道ID> --dry-run 预检、再 --owner-approved 执行。
+
+本轮禁止：不连跑下一条（副本还被我占着）；不主动 push / svn ci / git svn dcommit / git push；
+不 recut（没有分支）；不用 i18n-up / i18n-commit —— 词条与代码同在这份副本里，按该库自己的 i18n skill 处理，
+随代码一起 draft 登记；不改与当前条目无关的文件；不打开 `.secrets.env`；不许 resolve/close 禅道。
+闸门 G1–G13 与任务两轮（G13：任务第一轮只出 `plan`）照旧生效，见 §2.0。
 ```
 
 ## 1. 三种执行方式（本工程默认第三种）
@@ -288,6 +326,11 @@ git --git-dir=<镜像名>/.git fsck   # dangling blob 是镜像的正常现象�
 无人值守时那一下点击等于没人点，整轮就冻在那条 bug 上。现在镜像的整个草稿生命周期都有
 本系统命令，执行器只需要 `python -m app.cli …` 一种形态：
 
+**下表是 `git_mirror` 通道。** 产品绑成 `svn_direct`（§1.9）时，`mirror` / `checkout` / `draft` / `commit`
+这四条**同名但走 §1.9 那条通道**（另一套实现、另一套判据）；`push` / `revert` / `drafts` 三条则只在
+direct 模式有意义（`recut` 反过来对 direct 条目会被直接拒绝——没有分支可重切），一并列在下面认命令形态，
+护栏细节看 §1.9：
+
 | 命令 | 做什么 | 护栏 |
 | --- | --- | --- |
 | `mirror <ID>` | 只读探测：草稿分支在不在、tip、领先几笔、改了哪些文件、镜像当前停在哪个分支、工作区**真实**脏不脏（`worktree_clean` + `dirty_real`/`dirty_noise`/`dirty_untracked` + `dirty_paths` + `dirt{state,git,why}`）、`index.lock` 现状（`lock.state`）、就绪三判据（`mirror_ready`） | 纯只读，不 fetch 不 checkout，**也不删锁** |
@@ -295,6 +338,9 @@ git --git-dir=<镜像名>/.git fsck   # dangling blob 是镜像的正常现象�
 | `checkout --carry <路径,路径>` | 工作树被别的分支占着、而改动确实归本条时用：先证明「点名集合 == 工作区真实脏集合」（少点名、多点名、点名一个不脏的都整笔拒绝），逐个 `cp` 快照到镜像 `/tmp` 并记 sha1，再 `git checkout --` 清干净、建/切分支、把快照放回并**逐文件重算 sha1 必须相等**，返回 `carry_named`/`carry_restored`/`carry_snapshot` | 放回前先比 blob：某文件在 `$CUR` 与目标分支上的**已提交版本**不是同一份就拒绝放回（否则会把别人在该分支的新内容覆盖掉），并**退回原分支、把改动放回原处**；切分支失败同样放回原分支，快照目录只报不删。默认行为不变——不带 `--carry` 时脏工作区一律拒。路径含 `\|` 或换行在本侧直接拒（远端清单用 `\|` 分隔） |
 | `draft <ID> --message "fix #<ID> …" --files a,b` | 只 `git add` 列出的文件并提交，返回短哈希 | 同上：任务未确认方案先被 G13 拒绝；陈锁自动回收后才动手；说明必须以 `fix #<禅道ID>` 开头（G8，任务是 `feat #<ID>`）；`--files` 必填、必须是镜像内相对路径、不许 `..`/绝对路径/`.git`；分支不存在就报错让你先 `checkout`；HEAD 不在这条分支上就拒绝；暂存为空 → 不造空提交 |
 | `recut <ID> [--onto <ref>] [--apply --message "fix #<ID> …"]` | 把更新的 trunk 提交**合进**本条草稿分支，让护栏的基准变成 trunk。用在：主人 `git svn fetch` 之后，而 trunk 落的那笔正好与草稿改到**相邻行** —— 这种形状行级三方合并必拒（实测 `git merge-file`：两侧改动之间没有一行未变的行就 rc=1，草稿把 trunk 那行原样抄过去也照样 rc=1），对齐内容救不回来，只能让 trunk 提交成为 tip 的祖先 | 默认 dry-run：只证明与预演，不写任何东西。**写之前先证明**：该文件里 trunk 新增的每一行都必须已在草稿中存在（多重集比对，重复行也要重复命中），缺一行就整笔拒绝并报出那行原文，因为那种情况下合并会盖掉别人的改动；`--apply` 才落 merge 提交，说明必须以 `fix #<禅道ID>` 开头（G8）；HEAD 不在这条分支上 → 拒绝（不替你切分支）；工作区有真实未提交改动 / 判据读不出来 → 拒绝；陈锁自动回收后才动手。旧草稿提交不删不改写（新 tip 的两个父都还在），回退方式就是回到旧 tip。**不推远端、不碰 SVN** |
+| `push <ID> --owner-approved [--dry-run] [--files …] [--message …]` | **只服务 `svn_direct`（§1.9）**：把本条 `draft` 登记的那组未提交改动 `svn ci` 进版本库，登记真实 `r` 号并置 `merged` | 默认不提交：必须显式 `--owner-approved`（规则里不会让执行器去敲它）；提交清单必须与 `draft` 登记的那一份**逐文件相等**；清单里有 `contaminated`（领副本之前就脏）文件时还要 `--allow-dirty-base`；副本指向 trunk 时 `.env` 的 `SVN_ALLOW_TRUNK_WRITE` 必须为 `true`；预检现读 `svn status -u`，落后或冲突整笔拒绝。对 git 镜像产品调用会被拒并回指审查页「正式推入 SVN」 |
+| `revert <ID> --confirm` | **只服务 `svn_direct`**：丢掉本条在那份 SVN 副本里的未提交改动 | 必须 `--confirm`（不可恢复，属主人动作）；只 revert 草稿登记过的文件，声明之外的路径一律拒绝、**不做整仓 revert**；回滚后仍有残留时草稿保持在册不释放副本 |
+| `drafts [--release <ID>]` | 列出当前被占用的 SVN 工作副本（direct 模式的串行单位）：谁占的、什么状态、几个文件、基线 r 号、是否 `stale` | `--release` 只抹登记：**副本里还有那条改动就拒绝释放**，逼你先决定改动去向（提交或 revert），不让改动失去归属 |
 | `plan T<ID> --question … --options … --advice …` | **任务第一轮的唯一产出**：把「需求理解 + 修改细则」登记成待确认方案（`task_needs.need_kind='plan'`）、状态置 `need_solution`、并在禅道任务下留言 | 只对 `T<ID>` 开放（缺陷用 `block`）；登记后 `checkout`/`draft`/`commit` 对这条任务仍然一律拒绝，直到主人在「需方案」页确认（G13） |
 | `reconcile [ID] [--apply]` | 对账：镜像上有草稿提交、库里却没登记（执行器跑完没收口 / 崩在收口前） | 默认只报告；`--apply` 才登记 `git:<哈希>` 并转 `await_review`，分析里写明「结论来自 git 提交信息，未验证」 |
 | `tmp-clean [--apply]` | 回收跑完留在项目根的交接文件（`a_<ID>.json`、`blk_<ID>.json`、`py_<ID>.py`、`_tmp_*.py`） | 只认上面这几种命名；分析**没**入库的 `a_<ID>.json` 一律留着只报告；默认 dry-run，`--apply` 才删；`.env`、库文件、源码都不在候选里 |
@@ -352,6 +398,82 @@ CR 漂移」，git 就报 `Your local changes to the following files would be ov
 把它读过的文件回收掉**（返回里的 `handoff_removed` 就是清单），想留着自查就加 `--keep-handoff`；
 一批跑完统一 `tmp-clean --apply` 清场。这样整条链路上没有任何一步需要「删除」这个动作。
 
+## 1.9 svn_direct 落码模式（直接改 SVN 工作副本 · 主人在线，不是无人值守）
+
+**为什么还要第二种方式**：镜像方式的价值是「改动可以先本地提交、等审查再进库」，代价是两份副本要靠
+回灌对齐。有些活儿不需要这套隔离 —— 主人就坐在旁边，改的是正式 SVN 检出，他自己编译、他自己看 diff、
+他自己 `svn ci`。这时镜像只是一道多余的搬运，所以给「产品 → 代码库」加了第三维：`code_mode`。
+
+| 项 | `git_mirror`（默认，§1.5） | `svn_direct`（本节） |
+| --- | --- | --- |
+| 改码目录 | `product_repos.working_copy`（git-svn 镜像） | `product_repos.svn_working_copy`（真正的 SVN 检出） |
+| 一条目的隔离单位 | `bugfix/zentao-<ID>` 分支 | **SVN 工作副本本身**（SVN 没有本地分支，一份副本一次只承载一条未提交改动） |
+| 「草稿」是什么 | 一笔本地 `git commit` | 副本里那组**未提交**的改动 + 库里登记的 diff 摘要 |
+| 登记形态 | `--revision git:<短哈希>` | `--revision local@r<基线>`（还没进库）→ 主人提交后回填 `r<真实号>` |
+ | 谁执行提交 | 主人（审查页「正式推入 SVN」） | **主人自己 `svn ci`**；本系统只在主人当面要求且带 `--owner-approved` 时代跑 |
+| 补丁文件 | 不需要（草稿就是提交） | **不生成 patch**：证据是 `svn status` 字母 + 每文件 +/- 行数摘要 |
+| 多语言 | G12 直连通道（i18n-up / i18n-commit） | **G12 整条作废**：词条与代码同在一份副本里，按该代码库自己的 i18n skill 处理，`i18n-up/commit` 对这类产品会被拒绝 |
+| 适用轮次 | 无人值守连跑（§3.1 主循环） | 主人在线的协作轮，正文用 **§0.6**；`/dispatch` 对 direct 队列会自动换过去，**不要把 §0 / §3.1 的连跑下达语粘上来** |
+
+**配置**（两条命令就够，路径换算不出来会直接拒绝，绝不猜）：
+
+```
+python -m app.cli bind-repo <产品ID> "<SVN仓库根地址>" --code-mode svn_direct \
+        --svn-working-copy <该副本的 Windows 映射盘路径>
+        # 副本不在镜像同级目录、换算不出 Linux 路径时，再补：--svn-remote-copy <Linux 路径>
+python -m app.cli svn-check --product <产品ID>   # 逐条看：SSH 端点、路径换算、svn info、URL 归属、当前占用
+python -m app.cli repos                         # landing_spot / code_mode 会直接显示出来
+```
+
+**一条 bug 在 direct 模式下的完整走法**：
+
+```
+0) python -m app.cli mirror <禅道ID>
+   看 code_mode=svn_direct / wc_local（Windows 侧读改）/ wc_remote（SSH 侧跑 svn）/ url / revision /
+   mirror_ready / held_by / held_by_this_item / dirt.state。
+   本机有多份 URL 相同的副本（实测 trunk/3.0 四份），只有 mirror 点名的那份准动。
+   `held_by` 指向别的条目 → 这条开不了工，block 或等那条收尾，不要在同一份副本里叠两条改动。
+1) python -m app.cli checkout <禅道ID> --files <打算动的文件,逗号分隔>
+   只 svn update 这几个文件；同时把「此刻副本里已存在的真实改动」记成**归属基线**。
+   —— 这条基线是必须的：实测 `trunk/3.0-86` 领用前就有 187 个已修改的入库文件、18409 个未跟踪条目，
+      按「工作区必须干净」判，本模式在任何一份真实副本上都开不了工。
+2) 在 <svn_working_copy> 里改代码（Windows 映射盘只用来读与编辑，任何 svn 命令都在 SSH 侧跑）
+   编译、测试按该代码库自己的规程做。
+3) python -m app.cli draft <禅道ID> --message "fix #<ID> <一句话>" --files <同一批文件>
+   这一步不提交任何东西。它逐文件证明三件事，任一不成立就整笔拒绝：
+     a. 路径在副本里存在（拼错、没创建、已被删掉都算不过）
+     b. 该文件确实有改动（M/A/D/R）—— 这条同时挡住「只差大小写的同名文件被改到了另一个拼名上」
+     c. 领用之后新增的改动都在这份声明里（别人的改动不会被本条带走）
+   另有三项只警示不拒，但必须原样写进分析结论的「未验证」：
+     · behind —— 这些文件相对仓库已落后（`push` 的预检会把它们整笔拦住，先 svn update 再重验）
+     · contaminated —— 领用之前就是脏的文件，提交会连别人的改动一起带走
+     · ambiguous —— 同目录存在只差大小写的同名条目，需人工确认改动落在哪个拼名上
+4) python -m app.cli commit <禅道ID> --no-svn --revision local@r<基线> --files ... --analysis-file a.json
+   登记「改完了、等你验证」。REQUIRE_ANALYSIS 照旧：没有分析结论的 commit 直接拒。
+5) 你验证：在副本里 `svn diff` 看改动、跑构建、该测的测完，自己 `svn ci`。
+   然后回填真实号：python -m app.cli commit <禅道ID> --no-svn --revision r<真实号> --message "..." --files ...
+   —— 登记 r 号的同时副本的占用被释放，下一条才可以领用这份副本。
+6) 不想留这组改动：python -m app.cli revert <禅道ID> --confirm
+   只 revert 本条登记过的文件；声明之外的路径一律拒绝，也不做整仓 revert。
+```
+
+**要本系统代提交 trunk（默认关闭，三重锁）**：`python -m app.cli push <禅道ID> --dry-run` 先看预检，
+确认后 `push <禅道ID> --owner-approved --message "..."`。三道锁缺一不可：
+① 必须显式 `--owner-approved`（这是主人当面要求的声明，规则里不会让执行器去敲它）；
+② 提交清单必须与 `draft` 登记的那一份**逐文件相等**，且其中不能有 `contaminated` 文件
+（要强行带走还得再加 `--allow-dirty-base`）；
+③ 副本指向 trunk 时 `.env` 的 `SVN_ALLOW_TRUNK_WRITE` 必须为 `true`（默认 `false`，这就是总闸）。
+预检会现读 `svn status -u`：任何文件落后于仓库或处于冲突态 → 整笔拒绝、副本与版本库都不动。
+
+**并行的唯一约束**：串行单位从「镜像目录」扩到「镜像目录 + SVN 副本」。同一份副本上的产品必须并入
+同一条队列；`/dispatch` 的检查清单会按落码目录归组，并把当前被占用的副本连同 `drafts --release` 命令一起列出来。
+上一轮没收口留下的失联占用可以用 `python -m app.cli drafts` 查看、`drafts --release <条目号>` 释放
+（**副本里还有那条的改动时拒绝释放**，逼你先决定改动去向，而不是让改动失去归属）。
+
+**本节不适用的东西**：`recut`（没有分支可重切）、`branch`/`svn copy` 建条目分支、镜像就绪三判据、
+`i18n-up` / `i18n-commit`、§3.3 的「正式推入 SVN」弹窗按钮（点下去只会告诉你该用哪条命令）。
+其余闸门、状态机、分析结论字段规范、禅道评论回写、任务两轮（G13）全部照旧生效。
+
 ## 2. 提交闸门（下达给执行器的「什么情况下可以提交」）
 
 闸门全过才允许提交；**任一条不过 → 走 `block` 回填需方案，绝不「先提交再说」**。
@@ -375,6 +497,22 @@ CR 漂移」，git 就报 `Your local changes to the following files would be ov
 > G5 / G6 / G10 这三类是**代码库自己的细则**，本系统不复制也不解释它们，只在闸门清单里点名要求 ——
 > 细则原文以目标仓库工作区的 `CLAUDE.md` 与其下层 `registry/playbooks` 为唯一权威。
 > G12 是 G11 的**唯一例外**，且例外只覆盖白名单（`I18N_FILE_PATTERNS`）命中的文件。
+
+### 2.0 闸门在 `svn_direct` 模式下对应什么（§1.9）
+
+绑成 `svn_direct` 的产品按这张表判定，**其余闸门一字不改照常执行**：
+
+| 闸门 | git_mirror 里的含义 | svn_direct 里的含义 |
+| --- | --- | --- |
+| G3 | 改动落在该产品**镜像目录**内 | 改动落在该产品 **`svn_working_copy`** 内；SSH 侧换不出路径、或副本 URL 不属于该产品绑定的仓库 → 直接拒绝落码 |
+| G7 | 提交目标是 `bugfix/zentao-<ID>` 分支，不是 trunk | SVN 没有本地分支，改动天然停在 trunk 的工作副本里 → 保护从「分支」换成「**谁提交**」：`SVN_ALLOW_TRUNK_WRITE=false` 是总闸，执行器不许提交 |
+| G11 | 执行器只做本地 `git commit`，绝不 dcommit/push/ci | 执行器连本地提交都没有，只 `draft` 登记未提交改动；代提交必须 `push --owner-approved`，且受 G3/G7 + contaminated 三重锁 |
+| G12 | 词条走 i18n-up / i18n-commit 直连通道 | **不适用**：`i18n-up` / `i18n-commit` 对这类产品会被拒绝，词条按该代码库自己的 i18n skill 处理，随代码一起 `draft` 登记、由主人一并提交 |
+| G13 | 任务首轮只出方案，确认后才落码 | 完全相同：`checkout` / `draft` / `commit` / `push` 四处都会先查方案是否被主人确认过 |
+
+`draft` 在 direct 模式下多出来的三项证明（路径存在、声明文件确有改动、领用后新增改动全在声明内）
+就是 G3 与「只改与本条相关的文件」在这条通道上的**机器判据**；
+`contaminated` 与 `ambiguous` 两个警示是 G9「未验证必须标未验证」的输入，不许看到警告就当没事。
 
 ## 2.1 多语言专用通道（G12：为什么它不参与草稿/审查）
 
@@ -762,6 +900,11 @@ python -m app.cli commit <禅道ID> --message "<一句话根因>" --files a.c,b.
 `git checkout -b` 会把另一条正在改的工作树一起切走，两个产品的改动会互相污染、
 `git add` 也会串味。判定方法：`python -m app.cli repos`，看 `working_copy` 是否相同。
 
+**绑成 `svn_direct`（§1.9）的产品，划分单位换成那份 SVN 工作副本**（`repos` 输出里的 `landing_spot`）：
+SVN 没有本地分支，一份副本里同时只允许一条未提交改动，两条并行的结果一定是改动互相夹带、
+`svn ci` 一次带走两个人的工作。同一份副本上的产品必须交给同一个主对话串行做；
+`/dispatch` 的检查清单会按落码目录归组并列出当前被谁占用（`python -m app.cli drafts`）。
+
 用 §1.5 的 git 镜像时这条约束还要往外扩一层：镜像的 `.git` 跨 Samba 共享时 git 的文件锁不可靠，
 **Windows 侧与编译服务器侧绝不能同时操作同一个镜像**。所以：动镜像前先确认没有另一侧在跑
 `git` / `git svn fetch`。
@@ -806,6 +949,9 @@ python -m app.cli branch <禅道ID> --dry-run        # 确认 repo_source=produc
 
 工作副本留空即自动分配 `svn_workspace/p<产品ID>-<仓库哈希>`，不占用你日常开发那份代码。
 此时子任务把 §3.2 的第 5、6 步换成：`branch <禅道ID>` → 改码 → `commit <禅道ID> --message ... --files ...`（不带 `--no-svn`）。
+
+这种「本系统代跑 svn」的方式与 §1.9 的 `svn_direct` 不是一回事：后者由主人自己提交、本系统默认不写版本库，
+配置与流程只看 §1.9。
 
 ## 7. 跑起来后你在看什么
 
