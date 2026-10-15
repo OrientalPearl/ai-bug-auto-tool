@@ -655,10 +655,11 @@ def create_app() -> Flask:
         if not resolution:
             resolution = CLOSE_MERGED_RESOLUTION if was_merged else CLOSE_RESOLUTIONS[-1]
 
+        # Counted before the status change: closing the item is what settles its open
+        # questions (db.set_item_status does it, so every closing path gets it), and the
+        # flash wants to say how many went quiet.
+        closed_needs = db.count_open_needs(bug["id"], bug["target"])
         db.set_item_status(bug["id"], "closed", target=bug["target"])
-        # A blocker nobody has to answer any more: sweep the open questions so the
-        # 需方案 page and the AI queue stop treating a closed bug as work in progress.
-        closed_needs = db.close_open_needs(bug["id"], bug["target"])
         if not was_merged:
             db.add_analysis(
                 bug["id"],
@@ -953,6 +954,116 @@ def _rev_text(value: Any) -> str:
     return f"r{text}" if text.isdigit() else text
 
 
+# The order an item's own record should be read in: when an item was blocked, the
+# reason is almost always in the first of these that carries any text.
+_NOTE_FIELDS: tuple[tuple[str, str, int], ...] = (
+    ("root_cause", "根因", 1200),
+    ("conclusion", "结论", 700),
+    ("change_desc", "当时改动/为何没改", 500),
+    ("evidence", "证据", 800),
+    ("call_chain", "链路", 700),
+    ("impact", "影响面", 700),
+    ("unverified", "未验证项", 700),
+    ("verify", "验证情况", 500),
+    ("rollback", "回滚", 400),
+    ("symptom", "现象", 500),
+)
+
+_NEED_FIELDS: tuple[tuple[str, str, int], ...] = (
+    ("question", "当时提的问题", 900),
+    ("ai_options", "AI 给的选项", 900),
+    ("ai_advice", "AI 的建议", 800),
+    ("owner_reply", "主人答复", 700),
+)
+
+
+def _note_text(value: Any, limit: int) -> str:
+    """Flatten one record field (string, list or dict) into a clipped paragraph."""
+    if isinstance(value, (list, tuple)):
+        value = " ｜ ".join(str(v).strip() for v in value if str(v).strip())
+    elif isinstance(value, dict):
+        value = "；".join(f"{k}：{str(v).strip()}" for k, v in value.items() if str(v).strip())
+    return _prompt_line(value, "", limit)
+
+
+def _recorded_notes(item: dict[str, Any], draft: dict | None = None) -> list[str]:
+    """Everything already written down about this item, inlined into the prompt.
+
+    The discussion round used to send the executor off to `status` to go find its
+    own notes. That prints the whole row -- measured 67 KB / 229 lines on #53102 --
+    a terminal truncates it, and the executor concluded the notes were empty and
+    started reading Zentao comments instead, which for that item are three
+    reassignment entries with empty text. What it actually needed was already in the
+    database the whole time: a 812-character root cause, a 900-character question, a
+    450-character piece of advice. So the record now travels with the prompt rather
+    than being hunted for.
+    """
+    analyses = [a for a in (item.get("analyses") or []) if a]
+    written = [a for a in analyses if str(a.get("kind") or "") != "manual"]
+    manuals = [a for a in analyses if str(a.get("kind") or "") == "manual"]
+    needs = item.get("needs") or []
+    reviews = item.get("reviews") or []
+    rejects = [r for r in reviews if str(r.get("reject_reason") or "").strip()]
+    lines: list[str] = []
+
+    for a in written[:3]:
+        head = (f"· 分析 #{a.get('id')}（{a.get('kind') or '未标类型'} · "
+                f"{a.get('author') or 'ai'} · {a.get('created_at')}）")
+        body = [f"    {label}：{txt}" for key, label, limit in _NOTE_FIELDS
+                if (txt := _note_text(a.get(key), limit))]
+        if body:
+            lines.append(head)
+            lines += body
+    for n in needs[:3]:
+        head = (f"· 待你拍板项 #{n.get('id')}（{n.get('need_kind') or n.get('status')} · "
+                f"状态 {n.get('status')} · {n.get('created_at')}）")
+        body = [f"    {label}：{txt}" for key, label, limit in _NEED_FIELDS
+                if (txt := _note_text(n.get(key), limit))]
+        if body:
+            lines.append(head)
+            lines += body
+    for m in manuals[:3]:
+        txt = _note_text(m.get("conclusion") or m.get("change_desc") or m.get("root_cause"), 700)
+        if txt:
+            lines.append(f"· 人工留痕 #{m.get('id')}（{m.get('created_at')}）：{txt}")
+    for r in rejects[:3]:
+        txt = _note_text(r.get("reject_reason"), 700)
+        if txt:
+            lines.append(f"· 上一次打回原因（{r.get('created_at')}）：{txt}")
+    if not rejects and reviews:
+        # "It was reviewed" and "there is no note to inherit" are both true here, and
+        # saying only the first would make the executor hunt for a reason that is not
+        # recorded anywhere.
+        lines.append(f"· 审查记录 {len(reviews)} 次，全部通过、没有留下打回原因"
+                     "（没有原因不等于还没找到原因，别去禅道 comments 里替主人编一个）")
+    for key, label, limit in (("fix_summary", "已登记的修改说明", 600),
+                              ("verify_steps", "已登记的验证步骤", 500)):
+        txt = _note_text(item.get(key), limit)
+        if txt:
+            lines.append(f"· {label}（cli note 写的）：{txt}")
+    if draft:
+        note = _note_text(draft.get("note"), 500)
+        if note:
+            lines.append(f"· 本轮草稿备注（checkout/draft 时写的，副本 {draft.get('wc_path')}）：{note}")
+    if len(written) > 3 or len(needs) > 3:
+        lines.append(f"（以上只贴最近 3 条：本条共有分析 {len(analyses)} 条、待拍板 {len(needs)} 条，"
+                     "更早的用 `python -m app.cli status <条目号>` 的 analyses / needs 字段取，"
+                     "别去翻禅道）")
+    if not (written or manuals or needs) and lines:
+        lines.insert(0, "· 本条还没有分析记录也没有待拍板项（analyses / needs 为空），"
+                        "下面这几行是仅有的既有痕迹")
+    if not lines:
+        return ["本条在本系统里还没有任何分析、提问或打回记录（analyses / needs / reviews 都是空的）"
+                "—— 这就是这次讨论要从零开始的原因；"
+                "但「没有记录」不等于「没有线索」，线索在本条的 steps 与截图里，用 detail 抓，"
+                "不要去翻禅道 comments 当根因。"]
+    comments = item.get("comments") or []
+    lines.insert(0, "读法：下面每一条都是本系统里已经写下的记录，多数就是 AI（包括之前的你）"
+                    f"自己写的，讨论先以它为准。禅道 comments 是另一回事 —— 本条共 {len(comments)} 条，"
+                    "多为转派、正文常为空，那不是备注，也不是原因所在。")
+    return lines
+
+
 def _discussion_prompt(item: dict[str, Any], *, force_direct: bool = False) -> str:
     """A single-item prompt that stays inside AI-BUG, but enters discussion mode.
 
@@ -964,10 +1075,7 @@ def _discussion_prompt(item: dict[str, Any], *, force_direct: bool = False) -> s
     slug = db.item_slug(item.get("zentao_id"), item.get("target") or "bug")
     target_word = "任务" if item.get("target") == "task" else "bug"
     product_id = int(item.get("product_id") or 0)
-    analysis = item.get("analysis") or {}
     latest_rev = (item.get("revisions") or [None])[0] or {}
-    latest_need = next((n for n in (item.get("needs") or []) if n.get("owner_reply")), {}) or {}
-    latest_reject = next((r for r in (item.get("reviews") or []) if r.get("reject_reason")), {}) or {}
     files = item.get("files_changed") or []
     files_text = "、".join(str(f).strip() for f in files[:6] if str(f).strip())
     if len(files) > 6:
@@ -1033,7 +1141,7 @@ def _discussion_prompt(item: dict[str, Any], *, force_direct: bool = False) -> s
             f"git 镜像执行。要真走副本：点页面上的「SVN 副本下达语」（它会先登记这条），或 "
             f"python -m app.cli landing {slug} --mode svn_direct")
     scope_lines += [
-        f"备注：{repo_note}",
+        f"仓库来源：{repo_note}",
         # Same --full rule as below: naming the bare probe here would tell the reader
         # to run the one version that deliberately does not look at the copy.
         f"上面这些路径只作核对：真值是本条点名的副本或产品绑定，动手前先 "
@@ -1049,10 +1157,14 @@ def _discussion_prompt(item: dict[str, Any], *, force_direct: bool = False) -> s
         # it comes back scanned=none / dirt.state=skipped. Reporting that as clean
         # would be the single most misleading thing this prompt could say.
         recall_lines = [
-            "进入讨论前，先在这个系统里回忆现值：",
-            f"1. python -m app.cli status {slug}",
-            f"2. python -m app.cli detail {slug}",
-            f"3. python -m app.cli mirror {slug} --full   # 必须带 --full，原因写在下面",
+            "进入讨论前，先把下面「本条已记录的备注」整段读完 —— 那已经是你（或上一轮的我自己）"
+            "写下的现值，讨论必须先以它为准；读完再按需要核对：",
+            f"1. python -m app.cli mirror {slug} --full   # 必须带 --full，原因写在下面",
+            f"2. python -m app.cli status {slug}          # 只在要更早/更完整原文时才跑："
+            "实测这条命令输出约 67 KB / 229 行，终端会截断 —— "
+            "**截断不等于没有**，更不许因此改去翻禅道 comments",
+            f"3. python -m app.cli detail {slug}          # 它抓的是禅道现场的截图 / 评论 / 附件，"
+            "不是本系统的备注；备注已经在下面了，别把它当备注的来源",
             "4. 如需确认代码库绑定，再看 python -m app.cli repos",
             "",
             "这一条讨论的对象是那份 SVN 副本本身，mirror 的返回要分三块读：",
@@ -1090,10 +1202,14 @@ def _discussion_prompt(item: dict[str, Any], *, force_direct: bool = False) -> s
             ctx_lines += ["    " + ln for ln in str(draft["diff_stat"]).splitlines()[:20]]
     else:
         recall_lines = [
-            "进入讨论前，先在这个系统里回忆现值：",
-            f"1. python -m app.cli status {slug}",
-            f"2. python -m app.cli detail {slug}",
-            f"3. python -m app.cli mirror {slug}",
+            "进入讨论前，先把下面「本条已记录的备注」整段读完 —— 那已经是你（或上一轮的我自己）"
+            "写下的现值，讨论必须先以它为准；读完再按需要核对：",
+            f"1. python -m app.cli mirror {slug}   # 落码目录、分支、镜像是否就绪，看这一条就够",
+            f"2. python -m app.cli status {slug}   # 只在要更早/更完整原文时才跑："
+            "实测这条命令输出约 67 KB / 229 行，终端会截断 —— "
+            "**截断不等于没有**，更不许因此改去翻禅道 comments",
+            f"3. python -m app.cli detail {slug}   # 它抓的是禅道现场的截图 / 评论 / 附件，"
+            "不是本系统的备注；备注已经在下面了，别把它当备注的来源",
             "4. 如需确认代码库绑定，再看 python -m app.cli repos",
         ]
         forbid_lines = [
@@ -1122,7 +1238,12 @@ def _discussion_prompt(item: dict[str, Any], *, force_direct: bool = False) -> s
         "",
         *recall_lines,
         "",
+        "本条已记录的备注（本系统里的现值，讨论的起点就是它，不是禅道）：",
+        *_recorded_notes(item, draft),
+        "",
         "然后再进入在线讨论模式，只输出：",
+        "- 先用自己的话复述上面备注里已经写下的结论与卡点（标明引自哪条分析 / 哪个待拍板项），"
+        "再说明这次讨论是否推翻它",
         "- 这条最近一次修改与当前状态摘要",
         "- 方案对比",
         "- 风险与影响面",
@@ -1136,10 +1257,6 @@ def _discussion_prompt(item: dict[str, Any], *, force_direct: bool = False) -> s
         f"- 最近草稿/修订：{_rev_text(latest_rev.get('revision'))}",
         f"- 最近提交说明：{_prompt_line(latest_rev.get('message'))}",
         f"- 最近修改文件：{_prompt_line(files_text)}",
-        f"- 最近分析结论：{_prompt_line(analysis.get('conclusion') or analysis.get('root_cause') or item.get('fix_summary'))}",
-        f"- 最近主人答复：{_prompt_line(latest_need.get('owner_reply'))}",
-        f"- 最近打回原因：{_prompt_line(latest_reject.get('reject_reason'))}",
-        f"- 未验证项：{_prompt_line(analysis.get('unverified'))}",
         *ctx_lines,
         "",
         "现在只讨论这个问题：",

@@ -1357,7 +1357,9 @@ def cmd_drafts(args: argparse.Namespace) -> None:
             return
         target = svn_client.resolve_target(bug=bug)
         try:
-            wc = svn_direct.resolve(target)
+            # Pass the item so the draft's own copy / landing_wc still resolve;
+            # without it the chain falls back to the product binding only.
+            wc = svn_direct.resolve(target, item=bug)
             left = svn_direct.status(wc, paths=draft.get("files") or [])
         except (svn_direct.DirectError, svn_client.SvnError) as exc:
             _out({"ok": False, "action": "drafts", "error": str(exc)})

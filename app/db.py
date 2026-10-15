@@ -793,10 +793,20 @@ EDITABLE_FIELDS = {"branch", "fix_summary", "verify_steps", "files_changed", "ti
 
 def set_item_status(zentao_id_or_id: int, status: str, *, by_zentao_id: bool = False,
                     target: str = "bug", **fields: Any) -> dict | None:
-    """Move an item to ``status`` and optionally update extra columns."""
+    """Move an item to ``status`` and optionally update extra columns.
+
+    Closing an item also settles its open questions, here rather than in each
+    caller: 手工结案 did that from the start, but 拒绝并回滚 and `revert --confirm`
+    also end an item and did not -- which is how #53144 stayed on the 需方案 page
+    asking a question nobody will ever answer (measured: its need row is still
+    ``awaiting``, while the item has been ``closed`` since the reject at
+    2026-10-14 10:33:26). One rule in the status writer means a future closing path
+    cannot re-introduce the leak.
+    """
     if status not in BUG_STATUSES:
         raise ValueError(f"unknown item status: {status}")
-    item = tables_for(target).item
+    tab = tables_for(target)
+    item = tab.item
     ts = now_str()
     sets = ["status = ?", "updated_at = ?"]
     params: list[Any] = [status, ts]
@@ -813,6 +823,12 @@ def set_item_status(zentao_id_or_id: int, status: str, *, by_zentao_id: bool = F
 
     with tx() as conn:
         conn.execute(f"UPDATE {item} SET {', '.join(sets)} WHERE {where}", params)
+        if status == "closed":
+            conn.execute(
+                f"UPDATE {tab.need} SET status = 'done', done_at = ?"
+                f" WHERE {tab.fk} = (SELECT id FROM {item} WHERE {where})"
+                f" AND status IN ('awaiting', 'replied')",
+                (ts, int(zentao_id_or_id)))
     key = "zentao_id" if by_zentao_id else "id"
     return query_one(f"SELECT * FROM {item} WHERE {key} = ?", (int(zentao_id_or_id),))
 
@@ -1172,6 +1188,13 @@ def list_needs(status: str | None = "awaiting",
         severity = "i.severity" if target == "bug" else "NULL AS severity"
         need_kind = "n.need_kind" if tab.kind == "task" else "'block' AS need_kind"
         where = "WHERE n.status = ?" if status not in (None, "all") else ""
+        if status in ("awaiting", "replied"):
+            # This page asks the owner to decide. An item that is already closed has no
+            # decision left to make, so its question must not be listed as pending even
+            # when the need row was never settled (an older build, or a database touched
+            # by hand). The audit views -- done / all / unfiltered -- keep everything.
+            where = (where + " AND i.status <> 'closed'") if where else \
+                "WHERE i.status <> 'closed'"
         # Both tables must project the exact same column list: a UNION compares
         # positions, and task_needs carries one column need_solution does not.
         parts.append(
@@ -1226,22 +1249,18 @@ def close_need(need_id: int, target: str = "bug") -> dict | None:
     return query_one(f"{_need_columns(tab)} WHERE id = ?", (need_id,))
 
 
-def close_open_needs(bug_id: int, target: str = "bug") -> int:
-    """Settle every unanswered/replied need of one item; returns how many.
+def count_open_needs(item_id: int, target: str = "bug") -> int:
+    """How many questions of this item still await the owner.
 
-    Called when an item is closed by hand: the owner's verdict was "不修了", so the
-    question must not keep sitting on the 需方案 page, and a ``replied`` need is
-    itself a queue entry point (see ``fetch_task_queue``).
+    Settling them is no longer a caller's job -- `set_item_status` does it when an
+    item is closed -- but the page wants to say "and N blockers went quiet" in the
+    same breath, which has to be measured before the status change happens.
     """
     tab = tables_for(target)
-    ts = now_str()
-    with tx() as conn:
-        cur = conn.execute(
-            f"UPDATE {tab.need} SET status = 'done', done_at = ?"
-            f" WHERE {tab.fk} = ? AND status IN ('awaiting', 'replied')",
-            (ts, int(bug_id)),
-        )
-        return int(cur.rowcount or 0)
+    row = query_one(
+        f"SELECT COUNT(*) AS n FROM {tab.need} WHERE {tab.fk} = ? "
+        f"AND status IN ('awaiting', 'replied')", (int(item_id),))
+    return int((row or {}).get("n") or 0)
 
 
 # ---------------------------------------------------------------------------

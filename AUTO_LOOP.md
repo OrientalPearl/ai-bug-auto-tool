@@ -82,7 +82,8 @@
 但它仍然要先进入 **AI-BUG 任务系统语境**：先读 `AGENTS.md` 与 `AUTO_LOOP.md`，再围绕这条条目的产品、
 代码库与 `working_copy` 回忆现值，然后只讨论、不执行。
 
-如果页面里已经有「在线讨论下达语」按钮，优先点按钮复制单条版；单条版会自动把条目号、代码库、分支与最近分析带进去。
+如果页面里已经有「在线讨论下达语」按钮，优先点按钮复制单条版；单条版会自动把条目号、代码库、分支，
+以及**本条已经写下的备注原文**（分析根因 / 上次提问与建议 / 打回原因 / 草稿备注）一并带进去，不用你再去找。
 下面这段是通用版，适合手填 `<条目号>` 与 `<working_copy>`。
 
 ```
@@ -100,13 +101,18 @@ trunk：<trunk 路径>
 working_copy：<落码目录>
 svn_working_copy：<正式 SVN 工作副本，没有就写未配置>
 
-先在这个系统里回忆现值：
+先读这条**在本系统里已经写下的备注**（`analyses` 分析、`needs` 待拍板项、`reviews` 打回原因、direct 的草稿备注）——
+那些多数就是上一轮的 AI 自己写的，讨论必须以它为准，不是从禅道反推：
 1) python -m app.cli status <条目号>
-2) python -m app.cli detail <条目号>
-3) python -m app.cli mirror <条目号>
+   只看它的 `analyses` / `needs` / `reviews` 三个字段。实测这条命令整条输出约 67 KB / 229 行，
+   终端会截断 —— **截断不等于没有**，更不许因此转去翻禅道 comments。
+   页面上的「在线讨论下达语」按钮已把这些原文内联进单条版，能用按钮就用按钮。
+2) python -m app.cli detail <条目号>   # 它抓的是禅道现场的截图 / 评论 / 附件，不是本系统的备注
+3) python -m app.cli mirror <条目号>   # svn_direct 队列要写成 `mirror <条目号> --full`，原因见 §0.6
 4) 如需确认产品与代码库绑定，再看 python -m app.cli repos
 
 然后进入在线讨论模式，只输出：
+- **先复述上面备注里已经写下的结论与卡点**（标明引自哪条分析 / 哪个待拍板项），再说明这次讨论是否推翻它
 - 最近一次修改与当前状态摘要
 - 方案对比
 - 风险与影响面
@@ -116,6 +122,7 @@ svn_working_copy：<正式 SVN 工作副本，没有就写未配置>
 本轮禁止：
 - 不改代码，不 checkout / draft / commit / recut / promote
 - 不把这条收口为“已完成 / 已修复 / 可推”
+- 不拿禅道 comments 当根因来源（那多为转派流水，正文常为空）；本系统没有记录时就直接说没有，别去那里找原因
 - 没有我的“进入执行”指令，不得开始实现
 
 现在只讨论这个问题：
@@ -137,6 +144,10 @@ Web「下达任务」页 `/dispatch` 会按落码模式自动换正文：direct 
 
 0) 本系统命令一律在 <AI-BUG 项目根> 下执行（`app` 包要能 import；换到代码库目录跑会 ModuleNotFoundError）。
    代码的读与改在 SVN 工作副本里做，那个目录由下一条命令现读，不要自己认路径。
+   动手前先读这条**已有的记录**：`python -m app.cli status <禅道ID>` 只看 `analyses` / `needs` / `reviews`
+   三个字段（实测整条输出约 67 KB / 229 行，终端会截断，截断不等于没有）。
+   上一轮为什么 block、给过哪些选项、主人怎么答的、上次打回的原因，全在那里 —— 这些就是本系统的备注，
+   禅道 comments 不是。页面「在线讨论下达语」已把这些原文内联，讨论轮优先用按钮。
 1) python -m app.cli mirror <禅道ID> --full
    以这条命令报出的 wc_local（Windows 侧读改文件）/ wc_remote（SSH 侧跑 svn）为**唯一落码位置**，
    再看 url / revision / held_by / mirror_ready / dirt.state / dirty_real / conflicts / stale；
@@ -803,6 +814,12 @@ python -m app.cli tasks --limit 5       # 队列里 queue_kind=reopened 的行�
 判定不修」）、在禅道留言说明本地已结案。`fixing` / `await_review` / `rejected` 三种状态**不许**这样
 结案（会被拒并提示该走打回或「拒绝并回滚」），因为它们要么正在改、要么有该推的草稿。
 结案**不删分支、不动 trunk、不回滚任何提交**，改主意还能「重开补修」。
+任何一条把条目置 `closed` 的路径都会连带结掉这条的未答复阻塞项（`set_item_status` 里统一做，
+不再依赖调用方记得扫）：手工「结案（不修了）」、「拒绝并回滚」、`revert --confirm` 三者一致。
+这条规则是补出来的 —— 之前只有手工结案会扫，于是 #53144 被「拒绝并回滚」结案后，
+它那条 `awaiting` 的词条阻塞项继续挂在 `/need` 上催一个永远不会有答复的决定（#51635 同形）。
+需方案页的 `awaiting` / `replied` 视图也顺手排除了条目已 `closed` 的行，覆盖库里既存脏数据；
+`done` 与 `all` 是审计视图，仍然全给。重开（reopen）不会复活旧阻塞项：要重新问就再 `block` 一次。
 
 想手工做也可以，顺序与按钮一致（`--non-interactive` 保证不会弹密码）：
 
