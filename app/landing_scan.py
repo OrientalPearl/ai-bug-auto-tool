@@ -9,17 +9,58 @@ all", and "of which repository" -- which is what excludes a checkout of another
 product line (measured: ``U:/hy-nmc/3.0`` reports root ``.../hy-nmc-2``) before
 anything could ever be edited there.
 
-Nothing here touches the network or runs `svn`: the point is to *pick a
+Nothing here runs `svn` or reaches the build server: the point is to *pick a
 candidate*, and `svn_direct.resolve` still does the authoritative verification
-over SSH before any edit is allowed.
+over SSH before any edit is allowed. The reads themselves are ordinary directory
+reads -- but the mirrors live on mapped network drives, so they are far from free
+and are cached accordingly (see `CACHE_TTL_SECONDS`).
 """
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
 from . import db
+
+# A page renders one candidate lookup per card. These directories live on SMB
+# mapped drives (U:/ and Q:/), where a single-level listing plus four small reads
+# measured 117 ms + 209 ms -- and a kanban page did that 118 times (measured:
+# GET / went from 0.7 s to 121 s). The scan result is therefore cached per
+# (repository, mirror) pair; occupancy is deliberately *not* cached, so a copy
+# another item just claimed is reflected on the very next render.
+CACHE_TTL_SECONDS = 60.0
+_scan_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+
+def cache_key(repo_url: Any, landing_dirs: list[Any]) -> str:
+    """Stable identity for one scan: the repository and the mirrors we looked beside."""
+    dirs = ";".join(sorted({str(d or "").strip().rstrip("/\\").lower() for d in landing_dirs
+                            if str(d or "").strip()}))
+    return f"{str(repo_url or '').strip().rstrip('/').lower()}|{dirs}"
+
+
+def invalidate_cache() -> None:
+    """Forget cached listings (after a new checkout, or for tests)."""
+    _scan_cache.clear()
+
+
+def _scan_once(repo_url: str, landing_dirs: list[Any]) -> list[dict[str, Any]]:
+    """Uncached candidate scan: enumerate siblings, read manifests, keep our repository."""
+    seen: set[str] = set()
+    candidates: list[dict[str, Any]] = []
+    for mirror in landing_dirs:
+        for copy_dir in sibling_copies(mirror):
+            key = str(copy_dir).rstrip("/\\").lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            info = read_manifest(copy_dir)
+            if not info or not _same_repo(info["repo_root"], repo_url):
+                continue
+            candidates.append(info)
+    return candidates
 
 
 def read_manifest(path: Any) -> dict[str, str] | None:
@@ -85,12 +126,17 @@ def _same_repo(candidate_root: str, repo_url: str) -> bool:
 
 
 def _occupancy() -> dict[str, str]:
-    """local copy path -> the item holding it, for live direct drafts."""
+    """local copy path -> the item holding it, for live direct drafts.
+
+    Keys are normalised the way `db.claim_svn_draft` stores them: the draft row
+    carries the Windows-side path, and Windows folds case, so both sides are
+    lower-cased before they are compared.
+    """
     out: dict[str, str] = {}
     for draft in db.list_live_drafts():
-        wc_local = str(draft.get("wc_path") or "").strip()
+        wc_local = db.norm_wc_path(draft.get("wc_path"))
         if wc_local:
-            out[wc_local] = db.item_slug(draft.get("zentao_id"), draft.get("target") or "bug")
+            out[wc_local.lower()] = db.item_slug(draft.get("zentao_id"), draft.get("target") or "bug")
     return out
 
 
@@ -107,23 +153,21 @@ def discover(repo_url: str, landing_dirs: list[Any]) -> list[dict[str, Any]]:
        it is the least likely to need an update before the work can be committed.
     """
     repo_url = str(repo_url or "").strip()
-    seen: set[str] = set()
-    candidates: list[dict[str, Any]] = []
     if not repo_url:
-        return candidates
-    for mirror in landing_dirs:
-        for copy_dir in sibling_copies(mirror):
-            key = str(copy_dir).rstrip("/\\").lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            info = read_manifest(copy_dir)
-            if not info or not _same_repo(info["repo_root"], repo_url):
-                continue
-            candidates.append(info)
+        return []
+    key = cache_key(repo_url, landing_dirs)
+    hit = _scan_cache.get(key)
+    now = time.monotonic()
+    if hit and now - hit[0] < CACHE_TTL_SECONDS:
+        scanned = hit[1]
+    else:
+        scanned = _scan_once(repo_url, landing_dirs)
+        _scan_cache[key] = (now, scanned)
+    # Copy before annotating: the cached rows must never gain per-call fields.
+    candidates = [dict(c) for c in scanned]
     held = _occupancy()
     for cand in candidates:
-        cand["held_by"] = held.get(cand["path"], "")
+        cand["held_by"] = held.get(str(cand["path"]).rstrip("/\\").lower(), "")
         cand["revision_int"] = int(cand["revision"]) if cand["revision"].isdigit() else -1
     candidates.sort(key=lambda c: (bool(c["held_by"]), -c["revision_int"], c["path"].lower()))
     return candidates

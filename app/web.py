@@ -1582,19 +1582,22 @@ def _dispatch_checklist(queues: list[dict[str, Any]]) -> list[dict[str, str]]:
     return items
 
 
-def _landing(item: dict[str, Any]) -> tuple[str, str, str, str]:
+def _landing(item: dict[str, Any],
+             binding: dict[str, Any] | None = None) -> tuple[str, str, str, str]:
     """``(mode, copy, where-that-came-from, why-auto)`` for one item.
 
     For an item still on the mirror, ``copy`` is what a direct round *would* land on
     -- resolved by the same discovery the commands use, so the card shows the real
-    target and the owner never has to type a path.
+    target and the owner never has to type a path. ``binding`` is the caller's
+    already-fetched product row; a page passes one per product instead of letting
+    both chains re-read it per card.
     """
-    mode, wc, source = svn_direct.landing_for(item)
+    mode, wc, source = svn_direct.landing_for(item, binding)
     why = ""
     if mode != "svn_direct":
-        wc, why = svn_direct.direct_preview(item)
+        wc, why = svn_direct.direct_preview(item, binding)
     elif source == "auto":
-        _w, why = svn_direct.direct_preview(item)
+        _w, why = svn_direct.direct_preview(item, binding)
     return mode, wc, source, why
 
 
@@ -1603,9 +1606,21 @@ def _mode(item: dict[str, Any]) -> str:
     return svn_direct.landing_for(item)[0]
 
 
-def _annotate_one(item: dict[str, Any]) -> dict[str, Any]:
+def _bindings_for(items: list[dict[str, Any]]) -> dict[Any, dict[str, Any]]:
+    """One ``product_repos`` row per product on a page, fetched once, not per card."""
+    cache: dict[Any, dict[str, Any]] = {}
+    for item in items:
+        pid = item.get("product_id")
+        if pid is None or pid in cache:
+            continue
+        cache[pid] = db.get_product_repo(pid) or {}
+    return cache
+
+
+def _annotate_one(item: dict[str, Any],
+                  binding: dict[str, Any] | None = None) -> dict[str, Any]:
     """Attach the landing mode and, for direct items, the live SVN draft."""
-    mode, wc, source, why = _landing(item)
+    mode, wc, source, why = _landing(item, binding)
     item["code_mode"] = mode
     item["landing_wc"] = wc
     item["landing_source"] = source
@@ -1619,10 +1634,12 @@ def _annotate_one(item: dict[str, Any]) -> dict[str, Any]:
 def _annotate(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Annotate a whole page's worth of items.
 
-    Reads only the database: the working copy itself is never probed while a page
-    renders, because a whole-copy `svn status` costs about a minute here.
+    Only the local database and the local directory listing are read; the working
+    copy itself is never probed over SSH while a page renders, because a whole-copy
+    `svn status` costs about a minute here.
     """
-    return [_annotate_one(item) for item in items]
+    cache = _bindings_for(items)
+    return [_annotate_one(item, cache.get(item.get("product_id"), {})) for item in items]
 
 
 def _annotate_landing_only(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1632,11 +1649,12 @@ def _annotate_landing_only(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     them through `_annotate_one` would look up a live draft under the wrong key.
     All a card needs is which copy its 下达语 should name.
     """
+    cache = _bindings_for(rows)
     for row in rows:
         stub = {"product_id": row.get("product_id"),
                 "landing_wc": row.get("landing_wc"),
                 "landing_mode": row.get("landing_mode")}
-        mode, wc, source, why = _landing(stub)
+        mode, wc, source, why = _landing(stub, cache.get(row.get("product_id"), {}))
         row["code_mode"] = mode
         row["landing_wc"] = wc
         row["landing_source"] = source

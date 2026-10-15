@@ -570,7 +570,7 @@ def _preflight_direct(target: RepoTarget) -> list[dict]:
                        f"（Windows 视图 {wc.local_path}）"))
     steps.append(_step("svn info", True,
                        f"svn {wc.svn_version}；URL {wc.url}；当前 r{wc.revision}"))
-    holder = db.get_live_draft_for_wc(wc.remote_path)
+    holder = db.get_live_draft_for_wc(wc.local_path)
     steps.append(_step("副本占用", None,
                        f"当前由 {db.draft_holder_label(holder)} 持有" if holder
                        else "无在册草稿（一份副本同一时刻只允许一条未提交改动）"))

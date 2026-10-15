@@ -236,7 +236,10 @@ CREATE TABLE IF NOT EXISTS product_repos (
 -- working copy. SVN cannot express "one branch per item", so the working copy
 -- itself is the exclusive resource: at most one live draft may hold a given
 -- `wc_path`, which a partial unique index enforces in the database rather than
--- in an advisory check the caller can forget.
+-- in an advisory check the caller can forget. `wc_path` is stored normalised and
+-- holds the *local* (Windows) view of the copy, since that is what the page shows
+-- and what `landing_for` reads back as the copy an item already holds; the
+-- build-server spelling lives in `remote_wc`.
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS svn_drafts (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1674,6 +1677,21 @@ def draft_holder_label(draft: dict) -> str:
             f"{draft.get('wc_path')}）")
 
 
+def norm_wc_path(path: Any) -> str:
+    """One spelling for one directory, so "one copy, one live draft" cannot be dodged.
+
+    The partial unique index on ``svn_drafts.wc_path`` is the real enforcement, and
+    it compares strings: ``U:/hy-10G-2/trunk/3.0`` and ``U:\\hy-10G-2\\trunk\\3.0``
+    would otherwise let two items claim the same working copy. Separators and the
+    trailing one are normalised here; case is handled by `COLLATE NOCASE` in the
+    lookup below, because Windows paths fold it while the index does not.
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    return str(Path(raw)).rstrip("/\\")
+
+
 def get_svn_draft(draft_id: int) -> dict | None:
     return _decode_draft(query_one("SELECT * FROM svn_drafts WHERE id = ?", (int(draft_id),)))
 
@@ -1690,10 +1708,10 @@ def get_live_draft_for_item(item_id: int, target: str = "bug") -> dict | None:
 def get_live_draft_for_wc(wc_path: str) -> dict | None:
     """The one item that currently owns this working copy, if any."""
     return _decode_draft(query_one(
-        f"SELECT * FROM svn_drafts WHERE wc_path = ? "
+        f"SELECT * FROM svn_drafts WHERE wc_path = ? COLLATE NOCASE "
         f"AND status IN ({','.join('?' * len(LIVE_DRAFT_STATUSES))}) "
         f"ORDER BY id DESC LIMIT 1",
-        (str(wc_path), *LIVE_DRAFT_STATUSES)))
+        (norm_wc_path(wc_path), *LIVE_DRAFT_STATUSES)))
 
 
 def claim_svn_draft(item: dict, *, wc_path: str, wc_url: str = "", remote_wc: str = "",
@@ -1705,8 +1723,16 @@ def claim_svn_draft(item: dict, *, wc_path: str, wc_url: str = "", remote_wc: st
     `checkout` must not stack a second holder on the same directory. `baseline`
     is the set of tracked files that were already modified at claim time -- the
     reference every later ownership proof is measured against.
+
+    ``wc_path`` is stored normalised (see `norm_wc_path`); it is the *local* view of
+    the copy, which is what the page and `landing_for` need. The SSH spelling goes
+    to ``remote_wc``.
     """
-    wc = str(wc_path)
+    wc = norm_wc_path(wc_path)
+    if not wc:
+        # An empty holder path would still satisfy NOT NULL, and every such draft
+        # would then look like it owns the *same* copy to the unique index.
+        raise ValueError("领取工作副本时路径为空：拒绝登记（空路径会绕开副本独占索引）")
     ts = now_str()
     stamp = _json_dump(list(baseline or []))
     mine = get_live_draft_for_item(item["id"], item.get("target") or "bug")
@@ -1716,7 +1742,7 @@ def claim_svn_draft(item: dict, *, wc_path: str, wc_url: str = "", remote_wc: st
             f"工作副本 {wc} 已被 {draft_holder_label(other)} 占用："
             "SVN 没有本地分支，一份副本同一时刻只能承载一条条目的未提交改动。"
             "先让那条收尾（登记或 svn revert），再来领这条。")
-    if mine and mine["wc_path"] != wc:
+    if mine and str(mine["wc_path"]).lower() != wc.lower():
         raise ValueError(
             f"该条目已持有另一份副本 {mine['wc_path']}（{mine['status']}）："
             "先把那一处的改动收掉再换副本，避免同一条目留下两份未提交改动。")

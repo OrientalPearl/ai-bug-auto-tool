@@ -579,7 +579,12 @@ def open_draft(wc: DirectWc, item: dict, files: list[str], *, note: str = "") ->
     # if one of them was already dirty, `svn ci` would carry that other author's
     # work along, and `record()` reports exactly that as contamination.
     baseline = [p for p in dirt.real if p not in already]
-    draft = db.claim_svn_draft(item, wc_path=wc.remote_path, wc_url=wc.url,
+    # `wc_path` holds the Windows-side path because that is the identity every
+    # local consumer needs: the card shows it, `landing_for` reads it back as the
+    # copy this item already holds, and `landing_scan` compares it against the
+    # checkouts it found beside the mirror. The build-server spelling stays in
+    # `remote_wc` for anything that shells out over SSH.
+    draft = db.claim_svn_draft(item, wc_path=wc.local_path, wc_url=wc.url,
                                remote_wc=wc.remote_path, base_rev=wc.revision,
                                baseline=baseline, note=note)
     after = status(wc, paths=declared) if declared else dirt
@@ -839,7 +844,7 @@ def describe(target: RepoTarget, item: dict, *, against_repo: bool = False,
         dirt = Dirt(state="skipped", why="本条目还没有登记文件；全副本扫描在 checkout/draft 里做")
         scanned = "none"
         against_repo = False
-    holder = db.get_live_draft_for_wc(wc.remote_path)
+    holder = db.get_live_draft_for_wc(wc.local_path)
     held_here = bool(holder and draft and holder["id"] == draft["id"])
     out: dict[str, Any] = {
         "code_mode": "svn_direct", "wc_local": wc.local_path, "wc_remote": wc.remote_path,
